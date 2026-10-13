@@ -11,3 +11,50 @@ datasource db {
 generator client {
   provider = "prisma-client-js"
 }
+
+enum TeamRole {
+  OWNER
+  MANAGER
+  STAFF
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String?
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  teamsCreated Team[]   @relation("CreatedTeams")
+  memberships  TeamMembership[]
+}
+
+model Team {
+  id               String   @id @default(uuid())
+  name             String
+  createdByUserId  String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  createdBy   User @relation("CreatedTeams", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  memberships TeamMembership[]
+
+  @@index([createdByUserId])
+}
+
+model TeamMembership {
+  id        String   @id @default(uuid())
+  teamId    String
+  userId    String
+  role      TeamRole
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([teamId])
+  @@index([userId])
+}
