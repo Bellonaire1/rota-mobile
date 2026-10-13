@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+app/node_modules/
+server/node_modules/
+
+# Environment files
+.env
+.env.*
+!.env.example
+!app/.env.example
+!server/.env.example
+
+# Expo
+.expo/
+app/.expo/
+web-build/
+
+# Build output
+dist/
+build/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local database files
+*.db
+*.db-journal
+
+# OS / editor
+.DS_Store
+Thumbs.db

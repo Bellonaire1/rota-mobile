@@ -1,0 +1,12 @@
+// Prisma schema for Rota Backend
+// Database: PostgreSQL
+// Note: Business models will be added in subsequent feature milestones.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
