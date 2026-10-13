@@ -3,8 +3,8 @@
 // Note: Business models will be added in subsequent feature milestones.
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
@@ -26,18 +26,36 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  teamsCreated Team[]   @relation("CreatedTeams")
+  teamsCreated Team[]           @relation("CreatedTeams")
   memberships  TeamMembership[]
+  authSessions AuthSession[]
+}
+
+model AuthSession {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  familyId  String
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
 }
 
 model Team {
-  id               String   @id @default(uuid())
-  name             String
-  createdByUserId  String
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  id              String   @id @default(uuid())
+  name            String
+  createdByUserId String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  createdBy   User @relation("CreatedTeams", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdBy   User             @relation("CreatedTeams", fields: [createdByUserId], references: [id], onDelete: Restrict)
   memberships TeamMembership[]
 
   @@index([createdByUserId])
