@@ -1,6 +1,7 @@
-import { TeamRole } from '@prisma/client';
+import { ShiftStatus, TeamRole } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../database/prisma';
+import { runSerializable } from '../database/transactions';
 import { AppError } from '../errors/AppError';
 import {
   AddTeamMemberInput,
@@ -184,13 +185,26 @@ export const teamService = {
   },
 
   removeMember(teamId: string, actorId: string, targetUserId: string) {
-    return prisma.$transaction(async (transaction) => {
+    return runSerializable(async (transaction) => {
       await assertOwner(transaction, teamId, actorId);
       const target = await transaction.teamMembership.findUnique({
         where: { teamId_userId: { teamId, userId: targetUserId } },
         select: { role: true },
       });
       assertMemberTarget(target?.role);
+
+      const futureShift = await transaction.shift.findFirst({
+        where: {
+          teamId,
+          assignedToUserId: targetUserId,
+          status: ShiftStatus.SCHEDULED,
+          startsAt: { gt: new Date() },
+        },
+        select: { id: true },
+      });
+      if (futureShift) {
+        throw new AppError(409, 'Member has future scheduled shifts; reassign or cancel them first');
+      }
 
       await transaction.teamMembership.delete({
         where: { teamId_userId: { teamId, userId: targetUserId } },

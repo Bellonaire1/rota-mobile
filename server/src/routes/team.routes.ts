@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { shiftController } from '../controllers/shift.controller';
 import { teamController } from '../controllers/team.controller';
 import { authenticate } from '../middleware/authenticate';
 import { requireTeamMembership, requireTeamPermission } from '../middleware/teamAuthorization';
@@ -13,6 +14,14 @@ import {
   teamMemberTargetParamsSchema,
   updateTeamMemberRoleSchema,
 } from '../schemas/team.schema';
+import {
+  cancelShiftSchema,
+  createShiftSchema,
+  shiftListQuerySchema,
+  shiftParamsSchema,
+  shiftTargetParamsSchema,
+  updateShiftSchema,
+} from '../schemas/shift.schema';
 
 const router = Router();
 
@@ -42,6 +51,30 @@ router.delete(
   validateRequest({ params: teamMemberTargetParamsSchema }),
   requireTeamPermission(Permission.MANAGE_TEAM),
   teamController.removeMember
+);
+router.get(
+  '/:teamId/shifts',
+  validateRequest({ params: shiftParamsSchema, query: shiftListQuerySchema }),
+  requireTeamMembership,
+  shiftController.list
+);
+router.post(
+  '/:teamId/shifts',
+  validateRequest({ params: shiftParamsSchema, body: createShiftSchema }),
+  requireTeamPermission(Permission.MANAGE_OPERATIONAL_WORK),
+  shiftController.create
+);
+router.patch(
+  '/:teamId/shifts/:shiftId',
+  validateRequest({ params: shiftTargetParamsSchema, body: updateShiftSchema }),
+  requireTeamPermission(Permission.MANAGE_OPERATIONAL_WORK),
+  shiftController.update
+);
+router.post(
+  '/:teamId/shifts/:shiftId/cancel',
+  validateRequest({ params: shiftTargetParamsSchema, body: cancelShiftSchema }),
+  requireTeamPermission(Permission.MANAGE_OPERATIONAL_WORK),
+  shiftController.cancel
 );
 router.get('/:id', validateRequest({ params: teamIdParamSchema }), teamController.get);
 

@@ -18,6 +18,11 @@ enum TeamRole {
   STAFF
 }
 
+enum ShiftStatus {
+  SCHEDULED
+  CANCELLED
+}
+
 model User {
   id           String   @id @default(uuid())
   email        String   @unique
@@ -29,6 +34,8 @@ model User {
   teamsCreated Team[]           @relation("CreatedTeams")
   memberships  TeamMembership[]
   authSessions AuthSession[]
+  assignedShifts Shift[]         @relation("AssignedShifts")
+  createdShifts  Shift[]         @relation("CreatedShifts")
 }
 
 model AuthSession {
@@ -57,6 +64,7 @@ model Team {
 
   createdBy   User             @relation("CreatedTeams", fields: [createdByUserId], references: [id], onDelete: Restrict)
   memberships TeamMembership[]
+  shifts      Shift[]
 
   @@index([createdByUserId])
 }
@@ -75,4 +83,27 @@ model TeamMembership {
   @@unique([teamId, userId])
   @@index([teamId])
   @@index([userId])
+}
+
+model Shift {
+  id                String      @id @default(uuid())
+  teamId            String
+  assignedToUserId  String
+  createdByUserId   String
+  title             String
+  startsAt          DateTime    @db.Timestamptz(3)
+  endsAt            DateTime    @db.Timestamptz(3)
+  status            ShiftStatus @default(SCHEDULED)
+  cancelledAt       DateTime?   @db.Timestamptz(3)
+  cancelledByUserId String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  team       Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  assignedTo User @relation("AssignedShifts", fields: [assignedToUserId], references: [id], onDelete: Restrict)
+  createdBy  User @relation("CreatedShifts", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  @@index([teamId, startsAt])
+  @@index([teamId, status, startsAt])
+  @@index([assignedToUserId, startsAt])
 }
