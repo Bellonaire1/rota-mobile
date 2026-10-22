@@ -4,6 +4,11 @@ declare global {
       auth?: {
         userId: string;
       };
+      teamMembership?: {
+        teamId: string;
+        userId: string;
+        role: import('@prisma/client').TeamRole;
+      };
     }
   }
 }
