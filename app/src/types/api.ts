@@ -54,3 +54,54 @@ export interface TeamsResponse {
 export interface TeamResponse {
   team: Team;
 }
+
+export type TeamRole = 'OWNER' | 'MANAGER' | 'STAFF';
+
+export interface TeamMember {
+  id: string;
+  userId: string;
+  role: TeamRole;
+  createdAt: string;
+  updatedAt: string;
+  user: Pick<User, 'id' | 'email' | 'name'>;
+}
+
+export interface Pagination {
+  page: number;
+  limit: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface TeamMembersResponse {
+  members: TeamMember[];
+  pagination: Pagination;
+}
+
+export type ShiftStatus = 'SCHEDULED' | 'CANCELLED';
+
+export interface Shift {
+  id: string;
+  teamId: string;
+  assignedToUserId: string;
+  createdByUserId: string;
+  title: string;
+  startsAt: string;
+  endsAt: string;
+  status: ShiftStatus;
+  cancelledAt: string | null;
+  cancelledByUserId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  assignedTo: Pick<User, 'id' | 'email' | 'name'>;
+  createdBy: Pick<User, 'id' | 'email' | 'name'>;
+}
+
+export interface ShiftsResponse {
+  shifts: Shift[];
+  pagination: Pagination;
+}
+
+export interface ShiftResponse {
+  shift: Shift;
+}
