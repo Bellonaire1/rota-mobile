@@ -1,5 +1,5 @@
 import { apiClient } from './apiClient';
-import { Team, TeamMember, TeamMembersResponse, TeamResponse, TeamsResponse } from '@/types/api';
+import { Team, TeamMember, TeamMembersResponse, TeamResponse, TeamsResponse, TeamRole } from '@/types/api';
 
 export const teamService = {
   list(): Promise<TeamsResponse> {
@@ -27,6 +27,18 @@ export const teamService = {
       members.push(...response.members);
     }
     return members;
+  },
+
+  addMember(teamId: string, userId: string, role: Exclude<TeamRole, 'OWNER'> = 'STAFF'): Promise<{ member: TeamMember }> {
+    return apiClient.post<{ member: TeamMember }>(`/teams/${teamId}/members`, { userId, role });
+  },
+
+  updateMemberRole(teamId: string, userId: string, role: Exclude<TeamRole, 'OWNER'>): Promise<{ member: TeamMember }> {
+    return apiClient.patch<{ member: TeamMember }>(`/teams/${teamId}/members/${userId}/role`, { role });
+  },
+
+  removeMember(teamId: string, userId: string): Promise<unknown> {
+    return apiClient.delete<unknown>(`/teams/${teamId}/members/${userId}`);
   },
 };
 

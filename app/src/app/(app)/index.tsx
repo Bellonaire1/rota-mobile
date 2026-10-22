@@ -283,6 +283,9 @@ export default function DashboardScreen() {
         </View>
         {canManage ? <ActionButton label="Add shift" onPress={openCreate} /> : null}
       </View>
+      <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/members')} style={styles.membersLink}>
+        <Text style={styles.membersLinkText}>View team members →</Text>
+      </Pressable>
 
       <View style={styles.filterCard}>
         <Text style={styles.filterTitle}>Find shifts</Text>
@@ -379,6 +382,8 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
   headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: spacing.md },
+  membersLink: { alignSelf: 'flex-start', marginBottom: spacing.md },
+  membersLinkText: { color: colors.primary, fontSize: typography.sizes.sm, fontWeight: '700' },
   eyebrow: { color: colors.accent, fontSize: typography.sizes.xs, fontWeight: '800', letterSpacing: 1.2 },
   title: { color: colors.text, fontSize: typography.sizes.xxl, fontWeight: '800', marginTop: spacing.xs },
   filterCard: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 20, padding: spacing.md, marginBottom: spacing.md },
