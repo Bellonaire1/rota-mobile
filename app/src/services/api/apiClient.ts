@@ -1,6 +1,13 @@
 import { API_BASE_URL } from '@/constants/config';
 import { ApiErrorResponse } from '@/types/api';
 
+export interface ApiRequestOptions extends RequestInit {
+  allowRefresh?: boolean;
+  skipAuth?: boolean;
+}
+
+type RefreshHandler = () => Promise<string | null>;
+
 export class ApiError extends Error {
   public statusCode: number;
   public details?: ApiErrorResponse;
@@ -18,29 +25,53 @@ export class ApiError extends Error {
  */
 export class ApiClient {
   private baseUrl: string;
+  private accessToken: string | null = null;
+  private refreshHandler: RefreshHandler | null = null;
 
   constructor(baseUrl: string = API_BASE_URL) {
     this.baseUrl = baseUrl;
   }
 
-  private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  public setAccessToken(accessToken: string | null): void {
+    this.accessToken = accessToken;
+  }
+
+  public setRefreshHandler(handler: RefreshHandler | null): void {
+    this.refreshHandler = handler;
+  }
+
+  private async request<T>(endpoint: string, options: ApiRequestOptions = {}): Promise<T> {
     const url = endpoint.startsWith('http') ? endpoint : `${this.baseUrl}${endpoint.startsWith('/') ? '' : '/'}${endpoint}`;
-    
+
+    const { allowRefresh = true, skipAuth = false, ...fetchOptions } = options;
     const headers = {
       'Content-Type': 'application/json',
       Accept: 'application/json',
-      ...options.headers,
+      ...(this.accessToken && !skipAuth
+        ? { Authorization: `Bearer ${this.accessToken}` }
+        : {}),
+      ...fetchOptions.headers,
     };
 
     try {
       const response = await fetch(url, {
-        ...options,
+        ...fetchOptions,
         headers,
       });
 
       const data = await response.json().catch(() => null);
 
       if (!response.ok) {
+        if (response.status === 401 && allowRefresh && !skipAuth && this.refreshHandler) {
+          const accessToken = await this.refreshHandler();
+          if (accessToken) {
+            return this.request<T>(endpoint, {
+              ...options,
+              allowRefresh: false,
+            });
+          }
+        }
+
         const errorMessage = data?.message || `Request failed with status ${response.status}`;
         throw new ApiError(errorMessage, response.status, data);
       }
@@ -54,11 +85,11 @@ export class ApiClient {
     }
   }
 
-  public get<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  public get<T>(endpoint: string, options?: ApiRequestOptions): Promise<T> {
     return this.request<T>(endpoint, { ...options, method: 'GET' });
   }
 
-  public post<T>(endpoint: string, body?: unknown, options?: RequestInit): Promise<T> {
+  public post<T>(endpoint: string, body?: unknown, options?: ApiRequestOptions): Promise<T> {
     return this.request<T>(endpoint, {
       ...options,
       method: 'POST',
@@ -66,7 +97,7 @@ export class ApiClient {
     });
   }
 
-  public put<T>(endpoint: string, body?: unknown, options?: RequestInit): Promise<T> {
+  public put<T>(endpoint: string, body?: unknown, options?: ApiRequestOptions): Promise<T> {
     return this.request<T>(endpoint, {
       ...options,
       method: 'PUT',
@@ -74,7 +105,15 @@ export class ApiClient {
     });
   }
 
-  public delete<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  public patch<T>(endpoint: string, body?: unknown, options?: ApiRequestOptions): Promise<T> {
+    return this.request<T>(endpoint, {
+      ...options,
+      method: 'PATCH',
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  }
+
+  public delete<T>(endpoint: string, options?: ApiRequestOptions): Promise<T> {
     return this.request<T>(endpoint, { ...options, method: 'DELETE' });
   }
 }
