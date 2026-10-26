@@ -1,4 +1,4 @@
-import express, { Application } from 'express';
+import express, { Application, Request } from 'express';
 import cors from 'cors';
 import apiRouter from './routes';
 import { notFoundHandler } from './middleware/notFound';
@@ -9,6 +9,13 @@ export const createApp = (): Application => {
 
   // Middleware
   app.use(cors());
+  app.use('/api/v1/billing/webhooks/paystack', express.raw({
+    limit: '100kb',
+    type: 'application/json',
+  }), (req, _res, next) => {
+    if (Buffer.isBuffer(req.body)) (req as Request).rawBody = Buffer.from(req.body);
+    next();
+  });
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 

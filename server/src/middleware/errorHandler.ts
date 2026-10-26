@@ -7,6 +7,16 @@ export const errorHandler = (
   res: Response,
   _next: NextFunction
 ): void => {
+  const parserError = err as Error & { status?: number; type?: string };
+  if (parserError.type === 'entity.too.large') {
+    res.status(413).json({ status: 'error', message: 'Request body is too large' });
+    return;
+  }
+  if (parserError.type === 'entity.parse.failed') {
+    res.status(400).json({ status: 'error', message: 'Malformed JSON body' });
+    return;
+  }
+
   if (!(err instanceof AppError)) {
     console.error('Unhandled server error:', err);
   }

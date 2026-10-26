@@ -51,9 +51,16 @@ this milestone.
 
 Initialization creates only a pending payment operation. A browser redirect,
 mobile callback, or client-provided success claim must never activate a
-subscription. A later webhook worker should verify the Paystack signature,
-deduplicate the provider event, verify the transaction where appropriate, and
+subscription. The webhook intake verifies the Paystack signature, parses the
+authenticated raw bytes, and durably records the event before acknowledging it.
+A later webhook worker should verify the transaction where appropriate and
 atomically transition the persisted billing operation and subscription. The
 webhook event, not the redirect, becomes the authoritative activation signal.
-Webhook handling, provider subscriptions, and payment routes are deliberately
-deferred to a later milestone.
+
+Webhook ingestion deduplicates the exact serialized event using the event type
+and SHA-256 hash of the raw body. Two differently serialized payloads concerning
+the same transaction can therefore create distinct ingestion records. Future
+worker-side financial idempotency must instead use the provider transaction ID
+or reference together with unique billing and ledger constraints. This task
+does not implement worker processing, payment verification, activation, or
+ledger posting.

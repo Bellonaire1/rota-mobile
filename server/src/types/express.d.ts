@@ -4,6 +4,7 @@ declare global {
       auth?: {
         userId: string;
       };
+      rawBody?: Buffer;
       teamMembership?: {
         teamId: string;
         userId: string;
