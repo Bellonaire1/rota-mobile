@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import { shiftController } from '../controllers/shift.controller';
 import { teamController } from '../controllers/team.controller';
+import { billingController } from '../controllers/billing.controller';
 import { authenticate } from '../middleware/authenticate';
 import { requireTeamMembership, requireTeamPermission } from '../middleware/teamAuthorization';
 import { validateRequest } from '../middleware/validateRequest';
 import { Permission } from '../rbac/permissions';
+import { billingTeamParamsSchema, checkoutBodySchema } from '../schemas/billing.schema';
 import {
   addTeamMemberSchema,
   createTeamSchema,
@@ -75,6 +77,18 @@ router.post(
   validateRequest({ params: shiftTargetParamsSchema, body: cancelShiftSchema }),
   requireTeamPermission(Permission.MANAGE_OPERATIONAL_WORK),
   shiftController.cancel
+);
+router.get(
+  '/:teamId/billing',
+  validateRequest({ params: billingTeamParamsSchema }),
+  requireTeamPermission(Permission.MANAGE_TEAM),
+  billingController.teamBilling
+);
+router.post(
+  '/:teamId/billing/checkout',
+  validateRequest({ params: billingTeamParamsSchema, body: checkoutBodySchema }),
+  requireTeamPermission(Permission.MANAGE_TEAM),
+  billingController.checkout
 );
 router.get('/:id', validateRequest({ params: teamIdParamSchema }), teamController.get);
 
