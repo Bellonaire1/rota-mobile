@@ -23,6 +23,68 @@ enum ShiftStatus {
   CANCELLED
 }
 
+enum BillingPlanCode {
+  STARTER
+  TEAM
+  BUSINESS
+}
+
+enum BillingSubscriptionStatus {
+  PENDING_CHECKOUT
+  ACTIVE
+  PAST_DUE
+  GRACE
+  SUSPENDED
+  CANCELED
+}
+
+enum BillingPeriodStatus {
+  OPEN
+  FINALIZED
+  VOID
+}
+
+enum BillingInvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  PAYMENT_FAILED
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum BillingPaymentAttemptStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum BillingWebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum BillingIdempotencyStatus {
+  IN_PROGRESS
+  SUCCEEDED
+  FAILED
+}
+
+enum BillingLedgerTransactionType {
+  INVOICE
+  PAYMENT
+  REFUND
+  CREDIT
+  PRORATION
+}
+
+enum BillingLedgerTransactionStatus {
+  DRAFT
+  POSTED
+}
+
 model User {
   id           String   @id @default(uuid())
   email        String   @unique
@@ -36,6 +98,7 @@ model User {
   authSessions AuthSession[]
   assignedShifts Shift[]         @relation("AssignedShifts")
   createdShifts  Shift[]         @relation("CreatedShifts")
+  billingIdempotencyKeys BillingIdempotencyKey[]
 }
 
 model AuthSession {
@@ -65,6 +128,9 @@ model Team {
   createdBy   User             @relation("CreatedTeams", fields: [createdByUserId], references: [id], onDelete: Restrict)
   memberships TeamMembership[]
   shifts      Shift[]
+  billingSubscription BillingSubscription?
+  billingIdempotencyKeys BillingIdempotencyKey[]
+  billingLedgerTransactions BillingLedgerTransaction[]
 
   @@index([createdByUserId])
 }
@@ -106,4 +172,225 @@ model Shift {
   @@index([teamId, startsAt])
   @@index([teamId, status, startsAt])
   @@index([assignedToUserId, startsAt])
+}
+
+model BillingPlan {
+  id          String          @id @default(uuid())
+  code        BillingPlanCode @unique
+  displayName String
+  active      Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  prices              BillingPlanPrice[]
+  currentSubscriptions BillingSubscription[] @relation("CurrentSubscriptionPlan")
+  pendingSubscriptions BillingSubscription[] @relation("PendingSubscriptionPlan")
+}
+
+model BillingPlanPrice {
+  id                       String   @id @default(uuid())
+  planId                   String
+  monthlyPriceCents        Int
+  includedStaffSeats       Int
+  extraStaffSeatPriceCents Int
+  currency                 String   @default("USD") @db.Char(3)
+  effectiveFrom            DateTime @db.Timestamptz(3)
+  effectiveTo              DateTime? @db.Timestamptz(3)
+  providerPriceId          String?  @unique
+  createdAt                DateTime @default(now())
+
+  plan                 BillingPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+  currentSubscriptions BillingSubscription[] @relation("CurrentSubscriptionPrice")
+  pendingSubscriptions BillingSubscription[] @relation("PendingSubscriptionPrice")
+
+  @@unique([planId, effectiveFrom])
+  @@index([planId, effectiveFrom])
+}
+
+model BillingSubscription {
+  id                    String                     @id @default(uuid())
+  teamId                String                     @unique
+  planId                String
+  priceId               String
+  status                BillingSubscriptionStatus @default(PENDING_CHECKOUT)
+  provider              String?                    @db.VarChar(32)
+  providerCustomerId    String?                    @unique @db.VarChar(255)
+  providerSubscriptionId String?                   @unique @db.VarChar(255)
+  currency              String                     @default("USD") @db.Char(3)
+  currentPeriodStart    DateTime?                  @db.Timestamptz(3)
+  currentPeriodEnd      DateTime?                  @db.Timestamptz(3)
+  cancelAtPeriodEnd     Boolean                    @default(false)
+  pendingPlanId         String?
+  pendingPriceId        String?
+  pendingEffectiveAt    DateTime?                  @db.Timestamptz(3)
+  gracePeriodEndsAt     DateTime?                  @db.Timestamptz(3)
+  version               Int                        @default(0)
+  createdAt             DateTime                   @default(now())
+  updatedAt             DateTime                   @updatedAt
+
+  team          Team             @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  currentPlan   BillingPlan      @relation("CurrentSubscriptionPlan", fields: [planId], references: [id], onDelete: Restrict)
+  currentPrice  BillingPlanPrice @relation("CurrentSubscriptionPrice", fields: [priceId], references: [id], onDelete: Restrict)
+  pendingPlan   BillingPlan?     @relation("PendingSubscriptionPlan", fields: [pendingPlanId], references: [id], onDelete: Restrict)
+  pendingPrice  BillingPlanPrice? @relation("PendingSubscriptionPrice", fields: [pendingPriceId], references: [id], onDelete: Restrict)
+  periods       BillingPeriod[]
+  invoices      BillingInvoice[]
+  ledgerTransactions BillingLedgerTransaction[]
+
+  @@index([status, currentPeriodEnd])
+  @@index([status, gracePeriodEndsAt])
+}
+
+model BillingPeriod {
+  id                       String              @id @default(uuid())
+  subscriptionId           String
+  sequence                 Int
+  startsAt                 DateTime            @db.Timestamptz(3)
+  endsAt                   DateTime            @db.Timestamptz(3)
+  planCodeSnapshot         BillingPlanCode
+  monthlyPriceCents        Int
+  includedStaffSeats       Int
+  extraStaffSeatPriceCents Int
+  billableStaffSeats       Int
+  extraStaffSeats          Int
+  baseAmountCents          Int
+  extraSeatAmountCents     Int
+  prorationAmountCents     Int                 @default(0)
+  totalAmountCents         Int
+  currency                 String              @default("USD") @db.Char(3)
+  status                   BillingPeriodStatus @default(OPEN)
+  createdAt                DateTime            @default(now())
+
+  subscription BillingSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  invoices     BillingInvoice[]
+
+  @@unique([subscriptionId, sequence])
+  @@unique([subscriptionId, startsAt])
+  @@index([subscriptionId, startsAt])
+  @@index([status, endsAt])
+}
+
+model BillingInvoice {
+  id                  String               @id @default(uuid())
+  subscriptionId      String
+  periodId            String?
+  providerInvoiceId   String?              @unique @db.VarChar(255)
+  status              BillingInvoiceStatus @default(DRAFT)
+  subtotalCents       Int
+  prorationCents      Int                  @default(0)
+  totalCents          Int
+  amountPaidCents     Int                  @default(0)
+  currency            String               @default("USD") @db.Char(3)
+  dueAt               DateTime?            @db.Timestamptz(3)
+  paidAt              DateTime?             @db.Timestamptz(3)
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  subscription      BillingSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  period            BillingPeriod?      @relation(fields: [periodId], references: [id], onDelete: Restrict)
+  paymentAttempts   BillingPaymentAttempt[]
+  ledgerTransactions BillingLedgerTransaction[]
+
+  @@index([subscriptionId, createdAt])
+  @@index([status, dueAt])
+}
+
+model BillingPaymentAttempt {
+  id                String                       @id @default(uuid())
+  invoiceId         String
+  providerPaymentId String?                      @unique @db.VarChar(255)
+  idempotencyKey    String                       @unique @db.VarChar(255)
+  attemptNumber     Int
+  amountCents       Int
+  status            BillingPaymentAttemptStatus @default(PENDING)
+  failureCode       String?                      @db.VarChar(128)
+  failureMessage    String?
+  createdAt         DateTime                     @default(now())
+
+  invoice BillingInvoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@unique([invoiceId, attemptNumber])
+  @@index([status, createdAt])
+}
+
+model BillingWebhookEvent {
+  id                  String                    @id @default(uuid())
+  provider            String                    @db.VarChar(32)
+  providerEventId     String                    @db.VarChar(255)
+  eventType           String                    @db.VarChar(128)
+  payload             Json
+  signatureVerifiedAt DateTime                  @db.Timestamptz(3)
+  status              BillingWebhookEventStatus @default(RECEIVED)
+  attemptCount        Int                       @default(0)
+  processedAt         DateTime?                 @db.Timestamptz(3)
+  lastError           String?
+  receivedAt          DateTime                  @default(now())
+  updatedAt           DateTime                  @updatedAt
+
+  @@unique([provider, providerEventId])
+  @@index([status, receivedAt])
+  @@index([eventType, receivedAt])
+}
+
+model BillingIdempotencyKey {
+  id             String                  @id @default(uuid())
+  scope          String                  @db.VarChar(128)
+  key            String                  @db.VarChar(255)
+  requestHash    String                  @db.VarChar(128)
+  status         BillingIdempotencyStatus @default(IN_PROGRESS)
+  responseStatus Int?
+  responseBody   Json?
+  teamId         String?
+  userId         String?
+  expiresAt      DateTime                @db.Timestamptz(3)
+  createdAt      DateTime                @default(now())
+  completedAt    DateTime?               @db.Timestamptz(3)
+
+  team Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([scope, key])
+  @@index([teamId, createdAt])
+  @@index([expiresAt])
+}
+
+model BillingLedgerTransaction {
+  id                   String                       @id @default(uuid())
+  teamId               String?
+  subscriptionId       String?
+  invoiceId            String?
+  externalReference    String                       @unique @db.VarChar(255)
+  type                 BillingLedgerTransactionType
+  status               BillingLedgerTransactionStatus @default(DRAFT)
+  currency             String                       @default("USD") @db.Char(3)
+  totalDebitCents      Int
+  totalCreditCents     Int
+  description          String
+  metadata             Json?
+  occurredAt           DateTime                     @db.Timestamptz(3)
+  postedAt             DateTime?                    @db.Timestamptz(3)
+  createdAt            DateTime                     @default(now())
+
+  team         Team?                @relation(fields: [teamId], references: [id], onDelete: Restrict)
+  subscription BillingSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  invoice      BillingInvoice?      @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  entries      BillingLedgerEntry[]
+
+  @@index([teamId, occurredAt])
+  @@index([subscriptionId, occurredAt])
+  @@index([status, occurredAt])
+}
+
+model BillingLedgerEntry {
+  id            String   @id @default(uuid())
+  transactionId String
+  accountCode   String   @db.VarChar(64)
+  debitCents    Int      @default(0)
+  creditCents   Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  transaction BillingLedgerTransaction @relation(fields: [transactionId], references: [id], onDelete: Restrict)
+
+  @@index([transactionId])
+  @@index([accountCode, createdAt])
 }

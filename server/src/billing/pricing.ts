@@ -80,6 +80,7 @@ export interface ImmediateUpgradeProration {
   oldUnusedCreditCents: number;
   newRemainingCostCents: number;
   immediateChargeCents: number;
+  deferredCreditCents: number;
   remainingSeconds: number;
   periodSeconds: number;
 }
@@ -259,11 +260,15 @@ export const calculateImmediateUpgradeProration = (
     window.remainingSeconds,
     window.periodSeconds
   );
+  const netAdjustmentCents = newRemainingCostCents - oldUnusedCreditCents;
 
   return {
     oldUnusedCreditCents,
     newRemainingCostCents,
-    immediateChargeCents: newRemainingCostCents - oldUnusedCreditCents,
+    immediateChargeCents: Math.max(0, netAdjustmentCents),
+    // A seat reduction can make a nominal plan upgrade net negative. Do not
+    // return a negative payment; carry that difference as a future credit.
+    deferredCreditCents: Math.max(0, -netAdjustmentCents),
     remainingSeconds: window.remainingSeconds,
     periodSeconds: window.periodSeconds,
   };

@@ -71,6 +71,7 @@ describe('proration', () => {
     assert.equal(result.oldUnusedCreditCents, 1_333);
     assert.equal(result.newRemainingCostCents, 3_333);
     assert.equal(result.immediateChargeCents, 2_000);
+    assert.equal(result.deferredCreditCents, 0);
   });
 
   it('charges the full difference at period start', () => {
@@ -83,6 +84,7 @@ describe('proration', () => {
       new Date('2030-01-01T00:00:00Z')
     );
     assert.equal(result.immediateChargeCents, 3_000);
+    assert.equal(result.deferredCreditCents, 0);
   });
 
   it('rounds both costs down near period end', () => {
@@ -97,6 +99,7 @@ describe('proration', () => {
     assert.equal(result.oldUnusedCreditCents, 0);
     assert.equal(result.newRemainingCostCents, 0);
     assert.equal(result.immediateChargeCents, 0);
+    assert.equal(result.deferredCreditCents, 0);
   });
 
   it('defers downgrades without an immediate refund', () => {
@@ -160,6 +163,7 @@ describe('proration', () => {
     assert.equal(secondChange.oldUnusedCreditCents, 1_666);
     assert.equal(secondChange.newRemainingCostCents, 4_000);
     assert.equal(secondChange.immediateChargeCents, 2_334);
+    assert.equal(secondChange.deferredCreditCents, 0);
   });
 
   it('uses actual UTC elapsed seconds across a leap-year February period', () => {
@@ -180,6 +184,21 @@ describe('proration', () => {
     const billingPeriod = period('2030-01-01T00:00:00Z', '2030-01-31T00:00:00Z');
     assert.equal(unusedPlanCreditCents('STARTER', 5, billingPeriod, new Date('2030-01-11T00:00:00Z')), 1_333);
     assert.equal(remainingPeriodCostCents('TEAM', 15, billingPeriod, new Date('2030-01-11T00:00:00Z')), 3_333);
+  });
+
+  it('does not return a negative charge when extra-seat reduction outweighs a plan upgrade', () => {
+    const result = calculateImmediateUpgradeProration(
+      'TEAM',
+      'BUSINESS',
+      100,
+      40,
+      period('2030-01-01T00:00:00Z', '2030-01-31T00:00:00Z'),
+      new Date('2030-01-11T00:00:00Z')
+    );
+    assert.equal(result.oldUnusedCreditCents, 20_333);
+    assert.equal(result.newRemainingCostCents, 8_000);
+    assert.equal(result.immediateChargeCents, 0);
+    assert.equal(result.deferredCreditCents, 12_333);
   });
 });
 
