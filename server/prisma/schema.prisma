@@ -298,8 +298,10 @@ model BillingInvoice {
 model BillingPaymentAttempt {
   id                String                       @id @default(uuid())
   invoiceId         String
+  providerReference  String?                      @unique @db.VarChar(255)
   providerPaymentId String?                      @unique @db.VarChar(255)
   idempotencyKey    String                       @unique @db.VarChar(255)
+  idempotencyKeyId  String?                      @unique
   attemptNumber     Int
   amountCents       Int
   status            BillingPaymentAttemptStatus @default(PENDING)
@@ -307,7 +309,8 @@ model BillingPaymentAttempt {
   failureMessage    String?
   createdAt         DateTime                     @default(now())
 
-  invoice BillingInvoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  invoice           BillingInvoice        @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  idempotencyRecord BillingIdempotencyKey? @relation(fields: [idempotencyKeyId], references: [id], onDelete: Restrict)
 
   @@unique([invoiceId, attemptNumber])
   @@index([status, createdAt])
@@ -345,6 +348,8 @@ model BillingIdempotencyKey {
   expiresAt      DateTime                @db.Timestamptz(3)
   createdAt      DateTime                @default(now())
   completedAt    DateTime?               @db.Timestamptz(3)
+
+  paymentAttempt BillingPaymentAttempt?
 
   team Team? @relation(fields: [teamId], references: [id], onDelete: SetNull)
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
