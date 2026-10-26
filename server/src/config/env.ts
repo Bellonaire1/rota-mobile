@@ -11,6 +11,10 @@ const envSchema = z.object({
   JWT_ACCESS_SECRET: z.string().min(32),
   ACCESS_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(15),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),
+  PAYSTACK_MODE: z.literal('test').default('test'),
+  PAYSTACK_TEST_SECRET_KEY: z.string().min(1).optional(),
+  PAYSTACK_API_BASE_URL: z.string().url().default('https://api.paystack.co'),
+  PAYSTACK_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
 });
 
 const parsedEnv = envSchema.safeParse(process.env);
