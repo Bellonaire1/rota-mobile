@@ -325,6 +325,9 @@ model BillingWebhookEvent {
   signatureVerifiedAt DateTime                  @db.Timestamptz(3)
   status              BillingWebhookEventStatus @default(RECEIVED)
   attemptCount        Int                       @default(0)
+  nextAttemptAt       DateTime                  @default(now()) @db.Timestamptz(3)
+  processingLeaseUntil DateTime?                @db.Timestamptz(3)
+  processingLeaseToken String?                  @db.VarChar(128)
   processedAt         DateTime?                 @db.Timestamptz(3)
   lastError           String?
   receivedAt          DateTime                  @default(now())
@@ -332,6 +335,8 @@ model BillingWebhookEvent {
 
   @@unique([provider, providerEventId])
   @@index([status, receivedAt])
+  @@index([status, nextAttemptAt])
+  @@index([status, processingLeaseUntil])
   @@index([eventType, receivedAt])
 }
 
