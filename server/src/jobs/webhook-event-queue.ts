@@ -32,7 +32,7 @@ export class WebhookEventQueue {
     return Number(rows[0]?.count ?? 0);
   }
 
-  async claimOne(leaseDurationMs: number, provider?: string, eventType?: string): Promise<WebhookWorkItem | null> {
+  async claimOne(leaseDurationMs: number, provider?: string, eventType?: string, receivedAfter?: Date): Promise<WebhookWorkItem | null> {
     const token = randomBytes(32).toString('hex');
     const rows = await this.database.$transaction(async (transaction) => transaction.$queryRaw<ClaimedRow[]>`
       WITH candidate AS (
@@ -50,6 +50,7 @@ export class WebhookEventQueue {
         )
         AND (${provider ?? null}::text IS NULL OR "provider" = ${provider ?? null})
         AND (${eventType ?? null}::text IS NULL OR "eventType" = ${eventType ?? null})
+        AND (${receivedAfter ?? null}::timestamptz IS NULL OR "receivedAt" >= ${receivedAfter ?? null})
         ORDER BY "nextAttemptAt" ASC, "receivedAt" ASC
         FOR UPDATE SKIP LOCKED
         LIMIT 1

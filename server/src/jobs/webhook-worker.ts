@@ -1,12 +1,15 @@
 import { BillingWebhookEventStatus, PrismaClient } from '@prisma/client';
 import { env } from '../config/env';
 import { prisma } from '../database/prisma';
+import type { PaymentGateway } from '../billing/payments';
+import { PaystackReconciliationProcessor } from '../services/paystack-reconciliation.service';
 import { WebhookEventQueue, type WebhookWorkItem } from './webhook-event-queue';
 import { assertApprovedWebhookProcessor, FailClosedWebhookEventProcessor, PermanentWebhookError, RetryableWebhookError, type WebhookEventProcessor } from './webhook-event-processor';
 
 export type WebhookWorkerConfig = {
   provider?: string;
   eventType?: string;
+  receivedAfter?: Date;
   pollIntervalMs: number;
   leaseDurationMs: number;
   maxAttempts: number;
@@ -58,7 +61,7 @@ export class WebhookWorker {
   async runOnce(): Promise<number> {
     const claims: WebhookWorkItem[] = [];
     for (let index = 0; index < this.config.batchSize; index += 1) {
-      const event = await this.queue.claimOne(this.config.leaseDurationMs, this.config.provider, this.config.eventType);
+      const event = await this.queue.claimOne(this.config.leaseDurationMs, this.config.provider, this.config.eventType, this.config.receivedAfter);
       if (!event) break;
       claims.push(event);
     }
@@ -104,6 +107,26 @@ export class WebhookWorker {
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
   }
 }
+
+/**
+ * Explicit dependency-injection path for reviewed reconciliation deployments
+ * and tests. The executable worker deliberately does not call this factory.
+ */
+export const createPaystackReconciliationWorker = (
+  database: PrismaClient,
+  gateway: PaymentGateway,
+  config: WebhookWorkerConfig = {
+    ...webhookWorkerConfig,
+    provider: 'paystack',
+    eventType: 'charge.success',
+  },
+  logger: Pick<Console, 'error' | 'info' | 'warn'> = console,
+): WebhookWorker => new WebhookWorker(
+  new WebhookEventQueue(database),
+  new PaystackReconciliationProcessor(database, gateway),
+  { ...config, provider: 'paystack', eventType: 'charge.success' },
+  logger,
+);
 
 const assertNoLegacyProcessingEvents = async (queue: WebhookEventQueue): Promise<void> => {
   const count = await queue.countLegacyProcessingEvents();
