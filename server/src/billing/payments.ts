@@ -335,6 +335,9 @@ export class MockPaystackGateway implements PaymentGateway {
     if (!payment.verification) {
       throw new PaymentGatewayError('PROVIDER_FAILURE', 'Mock payment is still pending');
     }
+    if (input.expectedMetadata && !sameMetadata(payment.input.metadata, input.expectedMetadata)) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock verification metadata did not match the expected payment');
+    }
     return this.assertVerified(payment.verification, input);
   }
 
