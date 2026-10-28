@@ -353,6 +353,7 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
     const matchingCheckouts: Array<{
       providerPlanCode: string;
       amountCents: number;
+      operation: PersistedCheckout;
     }> = [];
 
     for (const invoice of subscription.invoices) {
@@ -373,6 +374,7 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
             matchingCheckouts.push({
               providerPlanCode: op.providerPlanCode,
               amountCents: op.amountCents,
+              operation: op,
             });
           }
         } catch (error) {
@@ -432,12 +434,13 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
       throw new ReconciliationPermanentError('Verified provider subscription does not match the expected recurring checkout');
     }
 
-    await this.applySubscriptionLinkage(subscription.id, verified);
+    await this.applySubscriptionLinkage(subscription.id, verified, checkout.operation);
   }
 
   private async applySubscriptionLinkage(
     subscriptionId: string,
     verified: VerifiedSubscription,
+    operation: PersistedCheckout,
   ): Promise<void> {
     for (let retry = 1; retry <= TRANSACTION_RETRIES; retry += 1) {
       try {
@@ -456,6 +459,9 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
           }
 
           if (current.providerSubscriptionId === verified.subscriptionCode) {
+            if (current.status === BillingSubscriptionStatus.PENDING_CHECKOUT) {
+              await this.activateSubscriptionIfEligible(transaction, current.id, operation);
+            }
             return;
           }
 
@@ -481,6 +487,8 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
               version: { increment: 1 },
             },
           });
+
+          await this.activateSubscriptionIfEligible(transaction, current.id, operation);
         });
         return;
       } catch (error) {
@@ -494,6 +502,110 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
         throw error;
       }
     }
+  }
+
+  private async activateSubscriptionIfEligible(
+    transaction: Prisma.TransactionClient,
+    subscriptionId: string,
+    operation: PersistedCheckout,
+  ): Promise<boolean> {
+    const subscription = await transaction.billingSubscription.findUnique({
+      where: { id: subscriptionId },
+      include: {
+        currentPlan: true,
+        currentPrice: true,
+      },
+    });
+    if (!subscription) return false;
+    if (subscription.status === BillingSubscriptionStatus.ACTIVE) return true;
+
+    if (operation.recurring) {
+      if (!subscription.providerSubscriptionId || !subscription.providerCustomerId) {
+        return false;
+      }
+    }
+
+    const attempt = await transaction.billingPaymentAttempt.findFirst({
+      where: {
+        invoice: { subscriptionId: subscription.id },
+        status: BillingPaymentAttemptStatus.SUCCEEDED,
+      },
+      include: {
+        invoice: true,
+        idempotencyRecord: true,
+      },
+      orderBy: { attemptNumber: 'asc' },
+    });
+    if (!attempt || attempt.invoice.status !== BillingInvoiceStatus.PAID || !attempt.providerPaymentId) {
+      return false;
+    }
+
+    const externalReference = `paystack:payment:${attempt.providerPaymentId}`;
+    const ledger = await transaction.billingLedgerTransaction.findUnique({
+      where: { externalReference },
+    });
+    if (!ledger || ledger.status !== BillingLedgerTransactionStatus.POSTED) {
+      return false;
+    }
+
+    if (subscription.currentPlan.code !== operation.planCode) {
+      throw new ReconciliationPermanentError('Subscription plan does not match the persisted checkout plan');
+    }
+    if (subscription.currency !== 'USD' || attempt.invoice.currency !== 'USD' || operation.currency !== 'USD') {
+      throw new ReconciliationPermanentError('Subscription currency must be USD');
+    }
+
+    const price = subscription.currentPrice;
+    const pricing = calculateHistoricalPricing(price, operation.billableStaffSeats);
+    if (pricing.monthlyTotalCents !== attempt.amountCents || pricing.monthlyTotalCents !== operation.amountCents) {
+      throw new ReconciliationPermanentError('Persisted billing amount does not match the payment attempt');
+    }
+
+    let period = await transaction.billingPeriod.findFirst({
+      where: { subscriptionId: subscription.id },
+    });
+    const periodStart = attempt.invoice.paidAt ?? new Date(Math.floor(Date.now() / 1_000) * 1_000);
+    const periodEnd = addOneCalendarMonth(periodStart);
+
+    if (!period) {
+      period = await transaction.billingPeriod.create({
+        data: {
+          subscriptionId: subscription.id,
+          sequence: 1,
+          startsAt: periodStart,
+          endsAt: periodEnd,
+          planCodeSnapshot: operation.planCode,
+          monthlyPriceCents: price.monthlyPriceCents,
+          includedStaffSeats: price.includedStaffSeats,
+          extraStaffSeatPriceCents: price.extraStaffSeatPriceCents,
+          billableStaffSeats: pricing.billableStaffSeats,
+          extraStaffSeats: pricing.extraStaffSeats,
+          baseAmountCents: pricing.monthlyTotalCents - pricing.extraStaffAmountCents,
+          extraSeatAmountCents: pricing.extraStaffAmountCents,
+          totalAmountCents: attempt.amountCents,
+          currency: 'USD',
+        },
+      });
+    }
+
+    if (attempt.invoice.periodId !== period.id) {
+      await transaction.billingInvoice.update({
+        where: { id: attempt.invoiceId },
+        data: { periodId: period.id },
+      });
+    }
+
+    await transaction.billingSubscription.update({
+      where: { id: subscription.id },
+      data: {
+        status: BillingSubscriptionStatus.ACTIVE,
+        currentPeriodStart: period.startsAt,
+        currentPeriodEnd: period.endsAt,
+        version: { increment: 1 },
+      },
+    });
+
+    return true;
   }
 
   private async applyFinancialState(
@@ -525,14 +637,27 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
           const existingLedger = await transaction.billingLedgerTransaction.findUnique({ where: { externalReference } });
 
           if (attempt.status === BillingPaymentAttemptStatus.SUCCEEDED) {
+            const validSubscriptionStatus = !operation.recurring
+              ? attempt.invoice.subscription.status === BillingSubscriptionStatus.ACTIVE
+              : attempt.invoice.subscription.providerSubscriptionId !== null
+                ? (attempt.invoice.subscription.status === BillingSubscriptionStatus.ACTIVE
+                  || attempt.invoice.subscription.status === BillingSubscriptionStatus.PENDING_CHECKOUT)
+                : attempt.invoice.subscription.status === BillingSubscriptionStatus.PENDING_CHECKOUT;
+
             if (attempt.providerPaymentId !== verified.providerTransactionId
               || attempt.invoice.status !== BillingInvoiceStatus.PAID
               || attempt.invoice.amountPaidCents !== attempt.amountCents
-              || attempt.invoice.subscription.status !== BillingSubscriptionStatus.ACTIVE
+              || !validSubscriptionStatus
               || (attempt.invoice.subscription.providerCustomerId ?? undefined) !== verified.providerCustomerId
               || !existingLedger
               || existingLedger.status !== BillingLedgerTransactionStatus.POSTED) {
               throw new ReconciliationPermanentError('Existing successful payment state does not match the verified transaction');
+            }
+
+            if (operation.recurring
+              && attempt.invoice.subscription.providerSubscriptionId !== null
+              && attempt.invoice.subscription.status === BillingSubscriptionStatus.PENDING_CHECKOUT) {
+              await this.activateSubscriptionIfEligible(transaction, attempt.invoice.subscriptionId, operation);
             }
             return;
           }
@@ -581,25 +706,6 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
           }
 
           const periodStart = new Date(Math.floor(Date.now() / 1_000) * 1_000);
-          const periodEnd = addOneCalendarMonth(periodStart);
-          const period = await transaction.billingPeriod.create({
-            data: {
-              subscriptionId: attempt.invoice.subscriptionId,
-              sequence: 1,
-              startsAt: periodStart,
-              endsAt: periodEnd,
-               planCodeSnapshot: operation.planCode,
-               monthlyPriceCents: price.monthlyPriceCents,
-               includedStaffSeats: price.includedStaffSeats,
-               extraStaffSeatPriceCents: price.extraStaffSeatPriceCents,
-               billableStaffSeats: pricing.billableStaffSeats,
-              extraStaffSeats: pricing.extraStaffSeats,
-              baseAmountCents: pricing.monthlyTotalCents - pricing.extraStaffAmountCents,
-              extraSeatAmountCents: pricing.extraStaffAmountCents,
-              totalAmountCents: attempt.amountCents,
-              currency: 'USD',
-            },
-          });
 
           await transaction.billingPaymentAttempt.update({
             where: { id: attempt.id },
@@ -607,16 +713,13 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
           });
           await transaction.billingInvoice.update({
             where: { id: attempt.invoiceId },
-            data: { status: BillingInvoiceStatus.PAID, amountPaidCents: attempt.amountCents, paidAt: periodStart, periodId: period.id },
+            data: { status: BillingInvoiceStatus.PAID, amountPaidCents: attempt.amountCents, paidAt: periodStart },
           });
           await transaction.billingSubscription.update({
             where: { id: attempt.invoice.subscriptionId },
             data: {
-              status: BillingSubscriptionStatus.ACTIVE,
               provider: PAYSTACK_PROVIDER,
               providerCustomerId: attempt.invoice.subscription.providerCustomerId ?? verified.providerCustomerId ?? null,
-              currentPeriodStart: periodStart,
-              currentPeriodEnd: periodEnd,
               version: { increment: 1 },
             },
           });
@@ -647,6 +750,11 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
             where: { id: ledger.id },
             data: { status: BillingLedgerTransactionStatus.POSTED, postedAt: periodStart },
           });
+
+          const canActivate = !operation.recurring || attempt.invoice.subscription.providerSubscriptionId !== null;
+          if (canActivate) {
+            await this.activateSubscriptionIfEligible(transaction, attempt.invoice.subscriptionId, operation);
+          }
         });
         return;
       } catch (error) {

@@ -124,7 +124,6 @@ export const createPaystackReconciliationWorker = (
     ...webhookWorkerConfig,
     provider: 'paystack',
     ...config,
-    eventType: 'eventType' in config ? config.eventType : 'charge.success',
   },
   logger,
 );
