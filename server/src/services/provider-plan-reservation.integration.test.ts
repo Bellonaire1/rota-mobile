@@ -524,4 +524,256 @@ describe('ProviderPlanReservationService', { concurrency: false, skip: reconcili
     assert.notEqual(plan1.planName, plan2.planName);
     assert.notEqual(plan1.providerPlanId, plan2.providerPlanId);
   });
+
+  it('never calls provider createPlan on an existing RESERVED reservation', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const idempotencyKey = `plan-key-${randomUUID()}`;
+
+    // Establish reservation in state RESERVED
+    await service.reserve({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey });
+
+    let createPlanCalls = 0;
+    const spyGateway = {
+      ...new MockPaystackGateway(),
+      async createPlan() {
+        createPlanCalls += 1;
+        throw new Error('Should not be called');
+      },
+    };
+
+    await assert.rejects(
+      service.getOrCreatePlan(
+        { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+        spyGateway as any
+      ),
+      (error: unknown) => error instanceof ProviderPlanReservationConflictError
+    );
+
+    assert.equal(createPlanCalls, 0);
+  });
+
+  it('treats network failures and HTTP errors as uncertain outcomes requiring recovery', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+
+    // 1. Network failure
+    const netKey = `plan-key-net-${randomUUID()}`;
+    gateway.setNextPlanResult(new PaymentGatewayError('NETWORK', 'Socket hang up'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: netKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // Re-attempt fails closed
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: netKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // 2. HTTP 502/500 error
+    const httpKey = `plan-key-http-${randomUUID()}`;
+    gateway.setNextPlanResult(new PaymentGatewayError('HTTP', 'Paystack 502 Bad Gateway'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: httpKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // Re-attempt fails closed
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: httpKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+  });
+
+  it('treats malformed provider responses and attribute mismatches as uncertain outcomes', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+
+    // 1. Invalid response
+    const invalidKey = `plan-key-inv-${randomUUID()}`;
+    gateway.setNextPlanResult(new PaymentGatewayError('INVALID_RESPONSE', 'Invalid plan ID from Paystack'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: invalidKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // 2. Verification mismatch
+    const mismatchKey = `plan-key-mis-${randomUUID()}`;
+    gateway.setNextPlanResult(new PaymentGatewayError('VERIFICATION_MISMATCH', 'Currency mismatched'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: mismatchKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+  });
+
+  it('protects crash-style pre-call state and allows subsequent verified recovery', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+    const idempotencyKey = `plan-key-crash-${randomUUID()}`;
+
+    // Establish reservation
+    await service.reserve({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey });
+
+    // Simulate pre-call transition having occurred before crash
+    const scope = `team-provider-plan:${teamId}`;
+    const record = await prisma.billingIdempotencyKey.findUniqueOrThrow({
+      where: { scope_key: { scope, key: idempotencyKey } },
+    });
+    const current = record.responseBody as any;
+    await prisma.billingIdempotencyKey.update({
+      where: { scope_key: { scope, key: idempotencyKey } },
+      data: {
+        responseBody: {
+          ...current,
+          state: 'RECOVERY_REQUIRED',
+          failureCode: 'EXECUTION_PENDING',
+          failureMessage: 'Provider plan creation initiated; outcome pending verification',
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    // Caller retrying getOrCreatePlan is blocked from calling createPlan again
+    let calls = 0;
+    const trackingGateway = {
+      ...gateway,
+      async createPlan() {
+        calls += 1;
+        throw new Error('Should not be called');
+      },
+    };
+
+    await assert.rejects(
+      service.getOrCreatePlan(
+        { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+        trackingGateway as any
+      ),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+    assert.equal(calls, 0);
+
+    // Recovery succeeds when verified plan exists
+    const candidatePlanCode = 'PLN_recovered_after_crash';
+    gateway.setPlanLookupResult(candidatePlanCode, {
+      providerPlanId: '77777',
+      planCode: candidatePlanCode,
+      name: `Rota TEAM (10 seats) - team:${teamId}`,
+      amountCents: 5_000,
+      currency: 'USD',
+      interval: 'monthly',
+    });
+
+    const recovered = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      candidatePlanCode,
+      gateway
+    );
+    assert.ok(recovered);
+    assert.equal(recovered.state, 'COMPLETED');
+    assert.equal(recovered.providerPlanCode, candidatePlanCode);
+  });
+
+  it('treats post-provider persistence failure as RECOVERY_REQUIRED and allows recovery', async () => {
+    const { teamId } = await createTeam();
+    const idempotencyKey = `plan-key-persist-${randomUUID()}`;
+    const gateway = new MockPaystackGateway();
+
+    let failCompletionUpdate = true;
+    const failingPrisma = new Proxy(prisma, {
+      get(target, prop, receiver) {
+        if (prop === 'billingIdempotencyKey') {
+          const originalKey = target.billingIdempotencyKey;
+          return new Proxy(originalKey, {
+            get(kTarget, kProp, kReceiver) {
+              if (kProp === 'update') {
+                return async (args: any) => {
+                  if (failCompletionUpdate && args?.data?.status === 'SUCCEEDED') {
+                    throw new Error('Database connection dropped during completion update');
+                  }
+                  return originalKey.update(args);
+                };
+              }
+              return Reflect.get(kTarget, kProp, kReceiver);
+            },
+          });
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    const failingService = new ProviderPlanReservationService(failingPrisma as any);
+
+    await assert.rejects(
+      failingService.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // Verify DB record is in RECOVERY_REQUIRED
+    const service = new ProviderPlanReservationService(prisma);
+    const scope = `team-provider-plan:${teamId}`;
+    const record = await prisma.billingIdempotencyKey.findUnique({
+      where: { scope_key: { scope, key: idempotencyKey } },
+    });
+    assert.ok(record);
+    assert.equal((record.responseBody as any).state, 'RECOVERY_REQUIRED');
+
+    // Recovery succeeds
+    failCompletionUpdate = false;
+    const candidateCode = 'PLN_mock_5000_1';
+    gateway.setPlanLookupResult(candidateCode, {
+      providerPlanId: '1',
+      planCode: candidateCode,
+      name: `Rota TEAM (10 seats) - team:${teamId}`,
+      amountCents: 5_000,
+      currency: 'USD',
+      interval: 'monthly',
+    });
+
+    const recovered = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      candidateCode,
+      gateway
+    );
+    assert.ok(recovered);
+    assert.equal(recovered.state, 'COMPLETED');
+  });
+
+  it('protects concurrent getOrCreatePlan execution without duplicate provider plan creation', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const idempotencyKey = `plan-key-concurrent-${randomUUID()}`;
+
+    let createPlanCount = 0;
+    const delayedGateway = {
+      ...new MockPaystackGateway(),
+      async createPlan(planInput: any) {
+        createPlanCount += 1;
+        await new Promise((r) => setTimeout(r, 50));
+        return {
+          providerPlanId: '88888',
+          planCode: `PLN_concurrent_${planInput.amountCents}`,
+          name: planInput.name,
+          amountCents: planInput.amountCents,
+          interval: 'monthly' as const,
+          currency: 'USD' as const,
+        };
+      },
+    };
+
+    const results = await Promise.allSettled([
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, delayedGateway as any),
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, delayedGateway as any),
+    ]);
+
+    // createPlan was called at most once
+    assert.equal(createPlanCount, 1);
+
+    // At least one succeeded or both converged safely
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    assert.ok(fulfilled.length >= 1);
+  });
 });

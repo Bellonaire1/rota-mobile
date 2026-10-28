@@ -220,6 +220,55 @@ export class ProviderPlanReservationService {
     throw new ProviderPlanReservationError('Exhausted retry attempts acquiring provider-plan reservation');
   }
 
+  private async transitionToExecution(
+    scope: string,
+    key: string
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= MAX_RESERVATION_ATTEMPTS; attempt++) {
+      try {
+        await this.database.$transaction(async (tx) => {
+          const record = await tx.billingIdempotencyKey.findUnique({
+            where: { scope_key: { scope, key } },
+          });
+          if (!record) {
+            throw new ProviderPlanReservationError('Reservation not found');
+          }
+          const current = parseReservation(record.responseBody);
+          if (current.state !== 'RESERVED') {
+            throw new ProviderPlanReservationConflictError(
+              `Cannot execute provider plan creation from state ${current.state}`
+            );
+          }
+          const now = new Date().toISOString();
+          const inFlightReservation: PersistedProviderPlanReservation = {
+            ...current,
+            state: 'RECOVERY_REQUIRED',
+            failureCode: 'EXECUTION_PENDING',
+            failureMessage: 'Provider plan creation initiated; outcome pending verification',
+            updatedAt: now,
+          };
+          await tx.billingIdempotencyKey.update({
+            where: { scope_key: { scope, key } },
+            data: {
+              responseBody: inFlightReservation as unknown as Prisma.InputJsonValue,
+            },
+          });
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+        return;
+      } catch (error) {
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          (error.code === 'P2002' || error.code === 'P2034') &&
+          attempt < MAX_RESERVATION_ATTEMPTS
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new ProviderPlanReservationError('Exhausted retry attempts transitioning reservation to execution');
+  }
+
   async getOrCreatePlan(
     input: ProviderPlanReservationInput,
     gateway: PaymentGateway
@@ -240,10 +289,19 @@ export class ProviderPlanReservationService {
           `Provider plan creation previously failed: ${reservation.failureMessage ?? 'unknown'}`
         );
       }
+      if (reservation.state === 'RESERVED') {
+        throw new ProviderPlanReservationConflictError(
+          'Provider plan creation reservation is already in progress'
+        );
+      }
       return reservation;
     }
 
     const scope = `${PROVIDER_PLAN_SCOPE_PREFIX}:${input.teamId}`;
+
+    // Establish a durable, atomic, pre-call state transition that makes execution
+    // attempts recoverable BEFORE the external createPlan call. Concurrency-safe: commits before HTTP call.
+    await this.transitionToExecution(scope, input.idempotencyKey);
 
     let plan: ProviderPlan;
     try {
@@ -255,43 +313,53 @@ export class ProviderPlanReservationService {
       });
     } catch (error) {
       const now = new Date().toISOString();
-      if (error instanceof PaymentGatewayError && error.code === 'TIMEOUT') {
-        const timeoutReservation: PersistedProviderPlanReservation = {
+
+      // Genuinely definitive provider rejection: provider returned status: false (HTTP 200 with rejection body)
+      if (error instanceof PaymentGatewayError && error.code === 'PROVIDER_FAILURE') {
+        const failedReservation: PersistedProviderPlanReservation = {
           ...reservation,
-          state: 'RECOVERY_REQUIRED',
-          failureCode: 'TIMEOUT',
+          state: 'FAILED',
+          failureCode: error.code,
           failureMessage: error.message,
           updatedAt: now,
         };
         await this.database.billingIdempotencyKey.update({
           where: { scope_key: { scope, key: input.idempotencyKey } },
           data: {
-            responseBody: timeoutReservation as unknown as Prisma.InputJsonValue,
+            status: BillingIdempotencyStatus.FAILED,
+            completedAt: new Date(),
+            responseBody: failedReservation as unknown as Prisma.InputJsonValue,
           },
         });
-        throw new ProviderPlanRecoveryRequiredError(
-          'Provider plan creation timed out and requires reconciliation'
-        );
+        throw error;
       }
 
+      // All other outcomes are potentially uncertain (TIMEOUT, NETWORK, HTTP, INVALID_RESPONSE, VERIFICATION_MISMATCH, or unexpected Error).
+      // Fail closed into RECOVERY_REQUIRED.
       const failureCode = error instanceof PaymentGatewayError ? error.code : 'UNKNOWN';
       const failureMessage = error instanceof Error ? error.message : 'Unknown error';
-      const failedReservation: PersistedProviderPlanReservation = {
+      const uncertainReservation: PersistedProviderPlanReservation = {
         ...reservation,
-        state: 'FAILED',
+        state: 'RECOVERY_REQUIRED',
         failureCode,
         failureMessage,
         updatedAt: now,
       };
-      await this.database.billingIdempotencyKey.update({
-        where: { scope_key: { scope, key: input.idempotencyKey } },
-        data: {
-          status: BillingIdempotencyStatus.FAILED,
-          completedAt: new Date(),
-          responseBody: failedReservation as unknown as Prisma.InputJsonValue,
-        },
-      });
-      throw error;
+
+      try {
+        await this.database.billingIdempotencyKey.update({
+          where: { scope_key: { scope, key: input.idempotencyKey } },
+          data: {
+            responseBody: uncertainReservation as unknown as Prisma.InputJsonValue,
+          },
+        });
+      } catch {
+        // Pre-call transition already made row RECOVERY_REQUIRED
+      }
+
+      throw new ProviderPlanRecoveryRequiredError(
+        `Provider plan creation outcome is uncertain (${failureCode}): ${failureMessage}`
+      );
     }
 
     const now = new Date().toISOString();
@@ -303,16 +371,24 @@ export class ProviderPlanReservationService {
       updatedAt: now,
     };
 
-    await this.database.billingIdempotencyKey.update({
-      where: { scope_key: { scope, key: input.idempotencyKey } },
-      data: {
-        status: BillingIdempotencyStatus.SUCCEEDED,
-        completedAt: new Date(),
-        responseBody: completedReservation as unknown as Prisma.InputJsonValue,
-      },
-    });
+    try {
+      await this.database.billingIdempotencyKey.update({
+        where: { scope_key: { scope, key: input.idempotencyKey } },
+        data: {
+          status: BillingIdempotencyStatus.SUCCEEDED,
+          completedAt: new Date(),
+          responseBody: completedReservation as unknown as Prisma.InputJsonValue,
+        },
+      });
 
-    return completedReservation;
+      return completedReservation;
+    } catch {
+      // The provider plan was created, but persisting the completed record failed.
+      // Pre-call transition already made row RECOVERY_REQUIRED, so it is safely recoverable.
+      throw new ProviderPlanRecoveryRequiredError(
+        'Provider plan was created but recording the result failed; reconciliation required'
+      );
+    }
   }
 
   async resolveReconciliation(
