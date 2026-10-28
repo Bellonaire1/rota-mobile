@@ -22,6 +22,7 @@ type Fixture = {
   attemptId: string;
   idempotencyId: string;
   reference: string;
+  providerCustomerId?: string;
 };
 
 type HistoricalPriceInput = {
@@ -44,7 +45,13 @@ const eventFor = (reference: string, payloadData: Record<string, unknown> = {}) 
   payload: { event: 'charge.success', data: { reference, ...payloadData } },
 });
 
-const createFixture = async (gateway: MockPaystackGateway, options: { metadata?: Readonly<Record<string, string>> } = {}): Promise<Fixture> => {
+const createFixture = async (
+  gateway: MockPaystackGateway,
+  options: {
+    metadata?: Readonly<Record<string, string>>;
+    providerCustomerId?: string | null;
+  } = {}
+): Promise<Fixture> => {
   const user = await prisma.user.create({
     data: { email: `reconciliation-${randomUUID()}@example.com`, name: 'Reconciliation Test', passwordHash: 'test-hash' },
   });
@@ -104,8 +111,20 @@ const createFixture = async (gateway: MockPaystackGateway, options: { metadata?:
     idempotencyKey: idempotency.key,
     metadata: options.metadata ?? { mode: 'test', subscriptionId: subscription.id },
   });
-  gateway.simulateSuccess(reference);
-  const fixture = { userId: user.id, teamId: team.id, subscriptionId: subscription.id, invoiceId: invoice.id, attemptId: attempt.id, idempotencyId: idempotency.id, reference };
+  const customerCode = options.providerCustomerId === null
+    ? undefined
+    : (options.providerCustomerId ?? `CUS_test_${randomUUID().replace(/-/g, '').slice(0, 16)}`);
+  gateway.simulateSuccess(reference, customerCode ? { providerCustomerId: customerCode } : undefined);
+  const fixture: Fixture = {
+    userId: user.id,
+    teamId: team.id,
+    subscriptionId: subscription.id,
+    invoiceId: invoice.id,
+    attemptId: attempt.id,
+    idempotencyId: idempotency.id,
+    reference,
+    ...(customerCode ? { providerCustomerId: customerCode } : {}),
+  };
   return fixture;
 };
 
@@ -160,6 +179,8 @@ describe('Paystack reconciliation processor', { concurrency: false, skip: reconc
     assert.equal(invoice.amountPaidCents, amountCents);
     assert.equal(invoice.periodId, period.id);
     assert.equal(subscription.status, BillingSubscriptionStatus.ACTIVE);
+    assert.equal(subscription.providerCustomerId, fixture.providerCustomerId);
+    assert.match(subscription.providerCustomerId ?? '', /^CUS_/);
     assert.equal(ledger.status, BillingLedgerTransactionStatus.POSTED);
     assert.equal(ledger.totalDebitCents, amountCents);
     assert.equal(ledger.totalCreditCents, amountCents);
@@ -319,6 +340,107 @@ describe('Paystack reconciliation processor', { concurrency: false, skip: reconc
     await processor.process(eventFor(fixture.reference, { amount: 1 }));
     const after = await prisma.billingInvoice.findUniqueOrThrow({ where: { id: fixture.invoiceId } });
     assert.deepEqual(after, before);
+  });
+
+  it('activates cleanly without fabricating an ID when provider customer code is missing', async () => {
+    const gateway = new MockPaystackGateway();
+    const fixture = await createFixture(gateway, { providerCustomerId: null });
+    assert.equal(fixture.providerCustomerId, undefined);
+    await new PaystackReconciliationProcessor(prisma, gateway).process(eventFor(fixture.reference));
+
+    const subscription = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: fixture.subscriptionId } });
+    const attempt = await prisma.billingPaymentAttempt.findUniqueOrThrow({ where: { id: fixture.attemptId } });
+    const invoice = await prisma.billingInvoice.findUniqueOrThrow({ where: { id: fixture.invoiceId } });
+
+    assert.equal(subscription.status, BillingSubscriptionStatus.ACTIVE);
+    assert.equal(subscription.providerCustomerId, null);
+    assert.equal(attempt.status, BillingPaymentAttemptStatus.SUCCEEDED);
+    assert.equal(invoice.status, BillingInvoiceStatus.PAID);
+  });
+
+  it('rejects an invalid provider customer code without activating or fabricating IDs', async () => {
+    const gateway = new MockPaystackGateway();
+    const fixture = await createFixture(gateway);
+    gateway.setVerificationResult(fixture.reference, {
+      reference: fixture.reference,
+      providerTransactionId: `mock_tx_${fixture.reference}`,
+      providerCustomerId: 'INVALID_NO_PREFIX',
+      amountCents,
+      currency: 'USD',
+      status: 'success',
+    });
+
+    await assertPermanent(new PaystackReconciliationProcessor(prisma, gateway).process(eventFor(fixture.reference)));
+
+    const subscription = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: fixture.subscriptionId } });
+    const attempt = await prisma.billingPaymentAttempt.findUniqueOrThrow({ where: { id: fixture.attemptId } });
+    assert.equal(subscription.status, BillingSubscriptionStatus.PENDING_CHECKOUT);
+    assert.equal(subscription.providerCustomerId, null);
+    assert.equal(attempt.status, BillingPaymentAttemptStatus.PENDING);
+    assert.equal(await prisma.billingLedgerTransaction.count({ where: { subscriptionId: fixture.subscriptionId } }), 0);
+  });
+
+  it('is idempotent on replay with matching customer identity', async () => {
+    const gateway = new MockPaystackGateway();
+    const fixture = await createFixture(gateway);
+    const processor = new PaystackReconciliationProcessor(prisma, gateway);
+
+    await processor.process(eventFor(fixture.reference));
+    const firstSub = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: fixture.subscriptionId } });
+    assert.equal(firstSub.status, BillingSubscriptionStatus.ACTIVE);
+    assert.equal(firstSub.providerCustomerId, fixture.providerCustomerId);
+
+    await processor.process(eventFor(fixture.reference));
+    const secondSub = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: fixture.subscriptionId } });
+    assert.equal(secondSub.providerCustomerId, fixture.providerCustomerId);
+    assert.equal(secondSub.version, firstSub.version);
+    assert.equal(await prisma.billingPeriod.count({ where: { subscriptionId: fixture.subscriptionId } }), 1);
+    assert.equal(await prisma.billingLedgerTransaction.count({ where: { subscriptionId: fixture.subscriptionId } }), 1);
+  });
+
+  it('rejects replay when verified customer identity conflicts with existing subscription', async () => {
+    const gateway = new MockPaystackGateway();
+    const fixture = await createFixture(gateway);
+    const processor = new PaystackReconciliationProcessor(prisma, gateway);
+
+    await processor.process(eventFor(fixture.reference));
+    const originalSub = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: fixture.subscriptionId } });
+    assert.equal(originalSub.providerCustomerId, fixture.providerCustomerId);
+
+    const conflictingCustomerCode = `CUS_conflict_${randomUUID().replace(/-/g, '').slice(0, 10)}`;
+    gateway.setVerificationResult(fixture.reference, {
+      reference: fixture.reference,
+      providerTransactionId: `mock_tx_${fixture.reference}`,
+      providerCustomerId: conflictingCustomerCode,
+      amountCents,
+      currency: 'USD',
+      status: 'success',
+    });
+
+    await assertPermanent(processor.process(eventFor(fixture.reference)));
+
+    const afterSub = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: fixture.subscriptionId } });
+    assert.equal(afterSub.providerCustomerId, fixture.providerCustomerId);
+    assert.notEqual(afterSub.providerCustomerId, conflictingCustomerCode);
+  });
+
+  it('rejects activation if provider customer code is already linked to another subscription', async () => {
+    const gateway = new MockPaystackGateway();
+    const sharedCustomerCode = `CUS_shared_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+    const firstFixture = await createFixture(gateway, { providerCustomerId: sharedCustomerCode });
+    await new PaystackReconciliationProcessor(prisma, gateway).process(eventFor(firstFixture.reference));
+
+    const firstSub = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: firstFixture.subscriptionId } });
+    assert.equal(firstSub.status, BillingSubscriptionStatus.ACTIVE);
+    assert.equal(firstSub.providerCustomerId, sharedCustomerCode);
+
+    const secondFixture = await createFixture(gateway, { providerCustomerId: sharedCustomerCode });
+    await assertPermanent(new PaystackReconciliationProcessor(prisma, gateway).process(eventFor(secondFixture.reference)));
+
+    const secondSub = await prisma.billingSubscription.findUniqueOrThrow({ where: { id: secondFixture.subscriptionId } });
+    assert.equal(secondSub.status, BillingSubscriptionStatus.PENDING_CHECKOUT);
+    assert.equal(secondSub.providerCustomerId, null);
+    assert.equal(await prisma.billingLedgerTransaction.count({ where: { subscriptionId: secondFixture.subscriptionId } }), 0);
   });
 });
 

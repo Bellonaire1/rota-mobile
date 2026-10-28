@@ -9,6 +9,7 @@ import {
 } from '@prisma/client';
 import type { BillingPlanCode as PricingPlanCode } from '../billing/pricing';
 import {
+  PAYSTACK_CUSTOMER_CODE_PATTERN,
   PaymentGatewayError,
   type PaystackCurrency,
   type PaymentGateway,
@@ -114,6 +115,12 @@ const assertVerifiedPayment = (payment: VerifiedPayment, expected: {
     || !payment.providerTransactionId
     || !/^[A-Za-z0-9._:-]{1,200}$/.test(payment.providerTransactionId)) {
     throw new ReconciliationPermanentError('Provider verification did not match the persisted payment operation');
+  }
+  if (payment.providerCustomerId !== undefined) {
+    if (typeof payment.providerCustomerId !== 'string'
+      || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(payment.providerCustomerId)) {
+      throw new ReconciliationPermanentError('Provider customer identity has an invalid format');
+    }
   }
 };
 
@@ -255,6 +262,7 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
               || attempt.invoice.status !== BillingInvoiceStatus.PAID
               || attempt.invoice.amountPaidCents !== attempt.amountCents
               || attempt.invoice.subscription.status !== BillingSubscriptionStatus.ACTIVE
+              || (attempt.invoice.subscription.providerCustomerId ?? undefined) !== verified.providerCustomerId
               || !existingLedger
               || existingLedger.status !== BillingLedgerTransactionStatus.POSTED) {
               throw new ReconciliationPermanentError('Existing successful payment state does not match the verified transaction');
@@ -268,6 +276,20 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
             || attempt.invoice.subscription.status !== BillingSubscriptionStatus.PENDING_CHECKOUT
             || existingLedger) {
             throw new ReconciliationPermanentError('Payment is not in a reconciliable pending state');
+          }
+
+          if (attempt.invoice.subscription.providerCustomerId !== null
+            && attempt.invoice.subscription.providerCustomerId !== verified.providerCustomerId) {
+            throw new ReconciliationPermanentError('Subscription is already associated with a different provider customer');
+          }
+
+          if (verified.providerCustomerId) {
+            const customerOwner = await transaction.billingSubscription.findUnique({
+              where: { providerCustomerId: verified.providerCustomerId },
+            });
+            if (customerOwner && customerOwner.id !== attempt.invoice.subscriptionId) {
+              throw new ReconciliationPermanentError('Provider customer identity is already associated with another subscription');
+            }
           }
 
           const subscription = attempt.invoice.subscription;
@@ -325,6 +347,7 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
             data: {
               status: BillingSubscriptionStatus.ACTIVE,
               provider: PAYSTACK_PROVIDER,
+              providerCustomerId: attempt.invoice.subscription.providerCustomerId ?? verified.providerCustomerId ?? null,
               currentPeriodStart: periodStart,
               currentPeriodEnd: periodEnd,
               version: { increment: 1 },

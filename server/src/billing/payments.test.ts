@@ -231,4 +231,84 @@ describe('Paystack HTTP gateway', () => {
     await assertGatewayError(gateway.initializeTransaction(input({ amountCents: 20.5 })), 'VALIDATION');
     await assertGatewayError(gateway.initializeTransaction(input({ reference: 'bad' })), 'VALIDATION');
   });
+
+  it('extracts and validates Paystack verified customer code', async () => {
+    const gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: {
+        id: 12345,
+        reference: input().reference,
+        amount: 2_000,
+        currency: 'USD',
+        status: 'success',
+        customer: { customer_code: 'CUS_1234567890abcdef' },
+      } }),
+    });
+    const verified = await gateway.verifyTransaction({
+      reference: input().reference,
+      expectedAmountCents: 2_000,
+      expectedCurrency: 'USD',
+    });
+    assert.equal(verified.providerCustomerId, 'CUS_1234567890abcdef');
+  });
+
+  it('omits providerCustomerId when Paystack customer data or customer_code is missing', async () => {
+    const noCustomer = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: {
+        id: 12345, reference: input().reference, amount: 2_000, currency: 'USD', status: 'success',
+      } }),
+    });
+    const verified1 = await noCustomer.verifyTransaction({
+      reference: input().reference, expectedAmountCents: 2_000, expectedCurrency: 'USD',
+    });
+    assert.equal(verified1.providerCustomerId, undefined);
+
+    const emptyCustomer = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: {
+        id: 12345, reference: input().reference, amount: 2_000, currency: 'USD', status: 'success', customer: {},
+      } }),
+    });
+    const verified2 = await emptyCustomer.verifyTransaction({
+      reference: input().reference, expectedAmountCents: 2_000, expectedCurrency: 'USD',
+    });
+    assert.equal(verified2.providerCustomerId, undefined);
+  });
+
+  it('rejects invalid Paystack customer data or malformed customer codes', async () => {
+    for (const badCustomer of [
+      'not-an-object',
+      ['array'],
+      { customer_code: 'NOT_CUS_PREFIX' },
+      { customer_code: 'CUS_' },
+      { customer_code: 12345 },
+      { customer_code: 'CUS_invalid!' },
+    ]) {
+      const badGateway = new PaystackGateway({
+        secretKey: 'sk_test_only-for-tests',
+        fetchImpl: async () => response({ status: true, data: {
+          id: 12345, reference: input().reference, amount: 2_000, currency: 'USD', status: 'success', customer: badCustomer,
+        } }),
+      });
+      await assertGatewayError(badGateway.verifyTransaction({
+        reference: input().reference, expectedAmountCents: 2_000, expectedCurrency: 'USD',
+      }), 'VERIFICATION_MISMATCH');
+    }
+  });
+
+  it('supports simulated provider customer code and validates format in mock gateway', async () => {
+    const gateway = new MockPaystackGateway();
+    await gateway.initializeTransaction(input());
+    gateway.simulateSuccess(input().reference, { providerCustomerId: 'CUS_mock_12345' });
+    const verified = await gateway.verifyTransaction({
+      reference: input().reference, expectedAmountCents: 2_000, expectedCurrency: 'USD',
+    });
+    assert.equal(verified.providerCustomerId, 'CUS_mock_12345');
+
+    assert.throws(
+      () => gateway.simulateSuccess(input().reference, { providerCustomerId: 'bad_code' }),
+      (error: unknown) => error instanceof PaymentGatewayError && error.code === 'VALIDATION'
+    );
+  });
 });

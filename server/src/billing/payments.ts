@@ -50,6 +50,7 @@ export interface VerifyPaymentInput {
 export interface VerifiedPayment {
   readonly reference: string;
   readonly providerTransactionId: string;
+  readonly providerCustomerId?: string;
   readonly amountCents: number;
   readonly currency: PaystackCurrency;
   readonly status: 'success';
@@ -63,6 +64,7 @@ export interface PaymentGateway {
 const SUPPORTED_CURRENCIES = new Set<PaystackCurrency>(['USD', 'NGN', 'GHS', 'ZAR', 'KES']);
 const REFERENCE_PATTERN = /^[A-Za-z0-9.=-]{8,100}$/;
 const IDEMPOTENCY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
+export const PAYSTACK_CUSTOMER_CODE_PATTERN = /^CUS_[A-Za-z0-9._:-]{3,100}$/;
 export const PAYSTACK_USD_MINIMUM_CENTS = 200;
 const PAYSTACK_API_ORIGIN = 'https://api.paystack.co';
 const PAYSTACK_CHECKOUT_ORIGIN = 'https://checkout.paystack.com';
@@ -148,6 +150,7 @@ interface PaystackVerifyData {
   readonly currency?: unknown;
   readonly status?: unknown;
   readonly metadata?: unknown;
+  readonly customer?: unknown;
 }
 
 export interface PaystackGatewayOptions {
@@ -254,9 +257,26 @@ export class PaystackGateway implements PaymentGateway {
     if (input.expectedMetadata && !metadataMatches(data.metadata, input.expectedMetadata)) {
       throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack verification metadata did not match');
     }
+
+    let providerCustomerId: string | undefined;
+    if (data.customer !== undefined && data.customer !== null) {
+      if (typeof data.customer !== 'object' || Array.isArray(data.customer)) {
+        throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack customer data has an invalid format');
+      }
+      const customerRecord = data.customer as Record<string, unknown>;
+      const customerCode = customerRecord.customer_code;
+      if (customerCode !== undefined && customerCode !== null) {
+        if (typeof customerCode !== 'string' || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(customerCode)) {
+          throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack customer code has an invalid format');
+        }
+        providerCustomerId = customerCode;
+      }
+    }
+
     return {
       reference: data.reference,
       providerTransactionId: String(data.id),
+      ...(providerCustomerId !== undefined ? { providerCustomerId } : {}),
       amountCents: data.amount,
       currency: verifiedCurrency,
       status: 'success',
@@ -353,12 +373,18 @@ export class MockPaystackGateway implements PaymentGateway {
     delete payment.verification;
   }
 
-  simulateSuccess(reference: string): void {
+  simulateSuccess(reference: string, options?: { providerCustomerId?: string }): void {
     const payment = this.payments.get(reference);
     if (!payment) throw new PaymentGatewayError('VALIDATION', 'Mock payment was not initialized');
+    if (options?.providerCustomerId !== undefined) {
+      if (typeof options.providerCustomerId !== 'string' || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(options.providerCustomerId)) {
+        throw new PaymentGatewayError('VALIDATION', 'Mock customer code has an invalid format');
+      }
+    }
     payment.verification = {
       reference,
       providerTransactionId: `mock_tx_${reference}`,
+      ...(options?.providerCustomerId !== undefined ? { providerCustomerId: options.providerCustomerId } : {}),
       amountCents: payment.input.amountCents,
       currency: payment.input.currency,
       status: 'success',
@@ -375,6 +401,11 @@ export class MockPaystackGateway implements PaymentGateway {
     if (result.reference !== input.reference || result.amountCents !== input.expectedAmountCents
       || result.currency !== input.expectedCurrency || result.status !== 'success') {
       throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock verification did not match the expected payment');
+    }
+    if (result.providerCustomerId !== undefined) {
+      if (typeof result.providerCustomerId !== 'string' || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(result.providerCustomerId)) {
+        throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock customer code has an invalid format');
+      }
     }
     return result;
   }
