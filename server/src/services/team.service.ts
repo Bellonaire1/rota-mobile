@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../database/prisma';
 import { runSerializable } from '../database/transactions';
 import { AppError } from '../errors/AppError';
+import { assertMembershipSeatEntitlement, resolveSubscriptionEntitlement } from './subscription-entitlement.service';
 import {
   AddTeamMemberInput,
   CreateTeamInput,
@@ -54,6 +55,10 @@ const assertMemberTarget = (role: TeamRole | undefined): void => {
   if (role === TeamRole.OWNER) {
     throw new AppError(403, 'Owners cannot be modified');
   }
+};
+
+const lockTeam = async (transaction: Prisma.TransactionClient, teamId: string): Promise<void> => {
+  await transaction.$queryRaw`SELECT "id" FROM "Team" WHERE "id" = ${teamId} FOR UPDATE`;
 };
 
 export const teamService = {
@@ -135,7 +140,8 @@ export const teamService = {
 
   async addMember(teamId: string, actorId: string, input: AddTeamMemberInput) {
     try {
-      return await prisma.$transaction(async (transaction) => {
+      return await runSerializable(async (transaction) => {
+        await lockTeam(transaction, teamId);
         await assertOwner(transaction, teamId, actorId);
 
         const user = await transaction.user.findUnique({
@@ -145,6 +151,15 @@ export const teamService = {
         if (!user) {
           throw new AppError(404, 'User not found');
         }
+        const existingMembership = await transaction.teamMembership.findUnique({
+          where: { teamId_userId: { teamId, userId: input.userId } },
+          select: { id: true },
+        });
+        if (existingMembership) {
+          throw new AppError(409, 'User is already a member of this team');
+        }
+        const entitlement = await resolveSubscriptionEntitlement(transaction, teamId);
+        assertMembershipSeatEntitlement(entitlement, entitlement.currentBillableStaffSeats + 1);
 
         return transaction.teamMembership.create({
           data: { teamId, userId: input.userId, role: input.role },
@@ -168,7 +183,8 @@ export const teamService = {
     targetUserId: string,
     input: UpdateTeamMemberRoleInput
   ) {
-    return prisma.$transaction(async (transaction) => {
+    return runSerializable(async (transaction) => {
+      await lockTeam(transaction, teamId);
       await assertOwner(transaction, teamId, actorId);
       const target = await transaction.teamMembership.findUnique({
         where: { teamId_userId: { teamId, userId: targetUserId } },
@@ -186,6 +202,7 @@ export const teamService = {
 
   removeMember(teamId: string, actorId: string, targetUserId: string) {
     return runSerializable(async (transaction) => {
+      await lockTeam(transaction, teamId);
       await assertOwner(transaction, teamId, actorId);
       const target = await transaction.teamMembership.findUnique({
         where: { teamId_userId: { teamId, userId: targetUserId } },

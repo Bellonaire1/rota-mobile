@@ -3,6 +3,7 @@ import { prisma } from '../database/prisma';
 import { runSerializable } from '../database/transactions';
 import { AppError } from '../errors/AppError';
 import { Permission, hasPermission } from '../rbac/permissions';
+import { assertOperationalMutationEntitlement, resolveSubscriptionEntitlement } from './subscription-entitlement.service';
 import {
   CancelShiftInput,
   CreateShiftInput,
@@ -104,6 +105,7 @@ export const shiftService = {
   async create(teamId: string, actorId: string, input: CreateShiftInput) {
     return runSerializable(async (transaction) => {
       await assertPermission(transaction, teamId, actorId, Permission.MANAGE_OPERATIONAL_WORK);
+      assertOperationalMutationEntitlement(await resolveSubscriptionEntitlement(transaction, teamId));
       await assertAssignee(transaction, teamId, input.assignedToUserId);
       await assertNoOverlap(transaction, input.assignedToUserId, input.startsAt, input.endsAt);
 
@@ -164,6 +166,7 @@ export const shiftService = {
   ) {
     return runSerializable(async (transaction) => {
       await assertPermission(transaction, teamId, actorId, Permission.MANAGE_OPERATIONAL_WORK);
+      assertOperationalMutationEntitlement(await resolveSubscriptionEntitlement(transaction, teamId));
       const shift = await transaction.shift.findFirst({
         where: { id: shiftId, teamId },
         select: {
@@ -211,6 +214,7 @@ export const shiftService = {
   async cancel(teamId: string, shiftId: string, actorId: string, input: CancelShiftInput) {
     return runSerializable(async (transaction) => {
       await assertPermission(transaction, teamId, actorId, Permission.MANAGE_OPERATIONAL_WORK);
+      assertOperationalMutationEntitlement(await resolveSubscriptionEntitlement(transaction, teamId));
       const shift = await transaction.shift.findFirst({
         where: { id: shiftId, teamId },
         select: { status: true, updatedAt: true },

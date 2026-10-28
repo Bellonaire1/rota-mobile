@@ -222,6 +222,7 @@ export class BillingService {
     for (let attempt = 1; attempt <= MAX_RESERVATION_ATTEMPTS; attempt += 1) {
       try {
         const reservation = await runSerializable(async (transaction) => {
+          await transaction.$queryRaw`SELECT "id" FROM "Team" WHERE "id" = ${teamId} FOR UPDATE`;
           await assertOwner(transaction, teamId, ownerId);
           const existing = await transaction.billingIdempotencyKey.findUnique({ where: { scope_key: { scope: `${CHECKOUT_SCOPE}:${teamId}`, key } } });
           if (existing) {
