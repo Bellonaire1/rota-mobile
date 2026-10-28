@@ -6,9 +6,11 @@ import {
   PaymentGatewayError,
   type CreatePlanInput,
   type FetchPlanByCodeInput,
+  type FetchSubscriptionByCodeInput,
   type InitializePaymentInput,
   type PlanInitializationOptions,
   type ProviderPlan,
+  type VerifiedSubscription,
 } from './payments';
 import { calculateSeatPricing } from './pricing';
 
@@ -1291,5 +1293,346 @@ describe('plan-linked transaction initialization', () => {
       })),
       'TIMEOUT'
     );
+  });
+});
+
+describe('Paystack subscription retrieval and verification', () => {
+  const defaultSubInput = (
+    overrides: Partial<FetchSubscriptionByCodeInput> = {}
+  ): FetchSubscriptionByCodeInput => ({
+    subscriptionCode: 'SUB_test_sub_001',
+    expectedPlanCode: 'PLN_test_plan_001',
+    expectedCustomerCode: 'CUS_test_cust_001',
+    expectedAmountCents: 5_000,
+    expectedCurrency: 'USD',
+    expectedInterval: 'monthly',
+    ...overrides,
+  });
+
+  const validSubData = {
+    id: 123456,
+    subscription_code: 'SUB_test_sub_001',
+    status: 'active',
+    amount: 5_000,
+    next_payment_date: '2026-11-28T12:00:00.000Z',
+    createdAt: '2026-10-28T12:00:00.000Z',
+    customer: {
+      id: 998877,
+      customer_code: 'CUS_test_cust_001',
+      email: 'sensitive-user@example.com',
+    },
+    plan: {
+      id: 554433,
+      plan_code: 'PLN_test_plan_001',
+      name: 'Rota TEAM (2 seats) - team:team-123',
+      amount: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    },
+    authorization: {
+      authorization_code: 'AUTH_secret_card_token_123',
+      card_type: 'visa',
+      last4: '4242',
+    },
+  };
+
+  it('retrieves and strictly verifies an active subscription matching plan, customer and amount without leaking sensitive tokens', async () => {
+    let capturedUrl = '';
+    let capturedHeaders: Record<string, string> = {};
+    const gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: (url, init) => {
+        capturedUrl = String(url);
+        capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+        return Promise.resolve(response({ status: true, data: validSubData }));
+      },
+    });
+
+    const result = await gateway.fetchSubscriptionByCode(defaultSubInput());
+    assert.equal(capturedUrl, 'https://api.paystack.co/subscription/SUB_test_sub_001');
+    assert.equal(capturedHeaders.Authorization, 'Bearer sk_test_only-for-tests');
+    assert.deepEqual(result, {
+      providerSubscriptionId: '123456',
+      subscriptionCode: 'SUB_test_sub_001',
+      status: 'active',
+      customerCode: 'CUS_test_cust_001',
+      planCode: 'PLN_test_plan_001',
+      amountCents: 5_000,
+      currency: 'USD',
+      interval: 'monthly',
+      nextPaymentDate: '2026-11-28T12:00:00.000Z',
+      createdAt: '2026-10-28T12:00:00.000Z',
+    });
+    // Strict leak prevention: sensitive authorization/card data never exposed
+    assert.equal((result as unknown as Record<string, unknown>).authorization, undefined);
+    assert.equal((result as unknown as Record<string, unknown>).authorization_code, undefined);
+    assert.equal((result as unknown as Record<string, unknown>).email, undefined);
+  });
+
+  it('returns null on 404 or message indicating not found', async () => {
+    const notFound404Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(response({ status: false, message: 'Subscription not found' }, 404)),
+    });
+    const result404 = await notFound404Gateway.fetchSubscriptionByCode(defaultSubInput());
+    assert.equal(result404, null);
+
+    const notFound200Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(response({ status: false, message: 'Subscription not found' }, 200)),
+    });
+    const result200 = await notFound200Gateway.fetchSubscriptionByCode(defaultSubInput());
+    assert.equal(result200, null);
+  });
+
+  it('fails closed on mismatched subscription code, customer, plan, amount, currency, interval or inactive status', async () => {
+    const mkGateway = (payload: unknown) => new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(response({ status: true, data: payload })),
+    });
+
+    // Wrong subscription code
+    await assertGatewayError(
+      mkGateway({ ...validSubData, subscription_code: 'SUB_mismatched_code_999' }).fetchSubscriptionByCode(defaultSubInput()),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // Wrong customer code
+    await assertGatewayError(
+      mkGateway({ ...validSubData, customer: { ...validSubData.customer, customer_code: 'CUS_other_cust_999' } }).fetchSubscriptionByCode(defaultSubInput()),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // Wrong plan code
+    await assertGatewayError(
+      mkGateway({ ...validSubData, plan: { ...validSubData.plan, plan_code: 'PLN_other_plan_999' } }).fetchSubscriptionByCode(defaultSubInput()),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // Wrong plan amount
+    await assertGatewayError(
+      mkGateway({ ...validSubData, plan: { ...validSubData.plan, amount: 6_000 } }).fetchSubscriptionByCode(defaultSubInput()),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // Wrong top-level amount if present
+    await assertGatewayError(
+      mkGateway({ ...validSubData, amount: 9_999 }).fetchSubscriptionByCode(defaultSubInput()),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // Wrong currency
+    await assertGatewayError(
+      mkGateway({ ...validSubData, plan: { ...validSubData.plan, currency: 'NGN' } }).fetchSubscriptionByCode(defaultSubInput()),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // Wrong interval
+    await assertGatewayError(
+      mkGateway({ ...validSubData, plan: { ...validSubData.plan, interval: 'annually' } }).fetchSubscriptionByCode(defaultSubInput()),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // Inactive status: attention, cancelled, non-renewing, complete
+    for (const inactiveStatus of ['attention', 'cancelled', 'non-renewing', 'complete', 'paused', 'unknown']) {
+      await assertGatewayError(
+        mkGateway({ ...validSubData, status: inactiveStatus }).fetchSubscriptionByCode(defaultSubInput()),
+        'VERIFICATION_MISMATCH'
+      );
+    }
+  });
+
+  it('fails closed on missing, malformed or invalid response fields', async () => {
+    const mkGateway = (body: unknown, status = 200) => new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(response(body, status)),
+    });
+
+    // Malformed JSON
+    const invalidJsonGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(new Response('<html>Error</html>', { status: 200, headers: { 'Content-Type': 'text/html' } })),
+    });
+    await assertGatewayError(invalidJsonGateway.fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+
+    // Missing data
+    await assertGatewayError(mkGateway({ status: true }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: null }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: [] }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+
+    // Invalid id
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, id: '123' } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, id: -1 } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, id: 0 } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+
+    // Invalid subscription_code format
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, subscription_code: 'INVALID' } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, subscription_code: 123 } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+
+    // Missing or invalid customer
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, customer: null } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, customer: {} } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, customer: { customer_code: 'INVALID' } } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+
+    // Missing or invalid plan
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, plan: null } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, plan: {} } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, plan: { ...validSubData.plan, id: 'bad' } } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+    await assertGatewayError(mkGateway({ status: true, data: { ...validSubData, plan: { ...validSubData.plan, plan_code: 'INVALID' } } }).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+
+    // Contradictory status code and body (404 with status: true)
+    await assertGatewayError(mkGateway({ status: true, data: validSubData }, 404).fetchSubscriptionByCode(defaultSubInput()), 'INVALID_RESPONSE');
+  });
+
+  it('distinguishes transport and provider uncertainty from not-found', async () => {
+    // HTTP 500 error
+    const http500Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(response({ status: false, message: 'Internal Server Error' }, 500)),
+    });
+    await assertGatewayError(http500Gateway.fetchSubscriptionByCode(defaultSubInput()), 'HTTP');
+
+    // HTTP 502 error
+    const http502Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(response({ status: false, message: 'Bad Gateway' }, 502)),
+    });
+    await assertGatewayError(http502Gateway.fetchSubscriptionByCode(defaultSubInput()), 'HTTP');
+
+    // Provider failure (status: false with non-404 status and message)
+    const providerFailureGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.resolve(response({ status: false, message: 'Subscription temporarily unavailable' }, 200)),
+    });
+    await assertGatewayError(providerFailureGateway.fetchSubscriptionByCode(defaultSubInput()), 'PROVIDER_FAILURE');
+
+    // Network failure
+    const networkFailGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => Promise.reject(new Error('Network offline')),
+    });
+    await assertGatewayError(networkFailGateway.fetchSubscriptionByCode(defaultSubInput()), 'NETWORK');
+
+    // Timeout
+    const timeoutGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      timeoutMs: 5,
+      fetchImpl: () => new Promise<Response>((_resolve, reject) => {
+        setTimeout(() => reject(new DOMException('The operation was aborted.', 'AbortError')), 10);
+      }),
+    });
+    await assertGatewayError(timeoutGateway.fetchSubscriptionByCode(defaultSubInput()), 'TIMEOUT');
+  });
+
+  it('validates input parameters before making provider calls', async () => {
+    let called = false;
+    const gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: () => {
+        called = true;
+        return Promise.resolve(response({ status: true, data: validSubData }));
+      },
+    });
+
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'INVALID' })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: '' })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ expectedPlanCode: 'INVALID' })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ expectedCustomerCode: 'INVALID' })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ expectedCurrency: 'NGN' as never })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ expectedInterval: 'annually' as never })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ expectedAmountCents: 100 })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchSubscriptionByCode(defaultSubInput({ expectedAmountCents: -500 })), 'VALIDATION');
+    assert.equal(called, false);
+  });
+
+  describe('MockPaystackGateway subscription capabilities', () => {
+    it('supports registered mock subscriptions and configured lookup results', async () => {
+      const mockGateway = new MockPaystackGateway();
+      const mockSub: VerifiedSubscription = {
+        providerSubscriptionId: '987654',
+        subscriptionCode: 'SUB_mock_sub_001',
+        status: 'active',
+        customerCode: 'CUS_mock_cust_001',
+        planCode: 'PLN_mock_plan_001',
+        amountCents: 5_000,
+        currency: 'USD',
+        interval: 'monthly',
+      };
+
+      // Unregistered subscription returns null
+      const notFound = await mockGateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'SUB_unregistered_001' }));
+      assert.equal(notFound, null);
+
+      // Configured null returns null
+      mockGateway.setSubscriptionLookupResult('SUB_configured_null_002', null);
+      const configuredNull = await mockGateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'SUB_configured_null_002' }));
+      assert.equal(configuredNull, null);
+
+      // Registered subscription matches and returns verified subscription
+      mockGateway.registerMockSubscription(mockSub);
+      const fetched = await mockGateway.fetchSubscriptionByCode({
+        subscriptionCode: 'SUB_mock_sub_001',
+        expectedPlanCode: 'PLN_mock_plan_001',
+        expectedCustomerCode: 'CUS_mock_cust_001',
+        expectedAmountCents: 5_000,
+        expectedCurrency: 'USD',
+        expectedInterval: 'monthly',
+      });
+      assert.deepEqual(fetched, mockSub);
+
+      // Configured error throws that error
+      mockGateway.setSubscriptionLookupResult(
+        'SUB_error_003',
+        new PaymentGatewayError('TIMEOUT', 'Mock subscription timeout')
+      );
+      await assertGatewayError(
+        mockGateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'SUB_error_003' })),
+        'TIMEOUT'
+      );
+
+      // Configured mismatch throws VERIFICATION_MISMATCH
+      mockGateway.setSubscriptionLookupResult('SUB_mismatch_004', {
+        ...mockSub,
+        subscriptionCode: 'SUB_mismatch_004',
+        amountCents: 6_000,
+      });
+      await assertGatewayError(
+        mockGateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'SUB_mismatch_004' })),
+        'VERIFICATION_MISMATCH'
+      );
+
+      // Inactive mock subscription throws VERIFICATION_MISMATCH
+      mockGateway.setSubscriptionLookupResult('SUB_inactive_005', {
+        ...mockSub,
+        subscriptionCode: 'SUB_inactive_005',
+        status: 'cancelled' as never,
+      });
+      await assertGatewayError(
+        mockGateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'SUB_inactive_005' })),
+        'VERIFICATION_MISMATCH'
+      );
+
+      // Customer mismatch throws VERIFICATION_MISMATCH
+      mockGateway.setSubscriptionLookupResult('SUB_cust_mismatch_006', {
+        ...mockSub,
+        subscriptionCode: 'SUB_cust_mismatch_006',
+        customerCode: 'CUS_different_002',
+      });
+      await assertGatewayError(
+        mockGateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'SUB_cust_mismatch_006' })),
+        'VERIFICATION_MISMATCH'
+      );
+
+      // Plan mismatch throws VERIFICATION_MISMATCH
+      mockGateway.setSubscriptionLookupResult('SUB_plan_mismatch_007', {
+        ...mockSub,
+        subscriptionCode: 'SUB_plan_mismatch_007',
+        planCode: 'PLN_different_002',
+      });
+      await assertGatewayError(
+        mockGateway.fetchSubscriptionByCode(defaultSubInput({ subscriptionCode: 'SUB_plan_mismatch_007' })),
+        'VERIFICATION_MISMATCH'
+      );
+    });
   });
 });

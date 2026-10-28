@@ -13,11 +13,13 @@ import {
   PaymentGatewayError,
   type CreatePlanInput,
   type FetchPlanByCodeInput,
+  type FetchSubscriptionByCodeInput,
   type InitializePaymentInput,
   type PaymentInitialization,
   type ProviderPlan,
   type VerifyPaymentInput,
   type VerifiedPayment,
+  type VerifiedSubscription,
 } from './payments';
 import { ProviderPlanReservationService } from '../services/provider-plan-reservation.service';
 import { reconciliationIntegrationSkipReason } from '../services/reconciliation-test-safety';
@@ -96,6 +98,9 @@ class TimeoutGateway implements PaymentGatewayForTest {
   async fetchPlanByCode(_input: FetchPlanByCodeInput): Promise<ProviderPlan | null> {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
+  async fetchSubscriptionByCode(_input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
 }
 
 class FailureGateway implements PaymentGatewayForTest {
@@ -109,6 +114,9 @@ class FailureGateway implements PaymentGatewayForTest {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
   async fetchPlanByCode(_input: FetchPlanByCodeInput): Promise<ProviderPlan | null> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
+  async fetchSubscriptionByCode(_input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null> {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
 }
@@ -145,6 +153,10 @@ class BlockingGateway implements PaymentGatewayForTest {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
 
+  async fetchSubscriptionByCode(_input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
+
   release(): void {
     this.releaseInitialization();
   }
@@ -155,6 +167,7 @@ interface PaymentGatewayForTest {
   verifyTransaction(input: VerifyPaymentInput): Promise<VerifiedPayment>;
   createPlan(input: CreatePlanInput): Promise<ProviderPlan>;
   fetchPlanByCode(input: FetchPlanByCodeInput): Promise<ProviderPlan | null>;
+  fetchSubscriptionByCode(input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null>;
 }
 
 describe('billing checkout API', { concurrency: false, skip: reconciliationIntegrationSkipReason() }, () => {

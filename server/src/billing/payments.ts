@@ -90,11 +90,34 @@ export interface FetchPlanByCodeInput {
   readonly expectedName: string;
 }
 
+export interface FetchSubscriptionByCodeInput {
+  readonly subscriptionCode: string;
+  readonly expectedPlanCode: string;
+  readonly expectedCustomerCode: string;
+  readonly expectedAmountCents: number;
+  readonly expectedCurrency: 'USD';
+  readonly expectedInterval: 'monthly';
+}
+
+export interface VerifiedSubscription {
+  readonly providerSubscriptionId: string;
+  readonly subscriptionCode: string;
+  readonly status: 'active';
+  readonly customerCode: string;
+  readonly planCode: string;
+  readonly amountCents: number;
+  readonly currency: 'USD';
+  readonly interval: 'monthly';
+  readonly nextPaymentDate?: string;
+  readonly createdAt?: string;
+}
+
 export interface PaymentGateway {
   initializeTransaction(input: InitializePaymentInput): Promise<PaymentInitialization>;
   verifyTransaction(input: VerifyPaymentInput): Promise<VerifiedPayment>;
   createPlan(input: CreatePlanInput): Promise<ProviderPlan>;
   fetchPlanByCode(input: FetchPlanByCodeInput): Promise<ProviderPlan | null>;
+  fetchSubscriptionByCode(input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null>;
 }
 
 const SUPPORTED_CURRENCIES = new Set<PaystackCurrency>(['USD', 'NGN', 'GHS', 'ZAR', 'KES']);
@@ -102,6 +125,7 @@ const REFERENCE_PATTERN = /^[A-Za-z0-9.=-]{8,100}$/;
 const IDEMPOTENCY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
 export const PAYSTACK_CUSTOMER_CODE_PATTERN = /^CUS_[A-Za-z0-9._:-]{3,100}$/;
 export const PAYSTACK_PLAN_CODE_PATTERN = /^PLN_[A-Za-z0-9._:-]{3,100}$/;
+export const PAYSTACK_SUBSCRIPTION_CODE_PATTERN = /^SUB_[A-Za-z0-9._:-]{3,100}$/;
 export const PAYSTACK_USD_MINIMUM_CENTS = 200;
 const PAYSTACK_API_ORIGIN = 'https://api.paystack.co';
 const PAYSTACK_CHECKOUT_ORIGIN = 'https://checkout.paystack.com';
@@ -177,6 +201,25 @@ const validateFetchPlanByCodeInput = (input: FetchPlanByCodeInput): void => {
   if (!input.expectedName || typeof input.expectedName !== 'string' || input.expectedName.trim().length === 0 || input.expectedName.length > 100) {
     throw new PaymentGatewayError('VALIDATION', 'Plan name is invalid');
   }
+};
+
+const validateFetchSubscriptionByCodeInput = (input: FetchSubscriptionByCodeInput): void => {
+  if (typeof input.subscriptionCode !== 'string' || !PAYSTACK_SUBSCRIPTION_CODE_PATTERN.test(input.subscriptionCode)) {
+    throw new PaymentGatewayError('VALIDATION', 'Subscription code has an invalid format');
+  }
+  if (typeof input.expectedPlanCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(input.expectedPlanCode)) {
+    throw new PaymentGatewayError('VALIDATION', 'Plan code has an invalid format');
+  }
+  if (typeof input.expectedCustomerCode !== 'string' || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(input.expectedCustomerCode)) {
+    throw new PaymentGatewayError('VALIDATION', 'Customer code has an invalid format');
+  }
+  if (input.expectedCurrency !== 'USD') {
+    throw new PaymentGatewayError('VALIDATION', 'Only USD currency is supported for subscriptions');
+  }
+  if (input.expectedInterval !== 'monthly') {
+    throw new PaymentGatewayError('VALIDATION', 'Only monthly interval is supported');
+  }
+  assertAmount(input.expectedAmountCents, input.expectedCurrency);
 };
 
 const validateInitializationInput = (input: InitializePaymentInput): void => {
@@ -257,6 +300,17 @@ interface PaystackPlanData {
   readonly amount?: unknown;
   readonly interval?: unknown;
   readonly currency?: unknown;
+}
+
+interface PaystackSubscriptionData {
+  readonly id?: unknown;
+  readonly subscription_code?: unknown;
+  readonly status?: unknown;
+  readonly amount?: unknown;
+  readonly next_payment_date?: unknown;
+  readonly createdAt?: unknown;
+  readonly plan?: unknown;
+  readonly customer?: unknown;
 }
 
 export interface PaystackGatewayOptions {
@@ -511,6 +565,99 @@ export class PaystackGateway implements PaymentGateway {
     };
   }
 
+  async fetchSubscriptionByCode(input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null> {
+    validateFetchSubscriptionByCodeInput(input);
+    const response = await this.request<PaystackSubscriptionData>(
+      `/subscription/${encodeURIComponent(input.subscriptionCode)}`,
+      { method: 'GET' },
+      { allow404: true }
+    );
+
+    if (response.httpStatus === 404 || response.status === false) {
+      if (response.httpStatus === 404 && response.status === true) {
+        throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack returned contradictory status code and body');
+      }
+      if (
+        response.httpStatus === 404
+        || (typeof response.message === 'string' && /not found/i.test(response.message))
+      ) {
+        return null;
+      }
+      throw new PaymentGatewayError('PROVIDER_FAILURE', 'Paystack could not retrieve the subscription');
+    }
+
+    if (response.status !== true) {
+      throw new PaymentGatewayError('PROVIDER_FAILURE', 'Paystack could not retrieve the subscription');
+    }
+
+    const data = response.data;
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription response was incomplete');
+    }
+    if (typeof data.id !== 'number' || !Number.isSafeInteger(data.id) || data.id <= 0) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription response contained an invalid subscription ID');
+    }
+    if (typeof data.subscription_code !== 'string' || !PAYSTACK_SUBSCRIPTION_CODE_PATTERN.test(data.subscription_code)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription response contained an invalid subscription code');
+    }
+    if (data.subscription_code !== input.subscriptionCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription code did not match the expected subscription code');
+    }
+    if (typeof data.status !== 'string' || data.status.toLowerCase() !== 'active') {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription is not active');
+    }
+    if (data.amount !== undefined && data.amount !== input.expectedAmountCents) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription amount did not match the expected amount');
+    }
+
+    if (!data.customer || typeof data.customer !== 'object' || Array.isArray(data.customer)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription response contained invalid customer data');
+    }
+    const customerRecord = data.customer as Record<string, unknown>;
+    if (typeof customerRecord.customer_code !== 'string' || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(customerRecord.customer_code)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription response contained an invalid customer code');
+    }
+    if (customerRecord.customer_code !== input.expectedCustomerCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription customer code did not match the expected customer code');
+    }
+
+    if (!data.plan || typeof data.plan !== 'object' || Array.isArray(data.plan)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription response contained invalid plan data');
+    }
+    const planRecord = data.plan as Record<string, unknown>;
+    if (typeof planRecord.id !== 'number' || !Number.isSafeInteger(planRecord.id) || planRecord.id <= 0) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription plan contained an invalid plan ID');
+    }
+    if (typeof planRecord.plan_code !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(planRecord.plan_code)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack subscription plan contained an invalid plan code');
+    }
+    if (planRecord.plan_code !== input.expectedPlanCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription plan code did not match the expected plan code');
+    }
+    if (planRecord.amount !== input.expectedAmountCents) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription plan amount did not match the expected amount');
+    }
+    if (planRecord.currency !== input.expectedCurrency) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription plan currency did not match the expected currency');
+    }
+    if (planRecord.interval !== input.expectedInterval) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack subscription plan interval did not match the expected monthly interval');
+    }
+
+    return {
+      providerSubscriptionId: String(data.id),
+      subscriptionCode: data.subscription_code,
+      status: 'active',
+      customerCode: customerRecord.customer_code,
+      planCode: planRecord.plan_code,
+      amountCents: planRecord.amount,
+      currency: 'USD',
+      interval: 'monthly',
+      ...(typeof data.next_payment_date === 'string' && data.next_payment_date.length > 0 ? { nextPaymentDate: data.next_payment_date } : {}),
+      ...(typeof data.createdAt === 'string' && data.createdAt.length > 0 ? { createdAt: data.createdAt } : {}),
+    };
+  }
+
   private async request<T>(
     path: string,
     init: RequestInit,
@@ -568,12 +715,76 @@ export class MockPaystackGateway implements PaymentGateway {
   private nextPlanResult?: ProviderPlan | PaymentGatewayError;
   private planCounter = 1;
 
+  private readonly subscriptions = new Map<string, VerifiedSubscription>();
+  private readonly subscriptionLookupResults = new Map<string, VerifiedSubscription | PaymentGatewayError | null>();
+
   setNextPlanResult(result: ProviderPlan | PaymentGatewayError): void {
     this.nextPlanResult = result;
   }
 
   setPlanLookupResult(planCode: string, result: ProviderPlan | PaymentGatewayError | null): void {
     this.planLookupResults.set(planCode, result);
+  }
+
+  setSubscriptionLookupResult(subscriptionCode: string, result: VerifiedSubscription | PaymentGatewayError | null): void {
+    this.subscriptionLookupResults.set(subscriptionCode, result);
+  }
+
+  registerMockSubscription(subscription: VerifiedSubscription): void {
+    this.subscriptions.set(subscription.subscriptionCode, subscription);
+  }
+
+  async fetchSubscriptionByCode(input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null> {
+    validateFetchSubscriptionByCodeInput(input);
+    if (this.subscriptionLookupResults.has(input.subscriptionCode)) {
+      const configured = this.subscriptionLookupResults.get(input.subscriptionCode);
+      if (configured === null) return null;
+      if (configured instanceof PaymentGatewayError) throw configured;
+      return this.assertFetchedSubscription(configured!, input);
+    }
+    const existing = this.subscriptions.get(input.subscriptionCode);
+    if (!existing) return null;
+    return this.assertFetchedSubscription(existing, input);
+  }
+
+  private assertFetchedSubscription(
+    sub: VerifiedSubscription,
+    input: FetchSubscriptionByCodeInput
+  ): VerifiedSubscription {
+    if (typeof sub.providerSubscriptionId !== 'string' || !/^\d+$/.test(sub.providerSubscriptionId)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Mock subscription response contained an invalid subscription ID');
+    }
+    if (typeof sub.subscriptionCode !== 'string' || !PAYSTACK_SUBSCRIPTION_CODE_PATTERN.test(sub.subscriptionCode)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Mock subscription response contained an invalid subscription code');
+    }
+    if (sub.subscriptionCode !== input.subscriptionCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock subscription code did not match the expected subscription code');
+    }
+    if (sub.status !== 'active') {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock subscription is not active');
+    }
+    if (typeof sub.customerCode !== 'string' || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(sub.customerCode)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Mock customer code has an invalid format');
+    }
+    if (sub.customerCode !== input.expectedCustomerCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock customer code did not match the expected customer code');
+    }
+    if (typeof sub.planCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(sub.planCode)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Mock plan code has an invalid format');
+    }
+    if (sub.planCode !== input.expectedPlanCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan code did not match the expected plan code');
+    }
+    if (sub.amountCents !== input.expectedAmountCents) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock subscription amount did not match the expected amount');
+    }
+    if (sub.currency !== input.expectedCurrency) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock subscription currency did not match the expected currency');
+    }
+    if (sub.interval !== input.expectedInterval) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock subscription interval did not match the expected monthly interval');
+    }
+    return sub;
   }
 
   async createPlan(input: CreatePlanInput): Promise<ProviderPlan> {
