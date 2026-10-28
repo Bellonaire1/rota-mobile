@@ -7,7 +7,16 @@ import { prisma } from '../database/prisma';
 import { BillingService } from '../services/billing.service';
 import { env } from '../config/env';
 import { PaystackWebhookService } from '../services/paystack-webhook.service';
-import { MockPaystackGateway, PaymentGatewayError, type InitializePaymentInput, type PaymentInitialization, type VerifyPaymentInput, type VerifiedPayment } from './payments';
+import {
+  MockPaystackGateway,
+  PaymentGatewayError,
+  type CreatePlanInput,
+  type InitializePaymentInput,
+  type PaymentInitialization,
+  type ProviderPlan,
+  type VerifyPaymentInput,
+  type VerifiedPayment,
+} from './payments';
 
 type Auth = { user: { id: string }; accessToken: string };
 type Team = { id: string };
@@ -71,6 +80,9 @@ class TimeoutGateway implements PaymentGatewayForTest {
   async verifyTransaction(_input: VerifyPaymentInput): Promise<VerifiedPayment> {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
+  async createPlan(_input: CreatePlanInput): Promise<ProviderPlan> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
 }
 
 class FailureGateway implements PaymentGatewayForTest {
@@ -78,6 +90,9 @@ class FailureGateway implements PaymentGatewayForTest {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'provider rejected initialization');
   }
   async verifyTransaction(_input: VerifyPaymentInput): Promise<VerifiedPayment> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
+  async createPlan(_input: CreatePlanInput): Promise<ProviderPlan> {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
 }
@@ -106,6 +121,10 @@ class BlockingGateway implements PaymentGatewayForTest {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
 
+  async createPlan(_input: CreatePlanInput): Promise<ProviderPlan> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
+
   release(): void {
     this.releaseInitialization();
   }
@@ -114,6 +133,7 @@ class BlockingGateway implements PaymentGatewayForTest {
 interface PaymentGatewayForTest {
   initializeTransaction(input: InitializePaymentInput): Promise<PaymentInitialization>;
   verifyTransaction(input: VerifyPaymentInput): Promise<VerifiedPayment>;
+  createPlan(input: CreatePlanInput): Promise<ProviderPlan>;
 }
 
 describe('billing checkout API', () => {
