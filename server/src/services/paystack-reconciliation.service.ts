@@ -10,16 +10,21 @@ import {
 import type { BillingPlanCode as PricingPlanCode } from '../billing/pricing';
 import {
   PAYSTACK_CUSTOMER_CODE_PATTERN,
+  PAYSTACK_PLAN_CODE_PATTERN,
+  PAYSTACK_SUBSCRIPTION_CODE_PATTERN,
+  PAYSTACK_USD_MINIMUM_CENTS,
   PaymentGatewayError,
   type PaystackCurrency,
   type PaymentGateway,
   type VerifiedPayment,
+  type VerifiedSubscription,
 } from '../billing/payments';
 import { prisma as defaultPrisma } from '../database/prisma';
 import { PermanentWebhookError, RetryableWebhookError, type WebhookEventProcessor } from '../jobs/webhook-event-processor';
 
 const PAYSTACK_PROVIDER = 'paystack';
-const SUPPORTED_EVENT_TYPE = 'charge.success';
+const CHARGE_SUCCESS_EVENT = 'charge.success';
+const SUBSCRIPTION_CREATE_EVENT = 'subscription.create';
 const CASH_ACCOUNT = 'cash';
 const ACCOUNTS_RECEIVABLE_ACCOUNT = 'accounts_receivable';
 const TRANSACTION_RETRIES = 5;
@@ -41,6 +46,8 @@ type PersistedCheckout = {
   billableStaffSeats: number;
   amountCents: number;
   currency: 'USD';
+  recurring?: boolean;
+  providerPlanCode?: string;
 };
 
 type PaymentAttemptWithContext = Prisma.BillingPaymentAttemptGetPayload<{
@@ -65,6 +72,69 @@ const parseReferenceHint = (payload: unknown): string => {
   return payload.data.reference;
 };
 
+type SubscriptionCreateHint = {
+  subscriptionCode: string;
+  customerCode: string;
+  planCode?: string;
+  amountCents?: number;
+};
+
+const parseSubscriptionHint = (payload: unknown): SubscriptionCreateHint => {
+  if (!isRecord(payload) || !isRecord(payload.data)) {
+    throw new ReconciliationPermanentError('Supported Paystack event does not contain valid event data');
+  }
+  const data = payload.data;
+  const rawSubCode = typeof data.subscription_code === 'string'
+    ? data.subscription_code
+    : (typeof data.subscriptionCode === 'string' ? data.subscriptionCode : undefined);
+
+  if (!rawSubCode || !PAYSTACK_SUBSCRIPTION_CODE_PATTERN.test(rawSubCode)) {
+    throw new ReconciliationPermanentError('Supported Paystack event does not contain a valid subscription code');
+  }
+
+  let rawCustomerCode: string | undefined;
+  if (isRecord(data.customer) && typeof data.customer.customer_code === 'string') {
+    rawCustomerCode = data.customer.customer_code;
+  } else if (isRecord(data.customer) && typeof data.customer.customerCode === 'string') {
+    rawCustomerCode = data.customer.customerCode;
+  } else if (typeof data.customer_code === 'string') {
+    rawCustomerCode = data.customer_code;
+  } else if (typeof data.customerCode === 'string') {
+    rawCustomerCode = data.customerCode;
+  }
+
+  if (!rawCustomerCode || !PAYSTACK_CUSTOMER_CODE_PATTERN.test(rawCustomerCode)) {
+    throw new ReconciliationPermanentError('Supported Paystack event does not contain a valid customer code');
+  }
+
+  let rawPlanCode: string | undefined;
+  if (isRecord(data.plan) && typeof data.plan.plan_code === 'string') {
+    rawPlanCode = data.plan.plan_code;
+  } else if (isRecord(data.plan) && typeof data.plan.planCode === 'string') {
+    rawPlanCode = data.plan.planCode;
+  } else if (typeof data.plan_code === 'string') {
+    rawPlanCode = data.plan_code;
+  } else if (typeof data.planCode === 'string') {
+    rawPlanCode = data.planCode;
+  }
+
+  if (rawPlanCode !== undefined && !PAYSTACK_PLAN_CODE_PATTERN.test(rawPlanCode)) {
+    throw new ReconciliationPermanentError('Supported Paystack event contains an invalid plan code hint');
+  }
+
+  const rawAmount = typeof data.amount === 'number' ? data.amount : undefined;
+  if (rawAmount !== undefined && (!Number.isSafeInteger(rawAmount) || rawAmount < PAYSTACK_USD_MINIMUM_CENTS)) {
+    throw new ReconciliationPermanentError('Supported Paystack event contains an invalid amount hint');
+  }
+
+  return {
+    subscriptionCode: rawSubCode,
+    customerCode: rawCustomerCode,
+    planCode: rawPlanCode,
+    amountCents: rawAmount,
+  };
+};
+
 const parsePersistedCheckout = (value: Prisma.JsonValue | null): PersistedCheckout => {
   const billableStaffSeats = isRecord(value) ? value.billableStaffSeats : undefined;
   const amountCents = isRecord(value) ? value.amountCents : undefined;
@@ -80,6 +150,14 @@ const parsePersistedCheckout = (value: Prisma.JsonValue | null): PersistedChecko
     || value.currency !== 'USD') {
     throw new ReconciliationPermanentError('Persisted checkout metadata is incomplete');
   }
+  const recurring = typeof value.recurring === 'boolean' ? value.recurring : undefined;
+  let providerPlanCode: string | undefined;
+  if (recurring) {
+    if (typeof value.providerPlanCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(value.providerPlanCode)) {
+      throw new ReconciliationPermanentError('Persisted recurring checkout metadata is missing a valid plan code');
+    }
+    providerPlanCode = value.providerPlanCode;
+  }
   return {
     subscriptionId: value.subscriptionId,
     invoiceId: value.invoiceId,
@@ -90,6 +168,7 @@ const parsePersistedCheckout = (value: Prisma.JsonValue | null): PersistedChecko
     billableStaffSeats: billableStaffSeats as number,
     amountCents: amountCents as number,
     currency: 'USD',
+    ...(recurring ? { recurring: true, providerPlanCode } : {}),
   };
 };
 
@@ -129,6 +208,13 @@ const mapGatewayError = (error: PaymentGatewayError): Error => {
     return new RetryableWebhookError('Paystack payment verification is temporarily unavailable');
   }
   return new ReconciliationPermanentError('Paystack payment verification did not match the persisted payment operation');
+};
+
+const mapSubscriptionGatewayError = (error: PaymentGatewayError): Error => {
+  if (error.code === 'TIMEOUT' || error.code === 'NETWORK' || error.code === 'PROVIDER_FAILURE') {
+    return new RetryableWebhookError('Paystack subscription verification is temporarily unavailable');
+  }
+  return new ReconciliationPermanentError(`Paystack subscription verification did not match the persisted checkout: ${error.message}`);
 };
 
 type HistoricalPrice = {
@@ -183,8 +269,14 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
 
   async process(event: WebhookEvent): Promise<void> {
     if (event.provider !== PAYSTACK_PROVIDER) return;
-    if (event.eventType !== SUPPORTED_EVENT_TYPE) return;
+    if (event.eventType === CHARGE_SUCCESS_EVENT) {
+      await this.processChargeSuccess(event);
+    } else if (event.eventType === SUBSCRIPTION_CREATE_EVENT) {
+      await this.processSubscriptionCreate(event);
+    }
+  }
 
+  private async processChargeSuccess(event: WebhookEvent): Promise<void> {
     const reference = parseReferenceHint(event.payload);
     const attempt = await this.database.billingPaymentAttempt.findUnique({
       where: { providerReference: reference },
@@ -227,6 +319,181 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
     });
 
     await this.applyFinancialState(attempt, operation, verified);
+  }
+
+  private async processSubscriptionCreate(event: WebhookEvent): Promise<void> {
+    const hint = parseSubscriptionHint(event.payload);
+
+    const subscription = await this.database.billingSubscription.findUnique({
+      where: { providerCustomerId: hint.customerCode },
+      include: {
+        currentPlan: true,
+        currentPrice: true,
+        team: true,
+        invoices: {
+          include: {
+            paymentAttempts: {
+              include: {
+                idempotencyRecord: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!subscription || !subscription.providerCustomerId) {
+      throw new RetryableWebhookError('Provider customer identity has not yet been reconciled from payment');
+    }
+
+    if (subscription.currency !== 'USD') {
+      throw new ReconciliationPermanentError('Subscription currency must be USD');
+    }
+
+    const matchingCheckouts: Array<{
+      providerPlanCode: string;
+      amountCents: number;
+    }> = [];
+
+    for (const invoice of subscription.invoices) {
+      for (const attempt of invoice.paymentAttempts) {
+        if (!attempt.idempotencyRecord?.responseBody) continue;
+        try {
+          const op = parsePersistedCheckout(attempt.idempotencyRecord.responseBody);
+          if (op.recurring === true && op.providerPlanCode) {
+            if (attempt.idempotencyRecord.teamId && attempt.idempotencyRecord.teamId !== subscription.teamId) {
+              throw new ReconciliationPermanentError('Recurring checkout team mismatch');
+            }
+            if (op.subscriptionId !== subscription.id) {
+              throw new ReconciliationPermanentError('Recurring checkout subscription mismatch');
+            }
+            if (op.currency !== 'USD' || invoice.currency !== 'USD') {
+              throw new ReconciliationPermanentError('Recurring checkout currency must be USD');
+            }
+            matchingCheckouts.push({
+              providerPlanCode: op.providerPlanCode,
+              amountCents: op.amountCents,
+            });
+          }
+        } catch (error) {
+          if (error instanceof ReconciliationPermanentError) throw error;
+        }
+      }
+    }
+
+    if (matchingCheckouts.length === 0) {
+      throw new ReconciliationPermanentError('No matching recurring checkout found for subscription');
+    }
+
+    const distinctPlanCodes = new Set(matchingCheckouts.map((c) => c.providerPlanCode));
+    const distinctAmounts = new Set(matchingCheckouts.map((c) => c.amountCents));
+
+    if (distinctPlanCodes.size > 1 || distinctAmounts.size > 1) {
+      throw new ReconciliationPermanentError('Ambiguous recurring checkout operations on subscription');
+    }
+
+    const checkout = matchingCheckouts[0];
+
+    if (hint.planCode && hint.planCode !== checkout.providerPlanCode) {
+      throw new ReconciliationPermanentError('Webhook plan code hint does not match recurring checkout');
+    }
+    if (hint.amountCents !== undefined && hint.amountCents !== checkout.amountCents) {
+      throw new ReconciliationPermanentError('Webhook amount hint does not match recurring checkout');
+    }
+
+    let verified: VerifiedSubscription | null;
+    try {
+      verified = await this.gateway.fetchSubscriptionByCode({
+        subscriptionCode: hint.subscriptionCode,
+        expectedPlanCode: checkout.providerPlanCode,
+        expectedCustomerCode: subscription.providerCustomerId,
+        expectedAmountCents: checkout.amountCents,
+        expectedCurrency: 'USD',
+        expectedInterval: 'monthly',
+      });
+    } catch (error) {
+      if (error instanceof PaymentGatewayError) {
+        throw mapSubscriptionGatewayError(error);
+      }
+      throw error;
+    }
+
+    if (!verified) {
+      throw new ReconciliationPermanentError('Provider subscription was not found on Paystack');
+    }
+
+    if (verified.subscriptionCode !== hint.subscriptionCode
+      || verified.customerCode !== subscription.providerCustomerId
+      || verified.planCode !== checkout.providerPlanCode
+      || verified.amountCents !== checkout.amountCents
+      || verified.currency !== 'USD'
+      || verified.interval !== 'monthly'
+      || verified.status !== 'active') {
+      throw new ReconciliationPermanentError('Verified provider subscription does not match the expected recurring checkout');
+    }
+
+    await this.applySubscriptionLinkage(subscription.id, verified);
+  }
+
+  private async applySubscriptionLinkage(
+    subscriptionId: string,
+    verified: VerifiedSubscription,
+  ): Promise<void> {
+    for (let retry = 1; retry <= TRANSACTION_RETRIES; retry += 1) {
+      try {
+        await this.runFinancialTransaction(async (transaction) => {
+          await transaction.$queryRaw`SELECT "id" FROM "BillingSubscription" WHERE "id" = ${subscriptionId} FOR UPDATE`;
+
+          const current = await transaction.billingSubscription.findUnique({
+            where: { id: subscriptionId },
+          });
+          if (!current) {
+            throw new ReconciliationPermanentError('Billing subscription disappeared during linkage');
+          }
+
+          if (current.providerCustomerId !== verified.customerCode) {
+            throw new ReconciliationPermanentError('Subscription customer identity mismatch during linkage');
+          }
+
+          if (current.providerSubscriptionId === verified.subscriptionCode) {
+            return;
+          }
+
+          if (current.providerSubscriptionId !== null) {
+            throw new ReconciliationPermanentError(
+              `Subscription is already linked to a different provider subscription: ${current.providerSubscriptionId}`
+            );
+          }
+
+          const existingWithProviderSub = await transaction.billingSubscription.findUnique({
+            where: { providerSubscriptionId: verified.subscriptionCode },
+          });
+          if (existingWithProviderSub && existingWithProviderSub.id !== current.id) {
+            throw new ReconciliationPermanentError(
+              'Provider subscription is already linked to another team'
+            );
+          }
+
+          await transaction.billingSubscription.update({
+            where: { id: current.id },
+            data: {
+              providerSubscriptionId: verified.subscriptionCode,
+              version: { increment: 1 },
+            },
+          });
+        });
+        return;
+      } catch (error) {
+        if (error instanceof Prisma.PrismaClientKnownRequestError && (error.code === 'P2034' || error.code === 'P2028') && retry < TRANSACTION_RETRIES) {
+          await new Promise((resolve) => setTimeout(resolve, retry * 50));
+          continue;
+        }
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+          throw new ReconciliationPermanentError('Provider subscription is already linked to another team');
+        }
+        throw error;
+      }
+    }
   }
 
   private async applyFinancialState(
@@ -383,8 +650,8 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
         });
         return;
       } catch (error) {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2034' && retry < TRANSACTION_RETRIES) {
-          await new Promise((resolve) => setTimeout(resolve, retry * 25));
+        if (error instanceof Prisma.PrismaClientKnownRequestError && (error.code === 'P2034' || error.code === 'P2028') && retry < TRANSACTION_RETRIES) {
+          await new Promise((resolve) => setTimeout(resolve, retry * 50));
           continue;
         }
         throw error;
@@ -396,6 +663,8 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
     if (this.transactionRunner) return this.transactionRunner(operation);
     return (this.database as PrismaClient).$transaction(operation, {
       isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      maxWait: 10_000,
+      timeout: 15_000,
     });
   }
 }

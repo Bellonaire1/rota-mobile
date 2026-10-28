@@ -115,16 +115,17 @@ export class WebhookWorker {
 export const createPaystackReconciliationWorker = (
   database: PrismaClient,
   gateway: PaymentGateway,
-  config: WebhookWorkerConfig = {
-    ...webhookWorkerConfig,
-    provider: 'paystack',
-    eventType: 'charge.success',
-  },
+  config: Partial<WebhookWorkerConfig> = {},
   logger: Pick<Console, 'error' | 'info' | 'warn'> = console,
 ): WebhookWorker => new WebhookWorker(
   new WebhookEventQueue(database),
   new PaystackReconciliationProcessor(database, gateway),
-  { ...config, provider: 'paystack', eventType: 'charge.success' },
+  {
+    ...webhookWorkerConfig,
+    provider: 'paystack',
+    ...config,
+    eventType: 'eventType' in config ? config.eventType : 'charge.success',
+  },
   logger,
 );
 
