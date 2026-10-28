@@ -207,7 +207,11 @@ export class ProviderPlanReservationService {
           };
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
       } catch (error) {
-        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002' && attempt < MAX_RESERVATION_ATTEMPTS) {
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          (error.code === 'P2002' || error.code === 'P2034') &&
+          attempt < MAX_RESERVATION_ATTEMPTS
+        ) {
           continue;
         }
         throw error;
@@ -312,49 +316,170 @@ export class ProviderPlanReservationService {
   }
 
   async resolveReconciliation(
-    input: ProviderPlanReservationInput,
-    verifiedPlan: ProviderPlan
-  ): Promise<PersistedProviderPlanReservation> {
+    input: ProviderPlanReservationInput & { candidatePlanCode?: string },
+    candidatePlanCodeOrGateway: string | PaymentGateway,
+    maybeGateway?: PaymentGateway
+  ): Promise<PersistedProviderPlanReservation | null> {
     assertIdempotencyKey(input.idempotencyKey);
+    const candidatePlanCode = typeof candidatePlanCodeOrGateway === 'string'
+      ? candidatePlanCodeOrGateway
+      : input.candidatePlanCode;
+    const gateway = typeof candidatePlanCodeOrGateway === 'string'
+      ? maybeGateway
+      : candidatePlanCodeOrGateway;
+
+    if (!gateway) {
+      throw new ProviderPlanReservationError('Payment gateway is required for reconciliation');
+    }
+    if (!candidatePlanCode || typeof candidatePlanCode !== 'string') {
+      throw new ProviderPlanReservationError('Candidate provider plan code is required');
+    }
+
+    const pricing = calculateSeatPricing(input.planCode as PricingPlanCode, input.billableStaffSeats);
+    const amountCents = pricing.monthlyTotalCents;
     const scope = `${PROVIDER_PLAN_SCOPE_PREFIX}:${input.teamId}`;
-
-    return await this.database.$transaction(async (tx) => {
-      const existing = await tx.billingIdempotencyKey.findUnique({
-        where: { scope_key: { scope, key: input.idempotencyKey } },
-      });
-      if (!existing) {
-        throw new ProviderPlanReservationError('No provider-plan reservation found to reconcile');
-      }
-
-      const current = parseReservation(existing.responseBody);
-      if (verifiedPlan.amountCents !== current.amountCents
-        || verifiedPlan.currency !== current.currency
-        || verifiedPlan.interval !== current.interval
-        || verifiedPlan.name !== current.planName) {
-        throw new ProviderPlanReservationConflictError(
-          'Verified provider plan does not match the persisted reservation'
-        );
-      }
-
-      const now = new Date().toISOString();
-      const reconciled: PersistedProviderPlanReservation = {
-        ...current,
-        state: 'COMPLETED',
-        providerPlanId: verifiedPlan.providerPlanId,
-        providerPlanCode: verifiedPlan.planCode,
-        updatedAt: now,
-      };
-
-      await tx.billingIdempotencyKey.update({
-        where: { scope_key: { scope, key: input.idempotencyKey } },
-        data: {
-          status: BillingIdempotencyStatus.SUCCEEDED,
-          completedAt: new Date(),
-          responseBody: reconciled as unknown as Prisma.InputJsonValue,
-        },
-      });
-
-      return reconciled;
+    const canonical = canonicalRequest({
+      teamId: input.teamId,
+      subscriptionId: input.subscriptionId,
+      planCode: input.planCode,
+      billableStaffSeats: input.billableStaffSeats,
+      amountCents,
     });
+    const requestHash = hashRequest(canonical);
+    const planName = `Rota ${input.planCode} (${input.billableStaffSeats} seats) - team:${input.teamId}`;
+
+    const existing = await this.database.billingIdempotencyKey.findUnique({
+      where: { scope_key: { scope, key: input.idempotencyKey } },
+    });
+    if (!existing) {
+      throw new ProviderPlanReservationError('No provider-plan reservation found to reconcile');
+    }
+    if (existing.teamId !== input.teamId) {
+      throw new ProviderPlanReservationConflictError('Provider-plan reservation belongs to a different team');
+    }
+    if (existing.requestHash !== requestHash) {
+      throw new ProviderPlanReservationConflictError(
+        'Idempotency key was used with different provider-plan creation parameters'
+      );
+    }
+
+    const current = parseReservation(existing.responseBody);
+    if (
+      current.teamId !== input.teamId ||
+      current.planCode !== input.planCode ||
+      current.billableStaffSeats !== input.billableStaffSeats ||
+      current.amountCents !== amountCents ||
+      current.currency !== 'USD' ||
+      current.interval !== 'monthly' ||
+      current.planName !== planName
+    ) {
+      throw new ProviderPlanReservationConflictError(
+        'Supplied parameters do not match the persisted reservation'
+      );
+    }
+
+    if (current.state === 'COMPLETED') {
+      if (current.providerPlanCode === candidatePlanCode) {
+        return current;
+      }
+      throw new ProviderPlanReservationConflictError(
+        'Provider plan reservation was already completed with a different plan code'
+      );
+    }
+    if (current.state === 'FAILED') {
+      throw new ProviderPlanReservationError(
+        `Cannot reconcile a failed reservation: ${current.failureMessage ?? 'unknown failure'}`
+      );
+    }
+    if (current.state !== 'RECOVERY_REQUIRED') {
+      throw new ProviderPlanReservationError(
+        `Cannot reconcile reservation in state ${current.state}`
+      );
+    }
+
+    let verifiedPlan: ProviderPlan | null = null;
+    try {
+      verifiedPlan = await gateway.fetchPlanByCode({
+        planCode: candidatePlanCode,
+        expectedAmountCents: current.amountCents,
+        expectedCurrency: current.currency,
+        expectedInterval: current.interval,
+        expectedName: current.planName,
+      });
+    } catch (error) {
+      if (error instanceof PaymentGatewayError) {
+        return null;
+      }
+      throw error;
+    }
+
+    if (!verifiedPlan) {
+      return null;
+    }
+
+    for (let attempt = 1; attempt <= MAX_RESERVATION_ATTEMPTS; attempt++) {
+      try {
+        return await this.database.$transaction(async (tx) => {
+          const record = await tx.billingIdempotencyKey.findUnique({
+            where: { scope_key: { scope, key: input.idempotencyKey } },
+          });
+          if (!record) {
+            throw new ProviderPlanReservationError('No provider-plan reservation found to reconcile');
+          }
+          if (record.requestHash !== requestHash) {
+            throw new ProviderPlanReservationConflictError(
+              'Idempotency key was used with different provider-plan creation parameters'
+            );
+          }
+
+          const latest = parseReservation(record.responseBody);
+          if (latest.state === 'COMPLETED') {
+            if (latest.providerPlanCode === verifiedPlan!.planCode) {
+              return latest;
+            }
+            throw new ProviderPlanReservationConflictError(
+              'Provider plan reservation was already completed with a different plan code'
+            );
+          }
+          if (latest.state !== 'RECOVERY_REQUIRED') {
+            throw new ProviderPlanReservationError(
+              `Cannot reconcile reservation in state ${latest.state}`
+            );
+          }
+
+          const now = new Date().toISOString();
+          const { failureCode: _fc, failureMessage: _fm, ...cleanLatest } = latest;
+          const completed: PersistedProviderPlanReservation = {
+            ...cleanLatest,
+            state: 'COMPLETED',
+            providerPlanId: verifiedPlan!.providerPlanId,
+            providerPlanCode: verifiedPlan!.planCode,
+            updatedAt: now,
+          };
+
+          await tx.billingIdempotencyKey.update({
+            where: { scope_key: { scope, key: input.idempotencyKey } },
+            data: {
+              status: BillingIdempotencyStatus.SUCCEEDED,
+              completedAt: new Date(),
+              responseBody: completed as unknown as Prisma.InputJsonValue,
+            },
+          });
+
+          return completed;
+        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+      } catch (error) {
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          (error.code === 'P2002' || error.code === 'P2034') &&
+          attempt < MAX_RESERVATION_ATTEMPTS
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new ProviderPlanReservationError('Exhausted retry attempts reconciling provider-plan reservation');
   }
 }

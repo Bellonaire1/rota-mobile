@@ -147,7 +147,7 @@ describe('ProviderPlanReservationService', { concurrency: false, skip: reconcili
     );
   });
 
-  it('reconciles uncertain reservation when verified provider plan is provided', async () => {
+  it('reconciles uncertain reservation using verified Paystack lookup', async () => {
     const { teamId } = await createTeam();
     const service = new ProviderPlanReservationService(prisma);
     const gateway = new MockPaystackGateway();
@@ -165,24 +165,26 @@ describe('ProviderPlanReservationService', { concurrency: false, skip: reconcili
       (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
     );
 
-    const verifiedPlan: ProviderPlan = {
+    const candidatePlanCode = 'PLN_reconciled_123';
+    gateway.setPlanLookupResult(candidatePlanCode, {
       providerPlanId: '98765',
-      planCode: 'PLN_reconciled_123',
+      planCode: candidatePlanCode,
       name: `Rota TEAM (10 seats) - team:${teamId}`,
       amountCents: 5_000,
       currency: 'USD',
       interval: 'monthly',
-    };
+    });
 
     const reconciled = await service.resolveReconciliation({
       teamId,
       planCode: 'TEAM',
       billableStaffSeats: 10,
       idempotencyKey,
-    }, verifiedPlan);
+    }, candidatePlanCode, gateway);
 
+    assert.ok(reconciled);
     assert.equal(reconciled.state, 'COMPLETED');
-    assert.equal(reconciled.providerPlanCode, 'PLN_reconciled_123');
+    assert.equal(reconciled.providerPlanCode, candidatePlanCode);
     assert.equal(reconciled.providerPlanId, '98765');
 
     // Subsequent calls now return the completed reservation
@@ -193,7 +195,280 @@ describe('ProviderPlanReservationService', { concurrency: false, skip: reconcili
       idempotencyKey,
     }, gateway);
     assert.equal(replay.state, 'COMPLETED');
-    assert.equal(replay.providerPlanCode, 'PLN_reconciled_123');
+    assert.equal(replay.providerPlanCode, candidatePlanCode);
+  });
+
+  it('returns recorded identity on completed replay and rejects conflicting plan code', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+    const idempotencyKey = `plan-key-${randomUUID()}`;
+
+    gateway.setNextPlanResult(new PaymentGatewayError('TIMEOUT', 'Paystack request timed out'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    const planCode = 'PLN_reconciled_replay';
+    gateway.setPlanLookupResult(planCode, {
+      providerPlanId: '11111',
+      planCode,
+      name: `Rota TEAM (10 seats) - team:${teamId}`,
+      amountCents: 5_000,
+      currency: 'USD',
+      interval: 'monthly',
+    });
+
+    const first = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      planCode,
+      gateway
+    );
+    assert.ok(first);
+    assert.equal(first.state, 'COMPLETED');
+
+    // Replay with same plan code returns identical result without re-fetching
+    const second = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      planCode,
+      gateway
+    );
+    assert.deepEqual(second, first);
+
+    // Replay with different candidate plan code throws conflict error
+    await assert.rejects(
+      service.resolveReconciliation(
+        { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+        'PLN_conflicting_code',
+        gateway
+      ),
+      (error: unknown) => error instanceof ProviderPlanReservationConflictError
+    );
+  });
+
+  it('leaves reservation unresolved when provider plan attributes mismatch', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+    const idempotencyKey = `plan-key-${randomUUID()}`;
+
+    gateway.setNextPlanResult(new PaymentGatewayError('TIMEOUT', 'Paystack request timed out'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // Mismatched amount
+    const mismatchCode = 'PLN_mismatch_amount';
+    gateway.setPlanLookupResult(mismatchCode, {
+      providerPlanId: '22222',
+      planCode: mismatchCode,
+      name: `Rota TEAM (10 seats) - team:${teamId}`,
+      amountCents: 4_000, // Expected 5_000
+      currency: 'USD',
+      interval: 'monthly',
+    });
+
+    const result = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      mismatchCode,
+      gateway
+    );
+    assert.equal(result, null);
+
+    // Reservation still in RECOVERY_REQUIRED
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+  });
+
+  it('leaves reservation unresolved when candidate plan is not found in Paystack', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+    const idempotencyKey = `plan-key-${randomUUID()}`;
+
+    gateway.setNextPlanResult(new PaymentGatewayError('TIMEOUT', 'Paystack request timed out'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // Unconfigured plan returns null in MockPaystackGateway
+    const result = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      'PLN_non_existent_code',
+      gateway
+    );
+    assert.equal(result, null);
+
+    // Reservation still in RECOVERY_REQUIRED
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+  });
+
+  it('leaves reservation unresolved on provider network failure or timeout during lookup', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+    const idempotencyKey = `plan-key-${randomUUID()}`;
+
+    gateway.setNextPlanResult(new PaymentGatewayError('TIMEOUT', 'Paystack request timed out'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    const outageCode = 'PLN_outage_code';
+    gateway.setPlanLookupResult(outageCode, new PaymentGatewayError('TIMEOUT', 'Lookup timeout'));
+
+    const result = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      outageCode,
+      gateway
+    );
+    assert.equal(result, null);
+
+    // Also with provider failure
+    gateway.setPlanLookupResult(outageCode, new PaymentGatewayError('PROVIDER_FAILURE', '500 Internal error'));
+    const resultFailure = await service.resolveReconciliation(
+      { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey },
+      outageCode,
+      gateway
+    );
+    assert.equal(resultFailure, null);
+
+    // Reservation still in RECOVERY_REQUIRED
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+  });
+
+  it('rejects reconciliation when request parameters differ or reservation state is not RECOVERY_REQUIRED', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+    const idempotencyKey = `plan-key-${randomUUID()}`;
+
+    gateway.setNextPlanResult(new PaymentGatewayError('TIMEOUT', 'Paystack request timed out'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    // Wrong plan code
+    await assert.rejects(
+      service.resolveReconciliation(
+        { teamId, planCode: 'STARTER', billableStaffSeats: 5, idempotencyKey },
+        'PLN_some_code',
+        gateway
+      ),
+      (error: unknown) => error instanceof ProviderPlanReservationConflictError
+    );
+
+    // Wrong seat count
+    await assert.rejects(
+      service.resolveReconciliation(
+        { teamId, planCode: 'TEAM', billableStaffSeats: 20, idempotencyKey },
+        'PLN_some_code',
+        gateway
+      ),
+      (error: unknown) => error instanceof ProviderPlanReservationConflictError
+    );
+
+    // Non-existent reservation
+    await assert.rejects(
+      service.resolveReconciliation(
+        { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: 'non-existent-key' },
+        'PLN_some_code',
+        gateway
+      ),
+      (error: unknown) => error instanceof ProviderPlanReservationError
+    );
+
+    // Cannot reconcile a freshly RESERVED reservation (not in RECOVERY_REQUIRED)
+    const freshKey = `plan-key-${randomUUID()}`;
+    await service.reserve({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: freshKey });
+    await assert.rejects(
+      service.resolveReconciliation(
+        { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: freshKey },
+        'PLN_some_code',
+        gateway
+      ),
+      (error: unknown) => error instanceof ProviderPlanReservationError
+    );
+
+    // Cannot reconcile a FAILED reservation
+    const failKey = `plan-key-${randomUUID()}`;
+    gateway.setNextPlanResult(new PaymentGatewayError('PROVIDER_FAILURE', 'Provider rejected plan'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: failKey }, gateway),
+      (error: unknown) => error instanceof PaymentGatewayError
+    );
+    await assert.rejects(
+      service.resolveReconciliation(
+        { teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey: failKey },
+        'PLN_some_code',
+        gateway
+      ),
+      (error: unknown) => error instanceof ProviderPlanReservationError
+    );
+  });
+
+  it('protects concurrent reconciliation and prevents conflicting plan overwrite', async () => {
+    const { teamId } = await createTeam();
+    const service = new ProviderPlanReservationService(prisma);
+    const gateway = new MockPaystackGateway();
+    const idempotencyKey = `plan-key-${randomUUID()}`;
+
+    gateway.setNextPlanResult(new PaymentGatewayError('TIMEOUT', 'Paystack request timed out'));
+    await assert.rejects(
+      service.getOrCreatePlan({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, gateway),
+      (error: unknown) => error instanceof ProviderPlanRecoveryRequiredError
+    );
+
+    const winningCode = 'PLN_concurrent_win';
+    gateway.setPlanLookupResult(winningCode, {
+      providerPlanId: '33333',
+      planCode: winningCode,
+      name: `Rota TEAM (10 seats) - team:${teamId}`,
+      amountCents: 5_000,
+      currency: 'USD',
+      interval: 'monthly',
+    });
+
+    // Multiple concurrent reconciliations for the same winning plan converge
+    const [res1, res2, res3] = await Promise.all([
+      service.resolveReconciliation({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, winningCode, gateway),
+      service.resolveReconciliation({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, winningCode, gateway),
+      service.resolveReconciliation({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, winningCode, gateway),
+    ]);
+
+    assert.ok(res1 && res2 && res3);
+    assert.equal(res1.providerPlanCode, winningCode);
+    assert.deepEqual(res2, res1);
+    assert.deepEqual(res3, res1);
+
+    // Another candidate cannot overwrite the completed reservation
+    const conflictingCode = 'PLN_concurrent_conflict';
+    gateway.setPlanLookupResult(conflictingCode, {
+      providerPlanId: '44444',
+      planCode: conflictingCode,
+      name: `Rota TEAM (10 seats) - team:${teamId}`,
+      amountCents: 5_000,
+      currency: 'USD',
+      interval: 'monthly',
+    });
+
+    await assert.rejects(
+      service.resolveReconciliation({ teamId, planCode: 'TEAM', billableStaffSeats: 10, idempotencyKey }, conflictingCode, gateway),
+      (error: unknown) => error instanceof ProviderPlanReservationConflictError
+    );
   });
 
   it('protects concurrent reservations and converges to one creator', async () => {
