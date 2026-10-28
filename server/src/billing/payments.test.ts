@@ -7,6 +7,7 @@ import {
   type CreatePlanInput,
   type FetchPlanByCodeInput,
   type InitializePaymentInput,
+  type PlanInitializationOptions,
   type ProviderPlan,
 } from './payments';
 import { calculateSeatPricing } from './pricing';
@@ -847,6 +848,448 @@ describe('verified Paystack plan lookup', () => {
     await assertGatewayError(
       gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_malformed_10' })),
       'INVALID_RESPONSE'
+    );
+  });
+});
+
+describe('plan-linked transaction initialization', () => {
+  const defaultPlan = (overrides: Partial<PlanInitializationOptions> = {}): PlanInitializationOptions => ({
+    planCode: 'PLN_test_plan_5000',
+    expectedAmountCents: 5_000,
+    expectedCurrency: 'USD',
+    expectedInterval: 'monthly',
+    expectedName: 'Rota Team (10 seats)',
+    ...overrides,
+  });
+
+  const validPlanData = {
+    id: 101,
+    plan_code: 'PLN_test_plan_5000',
+    name: 'Rota Team (10 seats)',
+    amount: 5_000,
+    interval: 'monthly',
+    currency: 'USD',
+  };
+
+  it('performs valid plan-linked initialization in MockPaystackGateway', async () => {
+    const gateway = new MockPaystackGateway();
+    const createdPlan = await gateway.createPlan({
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+
+    const initInput = input({
+      amountCents: 5_000,
+      plan: {
+        planCode: createdPlan.planCode,
+        expectedAmountCents: 5_000,
+        expectedCurrency: 'USD',
+        expectedInterval: 'monthly',
+        expectedName: 'Rota Team (10 seats)',
+      },
+    });
+
+    const initialized = await gateway.initializeTransaction(initInput);
+    assert.equal(initialized.reference, initInput.reference);
+    assert.ok(initialized.authorizationUrl.includes(encodeURIComponent(initInput.reference)));
+    assert.equal(initialized.accessCode, `mock_${initInput.reference}`);
+
+    // Verification also succeeds
+    gateway.simulateSuccess(initialized.reference);
+    const verified = await gateway.verifyTransaction({
+      reference: initialized.reference,
+      expectedAmountCents: 5_000,
+      expectedCurrency: 'USD',
+    });
+    assert.equal(verified.status, 'success');
+    assert.equal(verified.amountCents, 5_000);
+  });
+
+  it('performs valid plan-linked initialization in PaystackGateway verifying plan and passing plan in body', async () => {
+    const requests: Array<{ url: string; init: RequestInit }> = [];
+    const gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url, init) => {
+        requests.push({ url: String(url), init: init! });
+        if (String(url).includes('/plan/')) {
+          return response({
+            status: true,
+            data: validPlanData,
+          });
+        }
+        return response({
+          status: true,
+          data: {
+            authorization_url: 'https://checkout.paystack.com/auth_plan_123',
+            access_code: 'access_plan_123',
+            reference: 'rota-team-20261026-001',
+          },
+        });
+      },
+    });
+
+    const initInput = input({
+      amountCents: 5_000,
+      plan: defaultPlan(),
+    });
+
+    const initialized = await gateway.initializeTransaction(initInput);
+
+    assert.equal(initialized.reference, initInput.reference);
+    assert.equal(initialized.authorizationUrl, 'https://checkout.paystack.com/auth_plan_123');
+    assert.equal(initialized.accessCode, 'access_plan_123');
+
+    // First request: GET /plan/:code
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].url, 'https://api.paystack.co/plan/PLN_test_plan_5000');
+    assert.equal(requests[0].init.method, 'GET');
+
+    // Second request: POST /transaction/initialize with plan field
+    assert.equal(requests[1].url, 'https://api.paystack.co/transaction/initialize');
+    assert.equal(requests[1].init.method, 'POST');
+    const body = JSON.parse(String(requests[1].init.body));
+    assert.equal(body.email, initInput.customerEmail);
+    assert.equal(body.amount, 5_000);
+    assert.equal(body.currency, 'USD');
+    assert.equal(body.reference, initInput.reference);
+    assert.equal(body.plan, 'PLN_test_plan_5000');
+  });
+
+  it('preserves ordinary one-off checkout behavior when no plan is provided', async () => {
+    // Mock gateway
+    const mockGateway = new MockPaystackGateway();
+    const mockInit = await mockGateway.initializeTransaction(input());
+    assert.equal(mockInit.reference, input().reference);
+
+    // PaystackGateway
+    const requests: Array<{ url: string; init: RequestInit }> = [];
+    const httpGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url, init) => {
+        requests.push({ url: String(url), init: init! });
+        return response({
+          status: true,
+          data: {
+            authorization_url: 'https://checkout.paystack.com/auth_oneoff',
+            access_code: 'access_oneoff',
+            reference: input().reference,
+          },
+        });
+      },
+    });
+
+    const httpInit = await httpGateway.initializeTransaction(input());
+    assert.equal(httpInit.reference, input().reference);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, 'https://api.paystack.co/transaction/initialize');
+    const body = JSON.parse(String(requests[0].init.body));
+    assert.equal(body.plan, undefined);
+  });
+
+  it('rejects invalid plan inputs and malformed plan configurations before provider calls', async () => {
+    const gateway = new MockPaystackGateway();
+
+    // Malformed plan code
+    await assertGatewayError(
+      gateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan({ planCode: 'BAD_CODE' }),
+      })),
+      'VALIDATION'
+    );
+
+    // Non-USD currency in plan
+    await assertGatewayError(
+      gateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan({ expectedCurrency: 'NGN' as never }),
+      })),
+      'VALIDATION'
+    );
+
+    // Non-monthly interval in plan
+    await assertGatewayError(
+      gateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan({ expectedInterval: 'annually' as never }),
+      })),
+      'VALIDATION'
+    );
+
+    // Empty plan name
+    await assertGatewayError(
+      gateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan({ expectedName: '' }),
+      })),
+      'VALIDATION'
+    );
+
+    // Non-object plan
+    await assertGatewayError(
+      gateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: 'invalid-string' as never,
+      })),
+      'VALIDATION'
+    );
+  });
+
+  it('rejects price and currency mismatches between payment and plan before provider calls', async () => {
+    const gateway = new MockPaystackGateway();
+
+    // amountCents differs from plan expectedAmountCents
+    await assertGatewayError(
+      gateway.initializeTransaction(input({
+        amountCents: 6_000,
+        plan: defaultPlan({ expectedAmountCents: 5_000 }),
+      })),
+      'VALIDATION'
+    );
+
+    // currency differs from plan expectedCurrency
+    await assertGatewayError(
+      gateway.initializeTransaction(input({
+        amountCents: 5_000,
+        currency: 'NGN',
+        plan: defaultPlan({ expectedCurrency: 'USD' }),
+      })),
+      'VALIDATION'
+    );
+  });
+
+  it('rejects plan-linked initialization when plan does not exist or provider response mismatches', async () => {
+    // 1. Missing plan in MockPaystackGateway
+    const mockGateway = new MockPaystackGateway();
+    await assertGatewayError(
+      mockGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan({ planCode: 'PLN_uncreated_plan' }),
+      })),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // 2. Missing plan (HTTP 404) in PaystackGateway
+    let initializeCalls = 0;
+    const notFoundGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url) => {
+        if (String(url).includes('/transaction/initialize')) {
+          initializeCalls++;
+        }
+        return response({ status: false, message: 'Plan not found' }, 404);
+      },
+    });
+    await assertGatewayError(
+      notFoundGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'VERIFICATION_MISMATCH'
+    );
+    assert.equal(initializeCalls, 0);
+
+    // 3. Provider plan amount mismatch
+    const amountMismatchGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url) => {
+        if (String(url).includes('/transaction/initialize')) {
+          initializeCalls++;
+        }
+        return response({ status: true, data: { ...validPlanData, amount: 4_000 } });
+      },
+    });
+    await assertGatewayError(
+      amountMismatchGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'VERIFICATION_MISMATCH'
+    );
+    assert.equal(initializeCalls, 0);
+
+    // 4. Provider plan name mismatch
+    const nameMismatchGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url) => {
+        if (String(url).includes('/transaction/initialize')) {
+          initializeCalls++;
+        }
+        return response({ status: true, data: { ...validPlanData, name: 'Different Plan Name' } });
+      },
+    });
+    await assertGatewayError(
+      nameMismatchGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'VERIFICATION_MISMATCH'
+    );
+    assert.equal(initializeCalls, 0);
+
+    // 5. Malformed provider plan response
+    const malformedGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url) => {
+        if (String(url).includes('/transaction/initialize')) {
+          initializeCalls++;
+        }
+        return response({ status: true, data: { ...validPlanData, id: 'not-a-number' } });
+      },
+    });
+    await assertGatewayError(
+      malformedGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'INVALID_RESPONSE'
+    );
+    assert.equal(initializeCalls, 0);
+  });
+
+  it('enforces idempotency and rejects conflicting duplicate operations with plans in MockPaystackGateway', async () => {
+    const gateway = new MockPaystackGateway();
+    await gateway.createPlan({
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+
+    const planA = defaultPlan({ planCode: 'PLN_mock_5000_1' });
+    const baseInput = input({
+      reference: 'rota-dup-test-001',
+      idempotencyKey: 'dup-key-001',
+      amountCents: 5_000,
+      plan: planA,
+    });
+
+    // 1. Initial plan-linked initialization succeeds
+    const first = await gateway.initializeTransaction(baseInput);
+
+    // 2. Idempotent replay returns same initialization
+    const second = await gateway.initializeTransaction(baseInput);
+    assert.deepEqual(second, first);
+
+    // 3. Same reference with different plan code rejected
+    await assertGatewayError(
+      gateway.initializeTransaction({
+        ...baseInput,
+        plan: defaultPlan({ planCode: 'PLN_mock_5000_different' }),
+      }),
+      'DUPLICATE_OPERATION'
+    );
+
+    // 4. Same reference with different amount rejected
+    await assertGatewayError(
+      gateway.initializeTransaction({
+        ...baseInput,
+        amountCents: 7_500,
+        plan: defaultPlan({ expectedAmountCents: 7_500 }),
+      }),
+      'DUPLICATE_OPERATION'
+    );
+
+    // 5. Same reference without plan rejected
+    await assertGatewayError(
+      gateway.initializeTransaction({
+        ...baseInput,
+        plan: undefined,
+      }),
+      'DUPLICATE_OPERATION'
+    );
+
+    // 6. One-off initialization followed by plan-linked with same reference rejected
+    const oneOffInput = input({
+      reference: 'rota-oneoff-then-plan-002',
+      idempotencyKey: 'dup-key-002',
+      amountCents: 5_000,
+    });
+    await gateway.initializeTransaction(oneOffInput);
+    await assertGatewayError(
+      gateway.initializeTransaction({
+        ...oneOffInput,
+        plan: planA,
+      }),
+      'DUPLICATE_OPERATION'
+    );
+  });
+
+  it('handles provider uncertainty during plan lookup and initialization safely', async () => {
+    // 1. Plan lookup timeout in PaystackGateway
+    let initializeCalled = false;
+    const lookupTimeoutGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      timeoutMs: 5,
+      fetchImpl: (url) => {
+        if (String(url).includes('/transaction/initialize')) {
+          initializeCalled = true;
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          setTimeout(() => reject(new DOMException('The operation was aborted.', 'AbortError')), 10);
+        });
+      },
+    });
+    await assertGatewayError(
+      lookupTimeoutGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'TIMEOUT'
+    );
+    assert.equal(initializeCalled, false);
+
+    // 2. Plan lookup HTTP 502 Bad Gateway
+    const lookup502Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url) => {
+        if (String(url).includes('/transaction/initialize')) {
+          initializeCalled = true;
+        }
+        return response({ status: false, message: 'Bad Gateway' }, 502);
+      },
+    });
+    await assertGatewayError(
+      lookup502Gateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'HTTP'
+    );
+    assert.equal(initializeCalled, false);
+
+    // 3. Transaction initialize timeout (after plan lookup succeeds)
+    const initTimeoutGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      timeoutMs: 5,
+      fetchImpl: (url) => {
+        if (String(url).includes('/plan/')) {
+          return Promise.resolve(response({ status: true, data: validPlanData }));
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          setTimeout(() => reject(new DOMException('The operation was aborted.', 'AbortError')), 10);
+        });
+      },
+    });
+    await assertGatewayError(
+      initTimeoutGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'TIMEOUT'
+    );
+
+    // 4. Provider uncertainty during plan lookup in MockPaystackGateway
+    const mockGateway = new MockPaystackGateway();
+    mockGateway.setPlanLookupResult('PLN_test_plan_5000', new PaymentGatewayError('TIMEOUT', 'Mock plan lookup timeout'));
+    await assertGatewayError(
+      mockGateway.initializeTransaction(input({
+        amountCents: 5_000,
+        plan: defaultPlan(),
+      })),
+      'TIMEOUT'
     );
   });
 });

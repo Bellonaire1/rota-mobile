@@ -23,6 +23,14 @@ export class PaymentGatewayError extends Error {
 
 export type PaymentMetadata = Readonly<Record<string, string>>;
 
+export interface PlanInitializationOptions {
+  readonly planCode: string;
+  readonly expectedAmountCents: number;
+  readonly expectedCurrency: 'USD';
+  readonly expectedInterval: 'monthly';
+  readonly expectedName: string;
+}
+
 export interface InitializePaymentInput {
   readonly amountCents: number;
   readonly currency: PaystackCurrency;
@@ -32,6 +40,7 @@ export interface InitializePaymentInput {
   /** The caller's stable idempotency key, persisted before provider calls. */
   readonly idempotencyKey: string;
   readonly metadata?: PaymentMetadata;
+  readonly plan?: PlanInitializationOptions;
 }
 
 export interface PaymentInitialization {
@@ -141,6 +150,35 @@ const metadataMatches = (actual: unknown, expected: PaymentMetadata): boolean =>
 const sameMetadata = (left: PaymentMetadata | undefined, right: PaymentMetadata | undefined): boolean =>
   JSON.stringify(left ?? {}) === JSON.stringify(right ?? {});
 
+const samePlan = (
+  left: PlanInitializationOptions | undefined,
+  right: PlanInitializationOptions | undefined
+): boolean => {
+  if (!left && !right) return true;
+  if (!left || !right) return false;
+  return left.planCode === right.planCode
+    && left.expectedAmountCents === right.expectedAmountCents
+    && left.expectedCurrency === right.expectedCurrency
+    && left.expectedInterval === right.expectedInterval
+    && left.expectedName === right.expectedName;
+};
+
+const validateFetchPlanByCodeInput = (input: FetchPlanByCodeInput): void => {
+  if (typeof input.planCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(input.planCode)) {
+    throw new PaymentGatewayError('VALIDATION', 'Plan code has an invalid format');
+  }
+  if (input.expectedCurrency !== 'USD') {
+    throw new PaymentGatewayError('VALIDATION', 'Only USD currency is supported for plans');
+  }
+  if (input.expectedInterval !== 'monthly') {
+    throw new PaymentGatewayError('VALIDATION', 'Only monthly interval is supported');
+  }
+  assertAmount(input.expectedAmountCents, input.expectedCurrency);
+  if (!input.expectedName || typeof input.expectedName !== 'string' || input.expectedName.trim().length === 0 || input.expectedName.length > 100) {
+    throw new PaymentGatewayError('VALIDATION', 'Plan name is invalid');
+  }
+};
+
 const validateInitializationInput = (input: InitializePaymentInput): void => {
   assertCurrency(input.currency);
   assertAmount(input.amountCents, input.currency);
@@ -149,6 +187,18 @@ const validateInitializationInput = (input: InitializePaymentInput): void => {
   assertMetadata(input.metadata);
   if (!/^\S+@\S+\.\S+$/.test(input.customerEmail)) {
     throw new PaymentGatewayError('VALIDATION', 'Customer email is invalid');
+  }
+  if (input.plan !== undefined) {
+    if (typeof input.plan !== 'object' || input.plan === null || Array.isArray(input.plan)) {
+      throw new PaymentGatewayError('VALIDATION', 'Plan configuration is invalid');
+    }
+    validateFetchPlanByCodeInput(input.plan);
+    if (input.plan.expectedCurrency !== input.currency) {
+      throw new PaymentGatewayError('VALIDATION', 'Payment currency must match the expected plan currency');
+    }
+    if (input.plan.expectedAmountCents !== input.amountCents) {
+      throw new PaymentGatewayError('VALIDATION', 'Payment amount must match the expected plan amount');
+    }
   }
 };
 
@@ -174,22 +224,6 @@ const validateCreatePlanInput = (input: CreatePlanInput): void => {
     if (typeof input.description !== 'string' || input.description.length > 255) {
       throw new PaymentGatewayError('VALIDATION', 'Plan description is invalid');
     }
-  }
-};
-
-const validateFetchPlanByCodeInput = (input: FetchPlanByCodeInput): void => {
-  if (typeof input.planCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(input.planCode)) {
-    throw new PaymentGatewayError('VALIDATION', 'Plan code has an invalid format');
-  }
-  if (input.expectedCurrency !== 'USD') {
-    throw new PaymentGatewayError('VALIDATION', 'Only USD currency is supported for plans');
-  }
-  if (input.expectedInterval !== 'monthly') {
-    throw new PaymentGatewayError('VALIDATION', 'Only monthly interval is supported');
-  }
-  assertAmount(input.expectedAmountCents, input.expectedCurrency);
-  if (!input.expectedName || typeof input.expectedName !== 'string' || input.expectedName.trim().length === 0 || input.expectedName.length > 100) {
-    throw new PaymentGatewayError('VALIDATION', 'Plan name is invalid');
   }
 };
 
@@ -281,6 +315,17 @@ export class PaystackGateway implements PaymentGateway {
 
   async initializeTransaction(input: InitializePaymentInput): Promise<PaymentInitialization> {
     validateInitializationInput(input);
+    let verifiedPlanCode: string | undefined;
+    if (input.plan) {
+      const verifiedPlan = await this.fetchPlanByCode(input.plan);
+      if (!verifiedPlan) {
+        throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack plan was not found');
+      }
+      if (verifiedPlan.amountCents !== input.amountCents) {
+        throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack plan amount did not match payment amount');
+      }
+      verifiedPlanCode = verifiedPlan.planCode;
+    }
     const response = await this.request<PaystackInitializeData>('/transaction/initialize', {
       method: 'POST',
       body: JSON.stringify({
@@ -289,6 +334,7 @@ export class PaystackGateway implements PaymentGateway {
         currency: input.currency,
         reference: input.reference,
         ...(input.metadata ? { metadata: input.metadata } : {}),
+        ...(verifiedPlanCode ? { plan: verifiedPlanCode } : {}),
       }),
     });
 
@@ -621,11 +667,23 @@ export class MockPaystackGateway implements PaymentGateway {
         || existing.input.amountCents !== input.amountCents
         || existing.input.currency !== input.currency
         || existing.input.customerEmail !== input.customerEmail
-        || !sameMetadata(existing.input.metadata, input.metadata)) {
+        || !sameMetadata(existing.input.metadata, input.metadata)
+        || !samePlan(existing.input.plan, input.plan)) {
         throw new PaymentGatewayError('DUPLICATE_OPERATION', 'Payment reference was already used for another operation');
       }
       return existing.initialization;
     }
+
+    if (input.plan) {
+      const verifiedPlan = await this.fetchPlanByCode(input.plan);
+      if (!verifiedPlan) {
+        throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan was not found');
+      }
+      if (verifiedPlan.amountCents !== input.amountCents) {
+        throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan amount did not match payment amount');
+      }
+    }
+
     const initialization = {
       reference: input.reference,
       authorizationUrl: `https://mock.paystack.test/authorize/${encodeURIComponent(input.reference)}`,
