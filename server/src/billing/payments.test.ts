@@ -5,6 +5,7 @@ import {
   PaystackGateway,
   PaymentGatewayError,
   type CreatePlanInput,
+  type FetchPlanByCodeInput,
   type InitializePaymentInput,
   type ProviderPlan,
 } from './payments';
@@ -531,5 +532,321 @@ describe('recurring provider plan gateway', () => {
       } }),
     });
     await assertGatewayError(nameMismatch.createPlan(planInput()), 'VERIFICATION_MISMATCH');
+  });
+});
+
+describe('verified Paystack plan lookup', () => {
+  const fetchInput = (overrides: Partial<FetchPlanByCodeInput> = {}): FetchPlanByCodeInput => ({
+    planCode: 'PLN_gx2wn530m0i3w3m',
+    expectedAmountCents: 5_000,
+    expectedCurrency: 'USD',
+    expectedInterval: 'monthly',
+    expectedName: 'Rota Team (10 seats)',
+    ...overrides,
+  });
+
+  const validPlanData = {
+    id: 28,
+    plan_code: 'PLN_gx2wn530m0i3w3m',
+    name: 'Rota Team (10 seats)',
+    amount: 5_000,
+    interval: 'monthly',
+    currency: 'USD',
+  };
+
+  it('retrieves and strictly validates an exact match in PaystackGateway', async () => {
+    let capturedUrl: string | undefined;
+    let capturedInit: RequestInit | undefined;
+
+    const gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async (url, init) => {
+        capturedUrl = String(url);
+        capturedInit = init;
+        return response({
+          status: true,
+          message: 'Plan retrieved',
+          data: validPlanData,
+        });
+      },
+    });
+
+    const result = await gateway.fetchPlanByCode(fetchInput());
+
+    assert.equal(capturedUrl, 'https://api.paystack.co/plan/PLN_gx2wn530m0i3w3m');
+    assert.equal(capturedInit?.method, 'GET');
+    assert.deepEqual(result, {
+      providerPlanId: '28',
+      planCode: 'PLN_gx2wn530m0i3w3m',
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+  });
+
+  it('returns null when plan is not found via HTTP 404 or not-found message', async () => {
+    const notFound404Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: false, message: 'Plan not found' }, 404),
+    });
+    const result404 = await notFound404Gateway.fetchPlanByCode(fetchInput());
+    assert.equal(result404, null);
+
+    const notFound200Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: false, message: 'Plan not found' }, 200),
+    });
+    const result200 = await notFound200Gateway.fetchPlanByCode(fetchInput());
+    assert.equal(result200, null);
+  });
+
+  it('rejects plan response attribute mismatches in PaystackGateway', async () => {
+    // wrong amount
+    const amountMismatch = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: { ...validPlanData, amount: 4_000 } }),
+    });
+    await assertGatewayError(amountMismatch.fetchPlanByCode(fetchInput()), 'VERIFICATION_MISMATCH');
+
+    // wrong currency
+    const currencyMismatch = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: { ...validPlanData, currency: 'NGN' } }),
+    });
+    await assertGatewayError(currencyMismatch.fetchPlanByCode(fetchInput()), 'VERIFICATION_MISMATCH');
+
+    // wrong interval
+    const intervalMismatch = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: { ...validPlanData, interval: 'annually' } }),
+    });
+    await assertGatewayError(intervalMismatch.fetchPlanByCode(fetchInput()), 'VERIFICATION_MISMATCH');
+
+    // wrong name
+    const nameMismatch = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: { ...validPlanData, name: 'Different Team Plan' } }),
+    });
+    await assertGatewayError(nameMismatch.fetchPlanByCode(fetchInput()), 'VERIFICATION_MISMATCH');
+
+    // wrong code
+    const codeMismatch = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: { ...validPlanData, plan_code: 'PLN_different999' } }),
+    });
+    await assertGatewayError(codeMismatch.fetchPlanByCode(fetchInput()), 'VERIFICATION_MISMATCH');
+  });
+
+  it('rejects malformed responses and contradictory data in PaystackGateway', async () => {
+    // invalid JSON
+    const invalidJsonGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => new Response('not json', { status: 200 }),
+    });
+    await assertGatewayError(invalidJsonGateway.fetchPlanByCode(fetchInput()), 'INVALID_RESPONSE');
+
+    // missing data
+    const missingDataGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: null }),
+    });
+    await assertGatewayError(missingDataGateway.fetchPlanByCode(fetchInput()), 'INVALID_RESPONSE');
+
+    // invalid plan ID
+    const badIdGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: { ...validPlanData, id: -5 } }),
+    });
+    await assertGatewayError(badIdGateway.fetchPlanByCode(fetchInput()), 'INVALID_RESPONSE');
+
+    // invalid plan code format
+    const badCodeFormatGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: { ...validPlanData, plan_code: 'INVALID_FORMAT' } }),
+    });
+    await assertGatewayError(badCodeFormatGateway.fetchPlanByCode(fetchInput()), 'INVALID_RESPONSE');
+
+    // contradictory 404 with status: true
+    const contradictoryGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: true, data: validPlanData }, 404),
+    });
+    await assertGatewayError(contradictoryGateway.fetchPlanByCode(fetchInput()), 'INVALID_RESPONSE');
+  });
+
+  it('rejects provider errors and HTTP failures in PaystackGateway', async () => {
+    // HTTP 500 error
+    const http500Gateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: false, message: 'Server error' }, 500),
+    });
+    await assertGatewayError(http500Gateway.fetchPlanByCode(fetchInput()), 'HTTP');
+
+    // HTTP 200 with status: false and generic error
+    const providerFailureGateway = new PaystackGateway({
+      secretKey: 'sk_test_only-for-tests',
+      fetchImpl: async () => response({ status: false, message: 'Internal service error' }, 200),
+    });
+    await assertGatewayError(providerFailureGateway.fetchPlanByCode(fetchInput()), 'PROVIDER_FAILURE');
+  });
+
+  it('enforces strict input validation for plan lookup', async () => {
+    const gateway = new MockPaystackGateway();
+
+    // invalid plan code
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ planCode: 'INVALID' })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ planCode: '' })), 'VALIDATION');
+
+    // invalid currency
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ expectedCurrency: 'NGN' as never })), 'VALIDATION');
+
+    // invalid interval
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ expectedInterval: 'annually' as never })), 'VALIDATION');
+
+    // invalid amount
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ expectedAmountCents: 150 })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ expectedAmountCents: -500 })), 'VALIDATION');
+
+    // invalid name
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ expectedName: '' })), 'VALIDATION');
+    await assertGatewayError(gateway.fetchPlanByCode(fetchInput({ expectedName: '   ' })), 'VALIDATION');
+  });
+
+  it('supports equivalent exact match, not found, configured error, and validation in MockPaystackGateway', async () => {
+    const gateway = new MockPaystackGateway();
+
+    // 1. Not found initially
+    const notFound = await gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_uncreated_1' }));
+    assert.equal(notFound, null);
+
+    // 2. Explicitly configured as null
+    gateway.setPlanLookupResult('PLN_mock_null_2', null);
+    const configuredNull = await gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_null_2' }));
+    assert.equal(configuredNull, null);
+
+    // 3. Exact match on plan created via createPlan
+    const created = await gateway.createPlan({
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+    const fetchedCreated = await gateway.fetchPlanByCode({
+      planCode: created.planCode,
+      expectedAmountCents: 5_000,
+      expectedCurrency: 'USD',
+      expectedInterval: 'monthly',
+      expectedName: 'Rota Team (10 seats)',
+    });
+    assert.deepEqual(fetchedCreated, created);
+
+    // 4. Configured provider error
+    gateway.setPlanLookupResult(
+      'PLN_mock_err_3',
+      new PaymentGatewayError('PROVIDER_FAILURE', 'Simulated lookup failure')
+    );
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_err_3' })),
+      'PROVIDER_FAILURE'
+    );
+
+    // 5. Mismatched attributes in mock lookup
+    gateway.setPlanLookupResult('PLN_mock_mismatch_4', {
+      providerPlanId: '10',
+      planCode: 'PLN_mock_mismatch_4',
+      name: 'Rota Team (10 seats)',
+      amountCents: 4_000, // wrong amount
+      interval: 'monthly',
+      currency: 'USD',
+    });
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_mismatch_4', expectedAmountCents: 5_000 })),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // wrong currency
+    gateway.setPlanLookupResult('PLN_mock_mismatch_5', {
+      providerPlanId: '11',
+      planCode: 'PLN_mock_mismatch_5',
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'NGN' as never,
+    });
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_mismatch_5' })),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // wrong interval
+    gateway.setPlanLookupResult('PLN_mock_mismatch_6', {
+      providerPlanId: '12',
+      planCode: 'PLN_mock_mismatch_6',
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'annually' as never,
+      currency: 'USD',
+    });
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_mismatch_6' })),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // wrong name
+    gateway.setPlanLookupResult('PLN_mock_mismatch_7', {
+      providerPlanId: '13',
+      planCode: 'PLN_mock_mismatch_7',
+      name: 'Wrong Plan Name',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_mismatch_7' })),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // wrong code
+    gateway.setPlanLookupResult('PLN_mock_mismatch_8', {
+      providerPlanId: '14',
+      planCode: 'PLN_mock_mismatch_8_different',
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_mismatch_8' })),
+      'VERIFICATION_MISMATCH'
+    );
+
+    // malformed ID in mock
+    gateway.setPlanLookupResult('PLN_mock_malformed_9', {
+      providerPlanId: 'not-a-number',
+      planCode: 'PLN_mock_malformed_9',
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_malformed_9' })),
+      'INVALID_RESPONSE'
+    );
+
+    // malformed code format in mock
+    gateway.setPlanLookupResult('PLN_mock_malformed_10', {
+      providerPlanId: '15',
+      planCode: 'BAD_CODE_FORMAT',
+      name: 'Rota Team (10 seats)',
+      amountCents: 5_000,
+      interval: 'monthly',
+      currency: 'USD',
+    });
+    await assertGatewayError(
+      gateway.fetchPlanByCode(fetchInput({ planCode: 'PLN_mock_malformed_10' })),
+      'INVALID_RESPONSE'
+    );
   });
 });

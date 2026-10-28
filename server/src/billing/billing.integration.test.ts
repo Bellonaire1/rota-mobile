@@ -11,6 +11,7 @@ import {
   MockPaystackGateway,
   PaymentGatewayError,
   type CreatePlanInput,
+  type FetchPlanByCodeInput,
   type InitializePaymentInput,
   type PaymentInitialization,
   type ProviderPlan,
@@ -83,6 +84,9 @@ class TimeoutGateway implements PaymentGatewayForTest {
   async createPlan(_input: CreatePlanInput): Promise<ProviderPlan> {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
+  async fetchPlanByCode(_input: FetchPlanByCodeInput): Promise<ProviderPlan | null> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
 }
 
 class FailureGateway implements PaymentGatewayForTest {
@@ -93,6 +97,9 @@ class FailureGateway implements PaymentGatewayForTest {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
   async createPlan(_input: CreatePlanInput): Promise<ProviderPlan> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
+  async fetchPlanByCode(_input: FetchPlanByCodeInput): Promise<ProviderPlan | null> {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
 }
@@ -125,6 +132,10 @@ class BlockingGateway implements PaymentGatewayForTest {
     throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
   }
 
+  async fetchPlanByCode(_input: FetchPlanByCodeInput): Promise<ProviderPlan | null> {
+    throw new PaymentGatewayError('PROVIDER_FAILURE', 'not used');
+  }
+
   release(): void {
     this.releaseInitialization();
   }
@@ -134,6 +145,7 @@ interface PaymentGatewayForTest {
   initializeTransaction(input: InitializePaymentInput): Promise<PaymentInitialization>;
   verifyTransaction(input: VerifyPaymentInput): Promise<VerifiedPayment>;
   createPlan(input: CreatePlanInput): Promise<ProviderPlan>;
+  fetchPlanByCode(input: FetchPlanByCodeInput): Promise<ProviderPlan | null>;
 }
 
 describe('billing checkout API', () => {

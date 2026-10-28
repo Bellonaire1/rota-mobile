@@ -73,10 +73,19 @@ export interface ProviderPlan {
   readonly currency: 'USD';
 }
 
+export interface FetchPlanByCodeInput {
+  readonly planCode: string;
+  readonly expectedAmountCents: number;
+  readonly expectedCurrency: 'USD';
+  readonly expectedInterval: 'monthly';
+  readonly expectedName: string;
+}
+
 export interface PaymentGateway {
   initializeTransaction(input: InitializePaymentInput): Promise<PaymentInitialization>;
   verifyTransaction(input: VerifyPaymentInput): Promise<VerifiedPayment>;
   createPlan(input: CreatePlanInput): Promise<ProviderPlan>;
+  fetchPlanByCode(input: FetchPlanByCodeInput): Promise<ProviderPlan | null>;
 }
 
 const SUPPORTED_CURRENCIES = new Set<PaystackCurrency>(['USD', 'NGN', 'GHS', 'ZAR', 'KES']);
@@ -168,10 +177,27 @@ const validateCreatePlanInput = (input: CreatePlanInput): void => {
   }
 };
 
+const validateFetchPlanByCodeInput = (input: FetchPlanByCodeInput): void => {
+  if (typeof input.planCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(input.planCode)) {
+    throw new PaymentGatewayError('VALIDATION', 'Plan code has an invalid format');
+  }
+  if (input.expectedCurrency !== 'USD') {
+    throw new PaymentGatewayError('VALIDATION', 'Only USD currency is supported for plans');
+  }
+  if (input.expectedInterval !== 'monthly') {
+    throw new PaymentGatewayError('VALIDATION', 'Only monthly interval is supported');
+  }
+  assertAmount(input.expectedAmountCents, input.expectedCurrency);
+  if (!input.expectedName || typeof input.expectedName !== 'string' || input.expectedName.trim().length === 0 || input.expectedName.length > 100) {
+    throw new PaymentGatewayError('VALIDATION', 'Plan name is invalid');
+  }
+};
+
 interface PaystackResponse<T> {
   readonly status?: unknown;
   readonly message?: unknown;
   readonly data?: T;
+  readonly httpStatus?: number;
 }
 
 interface PaystackInitializeData {
@@ -378,7 +404,72 @@ export class PaystackGateway implements PaymentGateway {
     };
   }
 
-  private async request<T>(path: string, init: RequestInit): Promise<PaystackResponse<T>> {
+  async fetchPlanByCode(input: FetchPlanByCodeInput): Promise<ProviderPlan | null> {
+    validateFetchPlanByCodeInput(input);
+    const response = await this.request<PaystackPlanData>(
+      `/plan/${encodeURIComponent(input.planCode)}`,
+      { method: 'GET' },
+      { allow404: true }
+    );
+
+    if (response.httpStatus === 404 || response.status === false) {
+      if (response.httpStatus === 404 && response.status === true) {
+        throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack returned contradictory status code and body');
+      }
+      if (
+        response.httpStatus === 404
+        || (typeof response.message === 'string' && /not found/i.test(response.message))
+      ) {
+        return null;
+      }
+      throw new PaymentGatewayError('PROVIDER_FAILURE', 'Paystack could not retrieve the plan');
+    }
+
+    if (response.status !== true) {
+      throw new PaymentGatewayError('PROVIDER_FAILURE', 'Paystack could not retrieve the plan');
+    }
+
+    const data = response.data;
+    if (!data || typeof data !== 'object') {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack plan response was incomplete');
+    }
+    if (typeof data.id !== 'number' || !Number.isSafeInteger(data.id) || data.id <= 0) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack plan response contained an invalid plan ID');
+    }
+    if (typeof data.plan_code !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(data.plan_code)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Paystack plan response contained an invalid plan code');
+    }
+    if (data.plan_code !== input.planCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack plan code did not match the expected plan code');
+    }
+    if (data.amount !== input.expectedAmountCents) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack plan amount did not match the expected amount');
+    }
+    if (data.currency !== input.expectedCurrency) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack plan currency did not match the expected currency');
+    }
+    if (data.interval !== input.expectedInterval) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack plan interval did not match the expected monthly interval');
+    }
+    if (typeof data.name !== 'string' || data.name !== input.expectedName) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Paystack plan name did not match the expected name');
+    }
+
+    return {
+      providerPlanId: String(data.id),
+      planCode: data.plan_code,
+      name: data.name,
+      amountCents: data.amount,
+      interval: 'monthly',
+      currency: 'USD',
+    };
+  }
+
+  private async request<T>(
+    path: string,
+    init: RequestInit,
+    options?: { allow404?: boolean }
+  ): Promise<PaystackResponse<T>> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -401,10 +492,17 @@ export class PaystackGateway implements PaymentGateway {
         throw new PaymentGatewayError('NETWORK', 'Paystack request failed');
       }
       const body = await parseJson<T>(response);
+      const enrichedBody: PaystackResponse<T> = {
+        ...body,
+        httpStatus: response.status,
+      };
+      if (options?.allow404 && response.status === 404) {
+        return enrichedBody;
+      }
       if (!response.ok) {
         throw new PaymentGatewayError('HTTP', 'Paystack returned an HTTP error');
       }
-      return body;
+      return enrichedBody;
     } finally {
       clearTimeout(timeout);
     }
@@ -419,6 +517,8 @@ interface MockPayment {
 
 export class MockPaystackGateway implements PaymentGateway {
   private readonly payments = new Map<string, MockPayment>();
+  private readonly plans = new Map<string, ProviderPlan>();
+  private readonly planLookupResults = new Map<string, ProviderPlan | PaymentGatewayError | null>();
   private nextPlanResult?: ProviderPlan | PaymentGatewayError;
   private planCounter = 1;
 
@@ -426,23 +526,69 @@ export class MockPaystackGateway implements PaymentGateway {
     this.nextPlanResult = result;
   }
 
+  setPlanLookupResult(planCode: string, result: ProviderPlan | PaymentGatewayError | null): void {
+    this.planLookupResults.set(planCode, result);
+  }
+
   async createPlan(input: CreatePlanInput): Promise<ProviderPlan> {
     validateCreatePlanInput(input);
     const configured = this.nextPlanResult;
+    let plan: ProviderPlan;
     if (configured) {
       this.nextPlanResult = undefined;
       if (configured instanceof PaymentGatewayError) throw configured;
-      return this.assertPlan(configured, input);
+      plan = this.assertPlan(configured, input);
+    } else {
+      const id = this.planCounter++;
+      plan = {
+        providerPlanId: String(id),
+        planCode: `PLN_mock_${input.amountCents}_${id}`,
+        name: input.name,
+        amountCents: input.amountCents,
+        interval: 'monthly',
+        currency: 'USD',
+      };
     }
-    const id = this.planCounter++;
-    return {
-      providerPlanId: String(id),
-      planCode: `PLN_mock_${input.amountCents}_${id}`,
-      name: input.name,
-      amountCents: input.amountCents,
-      interval: 'monthly',
-      currency: 'USD',
-    };
+    this.plans.set(plan.planCode, plan);
+    return plan;
+  }
+
+  async fetchPlanByCode(input: FetchPlanByCodeInput): Promise<ProviderPlan | null> {
+    validateFetchPlanByCodeInput(input);
+    if (this.planLookupResults.has(input.planCode)) {
+      const configured = this.planLookupResults.get(input.planCode);
+      if (configured === null) return null;
+      if (configured instanceof PaymentGatewayError) throw configured;
+      return this.assertFetchedPlan(configured!, input);
+    }
+    const existing = this.plans.get(input.planCode);
+    if (!existing) return null;
+    return this.assertFetchedPlan(existing, input);
+  }
+
+  private assertFetchedPlan(plan: ProviderPlan, input: FetchPlanByCodeInput): ProviderPlan {
+    if (typeof plan.providerPlanId !== 'string' || !/^\d+$/.test(plan.providerPlanId)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Mock plan response contained an invalid plan ID');
+    }
+    if (typeof plan.planCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(plan.planCode)) {
+      throw new PaymentGatewayError('INVALID_RESPONSE', 'Mock plan response contained an invalid plan code');
+    }
+    if (plan.planCode !== input.planCode) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan code did not match the expected plan code');
+    }
+    if (plan.amountCents !== input.expectedAmountCents) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan amount did not match the expected amount');
+    }
+    if (plan.currency !== input.expectedCurrency) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan currency did not match the expected currency');
+    }
+    if (plan.interval !== input.expectedInterval) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan interval did not match the expected monthly interval');
+    }
+    if (plan.name !== input.expectedName) {
+      throw new PaymentGatewayError('VERIFICATION_MISMATCH', 'Mock plan name did not match the expected name');
+    }
+    return plan;
   }
 
   private assertPlan(plan: ProviderPlan, input: CreatePlanInput): ProviderPlan {
