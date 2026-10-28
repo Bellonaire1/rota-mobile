@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { createHmac, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { AddressInfo } from 'node:net';
 import { after, before, describe, it } from 'node:test';
+import { BillingIdempotencyStatus } from '@prisma/client';
 import { app } from '../app';
 import { prisma } from '../database/prisma';
-import { BillingService } from '../services/billing.service';
+import { billingService, BillingService } from '../services/billing.service';
 import { env } from '../config/env';
 import { PaystackWebhookService } from '../services/paystack-webhook.service';
 import {
@@ -18,6 +19,8 @@ import {
   type VerifyPaymentInput,
   type VerifiedPayment,
 } from './payments';
+import { ProviderPlanReservationService } from '../services/provider-plan-reservation.service';
+import { reconciliationIntegrationSkipReason } from '../services/reconciliation-test-safety';
 
 type Auth = { user: { id: string }; accessToken: string };
 type Team = { id: string };
@@ -59,10 +62,16 @@ const addMember = (owner: Auth, teamId: string, userId: string, role: 'STAFF' | 
   body: JSON.stringify({ userId, role }),
 });
 
-const checkout = (auth: Auth, teamId: string, key: string, planCode = 'STARTER') => request(`/teams/${teamId}/billing/checkout`, {
+const checkout = (
+  auth: Auth,
+  teamId: string,
+  key: string,
+  planCode = 'STARTER',
+  options: { recurring?: boolean; planReservationKey?: string } = {}
+) => request(`/teams/${teamId}/billing/checkout`, {
   method: 'POST',
   headers: { authorization: `Bearer ${auth.accessToken}`, 'content-type': 'application/json', 'Idempotency-Key': key },
-  body: JSON.stringify({ planCode }),
+  body: JSON.stringify({ planCode, ...options }),
 });
 
 const signedWebhook = (body: string, signatureBody = body) => request('/billing/webhooks/paystack', {
@@ -148,7 +157,7 @@ interface PaymentGatewayForTest {
   fetchPlanByCode(input: FetchPlanByCodeInput): Promise<ProviderPlan | null>;
 }
 
-describe('billing checkout API', () => {
+describe('billing checkout API', { concurrency: false, skip: reconciliationIntegrationSkipReason() }, () => {
   before(async () => {
     env.PAYSTACK_TEST_SECRET_KEY = webhookSecret;
     server = app.listen(0);
@@ -445,5 +454,375 @@ describe('billing checkout API', () => {
     assert.equal(replay.statusCode, 502);
     assert.equal(await prisma.billingPaymentAttempt.count({ where: { invoice: { subscription: { teamId: team.id } } } }), 1);
     assert.equal((await prisma.billingPaymentAttempt.findFirstOrThrow({ where: { invoice: { subscription: { teamId: team.id } } } })).status, 'FAILED');
+  });
+
+  it('performs recurring plan-linked checkout with verified COMPLETED plan reservation', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey = `plan-key-${randomUUID()}`;
+    const planService = new ProviderPlanReservationService(prisma);
+    const planGateway = billingService.gateway as MockPaystackGateway;
+    const plan = await planService.getOrCreatePlan({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey,
+    }, planGateway);
+    assert.equal(plan.state, 'COMPLETED');
+    assert.ok(plan.providerPlanCode);
+
+    const checkoutKey = `checkout-rec-${randomUUID()}`;
+    const response = await checkout(owner, team.id, checkoutKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(response.status, 202);
+    const body = await response.json() as { checkout: { state: string; amountCents: number; recurring?: boolean; providerPlanCode?: string; authorizationUrl?: string } };
+    assert.equal(body.checkout.state, 'CHECKOUT_PENDING');
+    assert.equal(body.checkout.amountCents, 2_000);
+    assert.equal(body.checkout.recurring, true);
+    assert.equal(body.checkout.providerPlanCode, plan.providerPlanCode);
+    assert.match(body.checkout.authorizationUrl!, /^https:\/\/mock\.paystack\.test\//);
+
+    const record = await prisma.billingIdempotencyKey.findUniqueOrThrow({
+      where: { scope_key: { scope: `team-billing-checkout:${team.id}`, key: checkoutKey } },
+    });
+    const persisted = record.responseBody as any;
+    assert.equal(persisted.recurring, true);
+    assert.equal(persisted.providerPlanCode, plan.providerPlanCode);
+  });
+
+  it('enforces separate idempotency identities between recurring and one-off checkout', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const key = `key-distinct-${randomUUID()}`;
+    const oneOffRes = await checkout(owner, team.id, key, 'STARTER');
+    assert.equal(oneOffRes.status, 202);
+
+    const conflictRes = await checkout(owner, team.id, key, 'STARTER', { recurring: true });
+    assert.equal(conflictRes.status, 409);
+    const errorBody = await conflictRes.json() as { message: string };
+    assert.match(errorBody.message, /different checkout parameters/i);
+  });
+
+  it('rejects recurring checkout when plan reservation is missing', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const checkoutKey = `checkout-noplan-${randomUUID()}`;
+    const response = await checkout(owner, team.id, checkoutKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: `nonexistent-plan-${randomUUID()}`,
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as { message: string };
+    assert.match(body.message, /No provider plan reservation found/i);
+
+    assert.equal(await prisma.billingSubscription.count({ where: { teamId: team.id } }), 0);
+    assert.equal(await prisma.billingInvoice.count({ where: { subscription: { teamId: team.id } } }), 0);
+  });
+
+  it('rejects recurring checkout when plan reservation is not COMPLETED', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey = `plan-inprog-${randomUUID()}`;
+    const planService = new ProviderPlanReservationService(prisma);
+    await planService.reserve({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey,
+    });
+
+    const checkoutKey = `checkout-inprog-${randomUUID()}`;
+    const response = await checkout(owner, team.id, checkoutKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as { message: string };
+    assert.match(body.message, /verified COMPLETED plan required/i);
+  });
+
+  it('rejects recurring checkout on seat count, tier, or amount mismatch', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey = `plan-mismatch-${randomUUID()}`;
+    const planService = new ProviderPlanReservationService(prisma);
+    await planService.getOrCreatePlan({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey,
+    }, billingService.gateway as MockPaystackGateway);
+
+    const staff2 = await register();
+    await addMember(owner, team.id, staff2.user.id, 'STAFF');
+
+    const responseSeats = await checkout(owner, team.id, `chk-seats-${randomUUID()}`, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(responseSeats.status, 409);
+    const bodySeats = await responseSeats.json() as { message: string };
+    assert.match(bodySeats.message, /seat count mismatch/i);
+
+    const responseTier = await checkout(owner, team.id, `chk-tier-${randomUUID()}`, 'TEAM', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(responseTier.status, 409);
+    const bodyTier = await responseTier.json() as { message: string };
+    assert.match(bodyTier.message, /tier mismatch/i);
+
+    assert.equal(await prisma.billingSubscription.count({ where: { teamId: team.id } }), 0);
+  });
+
+  it('supports idempotent replay of recurring checkout without duplicate records', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey = `plan-replay-${randomUUID()}`;
+    const planService = new ProviderPlanReservationService(prisma);
+    await planService.getOrCreatePlan({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey,
+    }, billingService.gateway as MockPaystackGateway);
+
+    const checkoutKey = `checkout-replay-${randomUUID()}`;
+    const first = await checkout(owner, team.id, checkoutKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(first.status, 202);
+    const firstBody = await first.json();
+
+    const replay = await checkout(owner, team.id, checkoutKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(replay.status, 202);
+    const replayBody = await replay.json();
+    assert.deepEqual(replayBody, firstBody);
+
+    assert.equal(await prisma.billingSubscription.count({ where: { teamId: team.id } }), 1);
+    assert.equal(await prisma.billingInvoice.count({ where: { subscription: { teamId: team.id } } }), 1);
+    assert.equal(await prisma.billingPaymentAttempt.count({ where: { invoice: { subscription: { teamId: team.id } } } }), 1);
+  });
+
+  it('rejects recurring checkout when provider-plan reservation is bound to another subscription', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey = `plan-bound-${randomUUID()}`;
+    const conflictingSubId = randomUUID();
+    const planService = new ProviderPlanReservationService(prisma);
+    await planService.getOrCreatePlan({
+      teamId: team.id,
+      subscriptionId: conflictingSubId,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey,
+    }, billingService.gateway as MockPaystackGateway);
+
+    const checkoutKey = `checkout-bound-${randomUUID()}`;
+    const response = await checkout(owner, team.id, checkoutKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as { message: string };
+    assert.match(body.message, /already bound to another subscription/i);
+
+    assert.equal(await prisma.billingSubscription.count({ where: { teamId: team.id } }), 0);
+    assert.equal(await prisma.billingInvoice.count({ where: { subscription: { teamId: team.id } } }), 0);
+    assert.equal(await prisma.billingPaymentAttempt.count({ where: { invoice: { subscription: { teamId: team.id } } } }), 0);
+  });
+
+  it('supports idempotent replay of legacy version-1 one-off checkout records', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const v1Key = `legacy-v1-${randomUUID()}`;
+    const legacyCanonical = JSON.stringify({
+      ownerId: owner.user.id,
+      planCode: 'STARTER',
+      teamId: team.id,
+      version: 1,
+    });
+    const legacyHash = createHash('sha256').update(legacyCanonical).digest('hex');
+
+    const mockCachedResponse = {
+      state: 'CHECKOUT_PENDING',
+      subscriptionId: randomUUID(),
+      invoiceId: randomUUID(),
+      paymentAttemptId: randomUUID(),
+      providerReference: `rota-${team.id}-${randomUUID()}`,
+      planCode: 'STARTER',
+      priceId: randomUUID(),
+      billableStaffSeats: 1,
+      amountCents: 2000,
+      currency: 'USD',
+      authorizationUrl: 'https://checkout.paystack.com/legacy-test',
+      accessCode: 'legacy-access-code',
+    };
+
+    await prisma.billingIdempotencyKey.create({
+      data: {
+        scope: `team-billing-checkout:${team.id}`,
+        key: v1Key,
+        requestHash: legacyHash,
+        status: BillingIdempotencyStatus.SUCCEEDED,
+        responseStatus: 202,
+        responseBody: mockCachedResponse,
+        teamId: team.id,
+        userId: owner.user.id,
+        expiresAt: new Date(Date.now() + 86400000),
+      },
+    });
+
+    const responseOmitted = await checkout(owner, team.id, v1Key, 'STARTER');
+    assert.equal(responseOmitted.status, 202);
+    const bodyOmitted = await responseOmitted.json() as { checkout: Record<string, unknown> };
+    assert.equal(bodyOmitted.checkout.authorizationUrl, 'https://checkout.paystack.com/legacy-test');
+    assert.equal(bodyOmitted.checkout.accessCode, 'legacy-access-code');
+
+    const responseFalse = await checkout(owner, team.id, v1Key, 'STARTER', { recurring: false });
+    assert.equal(responseFalse.status, 202);
+    const bodyFalse = await responseFalse.json() as { checkout: Record<string, unknown> };
+    assert.equal(bodyFalse.checkout.authorizationUrl, 'https://checkout.paystack.com/legacy-test');
+  });
+
+  it('rejects reusing the same idempotency key across one-off and recurring modes', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey = `plan-cross-${randomUUID()}`;
+    const planService = new ProviderPlanReservationService(prisma);
+    await planService.getOrCreatePlan({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey,
+    }, billingService.gateway as MockPaystackGateway);
+
+    const sharedKey = `shared-key-${randomUUID()}`;
+
+    const firstOneOff = await checkout(owner, team.id, sharedKey, 'STARTER');
+    assert.equal(firstOneOff.status, 202);
+
+    const secondRecurring = await checkout(owner, team.id, sharedKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(secondRecurring.status, 409);
+    const body = await secondRecurring.json() as { message: string };
+    assert.match(body.message, /different checkout parameters/i);
+
+    assert.equal(await prisma.billingSubscription.count({ where: { teamId: team.id } }), 1);
+  });
+
+  it('rejects reusing the same idempotency key with different planReservationKeys', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey1 = `plan-key-1-${randomUUID()}`;
+    const planKey2 = `plan-key-2-${randomUUID()}`;
+    const planService = new ProviderPlanReservationService(prisma);
+    await planService.getOrCreatePlan({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey1,
+    }, billingService.gateway as MockPaystackGateway);
+    await planService.getOrCreatePlan({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey2,
+    }, billingService.gateway as MockPaystackGateway);
+
+    const sharedKey = `shared-rec-key-${randomUUID()}`;
+
+    const first = await checkout(owner, team.id, sharedKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey1,
+    });
+    assert.equal(first.status, 202);
+
+    const second = await checkout(owner, team.id, sharedKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey2,
+    });
+    assert.equal(second.status, 409);
+    const body = await second.json() as { message: string };
+    assert.match(body.message, /different checkout parameters/i);
+  });
+
+  it('rejects recurring checkout when provider-plan reservation has an invalid request hash', async () => {
+    const owner = await register();
+    const staff = await register();
+    const team = await createTeam(owner);
+    await addMember(owner, team.id, staff.user.id, 'STAFF');
+
+    const planKey = `plan-badhash-${randomUUID()}`;
+    const planService = new ProviderPlanReservationService(prisma);
+    await planService.getOrCreatePlan({
+      teamId: team.id,
+      planCode: 'STARTER',
+      billableStaffSeats: 1,
+      idempotencyKey: planKey,
+    }, billingService.gateway as MockPaystackGateway);
+
+    await prisma.billingIdempotencyKey.update({
+      where: {
+        scope_key: {
+          scope: `team-provider-plan:${team.id}`,
+          key: planKey,
+        },
+      },
+      data: {
+        requestHash: '0000000000000000000000000000000000000000000000000000000000000000',
+      },
+    });
+
+    const checkoutKey = `checkout-badhash-${randomUUID()}`;
+    const response = await checkout(owner, team.id, checkoutKey, 'STARTER', {
+      recurring: true,
+      planReservationKey: planKey,
+    });
+    assert.equal(response.status, 409);
+    const body = await response.json() as { message: string };
+    assert.match(body.message, /request hash mismatch/i);
+
+    assert.equal(await prisma.billingSubscription.count({ where: { teamId: team.id } }), 0);
+    assert.equal(await prisma.billingInvoice.count({ where: { subscription: { teamId: team.id } } }), 0);
+    assert.equal(await prisma.billingPaymentAttempt.count({ where: { invoice: { subscription: { teamId: team.id } } } }), 0);
   });
 });

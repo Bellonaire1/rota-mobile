@@ -75,7 +75,7 @@ const assertIdempotencyKey = (key: string): void => {
   }
 };
 
-const canonicalRequest = (input: {
+export const canonicalProviderPlanRequest = (input: {
   teamId: string;
   subscriptionId?: string;
   planCode: string;
@@ -92,8 +92,19 @@ const canonicalRequest = (input: {
   version: 1,
 });
 
-const hashRequest = (canonical: string): string =>
+export const hashProviderPlanRequest = (canonical: string): string =>
   createHash('sha256').update(canonical).digest('hex');
+
+export const computeProviderPlanRequestHash = (input: {
+  teamId: string;
+  subscriptionId?: string;
+  planCode: string;
+  billableStaffSeats: number;
+  amountCents: number;
+}): string => hashProviderPlanRequest(canonicalProviderPlanRequest(input));
+
+const canonicalRequest = canonicalProviderPlanRequest;
+const hashRequest = hashProviderPlanRequest;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);

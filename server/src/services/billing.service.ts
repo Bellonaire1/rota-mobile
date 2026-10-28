@@ -19,11 +19,17 @@ import {
 } from '../billing/pricing';
 import {
   MockPaystackGateway,
+  PAYSTACK_PLAN_CODE_PATTERN,
   PAYSTACK_USD_MINIMUM_CENTS,
   PaymentGatewayError,
   type PaymentGateway,
+  type PlanInitializationOptions,
 } from '../billing/payments';
 import type { CheckoutInput } from '../schemas/billing.schema';
+import {
+  PROVIDER_PLAN_SCOPE_PREFIX,
+  computeProviderPlanRequestHash,
+} from './provider-plan-reservation.service';
 
 const CHECKOUT_SCOPE = 'team-billing-checkout';
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,128}$/;
@@ -42,6 +48,8 @@ interface PersistedCheckout {
   billableStaffSeats: number;
   amountCents: number;
   currency: 'USD';
+  recurring?: boolean;
+  providerPlanCode?: string;
   authorizationUrl?: string;
   accessCode?: string;
   failureCode?: string;
@@ -77,16 +85,31 @@ const toCheckoutResponse = (operation: PersistedCheckout): CheckoutResponse => (
 const asJson = (operation: PersistedCheckout): Prisma.InputJsonValue =>
   operation as unknown as Prisma.InputJsonValue;
 
-const canonicalClientRequest = (input: {
+export const canonicalClientRequest = (input: {
   teamId: string;
   ownerId: string;
   planCode: BillingPlanCode;
-}): string => JSON.stringify({
-  ownerId: input.ownerId,
-  planCode: input.planCode,
-  teamId: input.teamId,
-  version: 1,
-});
+  recurring?: boolean;
+  planReservationKey?: string;
+}): string => {
+  if (!input.recurring) {
+    return JSON.stringify({
+      ownerId: input.ownerId,
+      planCode: input.planCode,
+      teamId: input.teamId,
+      version: 1,
+    });
+  }
+
+  return JSON.stringify({
+    ownerId: input.ownerId,
+    planCode: input.planCode,
+    planReservationKey: input.planReservationKey ?? null,
+    recurring: true,
+    teamId: input.teamId,
+    version: 2,
+  });
+};
 
 const requestHash = (canonical: string): string => createHash('sha256').update(canonical).digest('hex');
 
@@ -145,7 +168,7 @@ const operationFromRecord = (record: Prisma.JsonValue): PersistedCheckout => {
 export class BillingService {
   constructor(
     private readonly database: typeof defaultPrisma = defaultPrisma,
-    private readonly gateway: PaymentGateway = new MockPaystackGateway()
+    public readonly gateway: PaymentGateway = new MockPaystackGateway()
   ) {}
 
   async listPlans() {
@@ -224,9 +247,12 @@ export class BillingService {
         const reservation = await runSerializable(async (transaction) => {
           await transaction.$queryRaw`SELECT "id" FROM "Team" WHERE "id" = ${teamId} FOR UPDATE`;
           await assertOwner(transaction, teamId, ownerId);
+          const planReservationKey = input.recurring ? (input.planReservationKey ?? key) : undefined;
+          const canonical = canonicalClientRequest({ teamId, ownerId, planCode, recurring: input.recurring, planReservationKey });
+          const hash = requestHash(canonical);
           const existing = await transaction.billingIdempotencyKey.findUnique({ where: { scope_key: { scope: `${CHECKOUT_SCOPE}:${teamId}`, key } } });
           if (existing) {
-            if (existing.requestHash !== requestHash(canonicalClientRequest({ teamId, ownerId, planCode }))) {
+            if (existing.requestHash !== hash) {
               throw new AppError(409, 'Idempotency key was used with different checkout parameters');
             }
             return { existing: true, response: toCheckoutResponse(operationFromRecord(existing.responseBody)), idempotencyId: existing.id, customerEmail: '' };
@@ -237,17 +263,96 @@ export class BillingService {
           if (seatPricing.monthlyTotalCents < PAYSTACK_USD_MINIMUM_CENTS) {
             throw new AppError(409, 'This checkout is below the Paystack USD minimum and is deferred');
           }
-          const canonical = canonicalClientRequest({ teamId, ownerId, planCode });
-          const hash = requestHash(canonical);
           const currentSubscription = await transaction.billingSubscription.findUnique({ where: { teamId }, select: { status: true } });
           if (currentSubscription) throw new AppError(409, 'Team already has a billing subscription');
+
+          let providerPlanCode: string | undefined;
+          if (input.recurring) {
+            const planKey = planReservationKey!;
+            const planRecord = await transaction.billingIdempotencyKey.findUnique({
+              where: {
+                scope_key: {
+                  scope: `${PROVIDER_PLAN_SCOPE_PREFIX}:${teamId}`,
+                  key: planKey,
+                },
+              },
+            });
+            if (!planRecord) {
+              throw new AppError(409, 'No provider plan reservation found for recurring checkout');
+            }
+            if (!planRecord.responseBody || typeof planRecord.responseBody !== 'object' || Array.isArray(planRecord.responseBody)) {
+              throw new AppError(409, 'Provider plan reservation payload is malformed');
+            }
+            const planData = planRecord.responseBody as Record<string, unknown>;
+            if (planData.state !== 'COMPLETED') {
+              throw new AppError(
+                409,
+                `Provider plan reservation is in state ${planData.state}; verified COMPLETED plan required`
+              );
+            }
+            if (planData.teamId !== teamId) {
+              throw new AppError(409, 'Provider plan reservation team mismatch');
+            }
+            if (planData.planCode !== planCode) {
+              throw new AppError(409, 'Provider plan reservation tier mismatch');
+            }
+            if (planData.billableStaffSeats !== billableStaffSeats) {
+              throw new AppError(409, 'Provider plan reservation seat count mismatch');
+            }
+            if (planData.amountCents !== seatPricing.monthlyTotalCents) {
+              throw new AppError(409, 'Provider plan reservation amount mismatch');
+            }
+            if (planData.currency !== 'USD') {
+              throw new AppError(409, 'Provider plan reservation currency mismatch');
+            }
+            if (planData.interval !== 'monthly') {
+              throw new AppError(409, 'Provider plan reservation interval mismatch');
+            }
+            const expectedPlanName = `Rota ${planCode} (${billableStaffSeats} seats) - team:${teamId}`;
+            if (planData.planName !== expectedPlanName) {
+              throw new AppError(409, 'Provider plan reservation name mismatch');
+            }
+            if (typeof planData.providerPlanCode !== 'string' || !PAYSTACK_PLAN_CODE_PATTERN.test(planData.providerPlanCode)) {
+              throw new AppError(409, 'Provider plan reservation missing valid plan code');
+            }
+
+            const expectedPlanHash = computeProviderPlanRequestHash({
+              teamId,
+              subscriptionId: typeof planData.subscriptionId === 'string' ? planData.subscriptionId : undefined,
+              planCode,
+              billableStaffSeats,
+              amountCents: seatPricing.monthlyTotalCents,
+            });
+            if (!planRecord.requestHash || planRecord.requestHash !== expectedPlanHash) {
+              throw new AppError(409, 'Provider plan reservation request hash mismatch');
+            }
+
+            if (planData.subscriptionId !== undefined && planData.subscriptionId !== null) {
+              throw new AppError(409, 'Provider plan reservation is already bound to another subscription');
+            }
+
+            providerPlanCode = planData.providerPlanCode;
+          }
+
           const owner = await transaction.user.findUniqueOrThrow({ where: { id: ownerId }, select: { email: true } });
           const providerReference = `rota-${teamId}-${randomUUID()}`;
           const subscription = await transaction.billingSubscription.create({ data: { teamId, planId: plan.id, priceId: price.id, status: BillingSubscriptionStatus.PENDING_CHECKOUT, currency: 'USD' } });
           const invoice = await transaction.billingInvoice.create({ data: { subscriptionId: subscription.id, subtotalCents: seatPricing.monthlyTotalCents, totalCents: seatPricing.monthlyTotalCents, currency: 'USD' } });
           const idempotency = await transaction.billingIdempotencyKey.create({ data: { scope: `${CHECKOUT_SCOPE}:${teamId}`, key, requestHash: hash, status: BillingIdempotencyStatus.IN_PROGRESS, teamId, userId: ownerId, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) } });
           const paymentAttempt = await transaction.billingPaymentAttempt.create({ data: { invoiceId: invoice.id, providerReference, idempotencyKey: `${CHECKOUT_SCOPE}:${teamId}:${key}`, idempotencyKeyId: idempotency.id, attemptNumber: 1, amountCents: seatPricing.monthlyTotalCents, status: BillingPaymentAttemptStatus.PENDING } });
-          const operation: PersistedCheckout = { state: 'RESERVED', subscriptionId: subscription.id, invoiceId: invoice.id, paymentAttemptId: paymentAttempt.id, providerReference, planCode, priceId: price.id, billableStaffSeats, amountCents: seatPricing.monthlyTotalCents, currency: 'USD' };
+          const operation: PersistedCheckout = {
+            state: 'RESERVED',
+            subscriptionId: subscription.id,
+            invoiceId: invoice.id,
+            paymentAttemptId: paymentAttempt.id,
+            providerReference,
+            planCode,
+            priceId: price.id,
+            billableStaffSeats,
+            amountCents: seatPricing.monthlyTotalCents,
+            currency: 'USD',
+            ...(input.recurring ? { recurring: true, providerPlanCode } : {}),
+          };
           await transaction.billingIdempotencyKey.update({ where: { id: idempotency.id }, data: { responseBody: asJson(operation) } });
           return { existing: false, response: toCheckoutResponse(operation), idempotencyId: idempotency.id, customerEmail: owner.email };
         });
@@ -264,7 +369,29 @@ export class BillingService {
     if (!reserved! || !idempotencyId! || !customerEmail!) throw new AppError(503, 'Checkout reservation could not be completed');
 
     try {
-      const initialized = await this.gateway.initializeTransaction({ amountCents: reserved.amountCents, currency: 'USD', customerEmail, reference: reserved.providerReference, idempotencyKey: key, metadata: { mode: 'test', subscriptionId: reserved.subscriptionId } });
+      const planOptions: PlanInitializationOptions | undefined = reserved.recurring && reserved.providerPlanCode
+        ? {
+            planCode: reserved.providerPlanCode,
+            expectedAmountCents: reserved.amountCents,
+            expectedCurrency: 'USD',
+            expectedInterval: 'monthly',
+            expectedName: `Rota ${reserved.planCode} (${reserved.billableStaffSeats} seats) - team:${teamId}`,
+          }
+        : undefined;
+
+      const initialized = await this.gateway.initializeTransaction({
+        amountCents: reserved.amountCents,
+        currency: 'USD',
+        customerEmail,
+        reference: reserved.providerReference,
+        idempotencyKey: key,
+        metadata: {
+          mode: 'test',
+          subscriptionId: reserved.subscriptionId,
+          ...(reserved.providerPlanCode ? { providerPlanCode: reserved.providerPlanCode } : {}),
+        },
+        ...(planOptions ? { plan: planOptions } : {}),
+      });
       const completed: PersistedCheckout = { ...reserved, state: 'CHECKOUT_PENDING', authorizationUrl: initialized.authorizationUrl, accessCode: initialized.accessCode };
       await this.database.billingIdempotencyKey.update({ where: { id: idempotencyId }, data: { responseBody: asJson(completed), responseStatus: 202 } });
       return toCheckoutResponse(completed);
