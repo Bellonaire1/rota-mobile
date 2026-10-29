@@ -215,30 +215,30 @@ export class PaystackAuthenticatedRenewalEvidenceService {
     }
 
     // 5. Require Unambiguous Successful Invoice & Payment State
-    if (hint.invoice.paid === false) {
+    if (hint.invoice.paid !== true) {
       return {
         outcome: 'INCOMPLETE_INVOICE_STATE',
         isReadyForSettlement: false,
         unresolvedFacts: DEFAULT_UNRESOLVED_FACTS,
-        error: 'invoice.update indicates unpaid invoice (paid=false)',
+        error: `invoice.update indicates unpaid or missing paid status (paid=${String(hint.invoice.paid)})`,
       };
     }
 
-    if (hint.invoice.status && !['paid', 'success'].includes(hint.invoice.status)) {
+    if (!hint.invoice.status || !['paid', 'success'].includes(hint.invoice.status)) {
       return {
         outcome: 'INCOMPLETE_INVOICE_STATE',
         isReadyForSettlement: false,
         unresolvedFacts: DEFAULT_UNRESOLVED_FACTS,
-        error: `invoice.update status is "${hint.invoice.status}"; expected "paid" or "success"`,
+        error: `invoice.update status is "${String(hint.invoice.status)}"; expected "paid" or "success"`,
       };
     }
 
-    if (hint.transaction.status && hint.transaction.status !== 'success') {
+    if (hint.transaction.status !== 'success') {
       return {
         outcome: 'INCOMPLETE_INVOICE_STATE',
         isReadyForSettlement: false,
         unresolvedFacts: DEFAULT_UNRESOLVED_FACTS,
-        error: `invoice.update candidate transaction status is "${hint.transaction.status}"; expected "success"`,
+        error: `invoice.update candidate transaction status is "${String(hint.transaction.status)}"; expected "success"`,
       };
     }
 

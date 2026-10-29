@@ -455,6 +455,45 @@ describe('PaystackAuthenticatedRenewalEvidenceService', () => {
       assert.equal(result.outcome, 'INCOMPLETE_INVOICE_STATE');
       assert.match(result.error ?? '', /expected "success"/);
     });
+
+    it('fails closed when invoice paid flag is removed (undefined)', async () => {
+      const validEvt = createValidWebhookEvent();
+      delete validEvt.payload.data.paid;
+
+      const db = createMockDatabase({ webhookEvents: [validEvt] });
+      const gateway = new TestRenewalGateway();
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+      assert.equal(result.outcome, 'INCOMPLETE_INVOICE_STATE');
+      assert.match(result.error ?? '', /missing paid status/);
+    });
+
+    it('fails closed when invoice status is removed (undefined)', async () => {
+      const validEvt = createValidWebhookEvent();
+      delete validEvt.payload.data.status;
+
+      const db = createMockDatabase({ webhookEvents: [validEvt] });
+      const gateway = new TestRenewalGateway();
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+      assert.equal(result.outcome, 'INCOMPLETE_INVOICE_STATE');
+      assert.match(result.error ?? '', /expected "paid" or "success"/);
+    });
+
+    it('fails closed when candidate transaction status is removed (undefined)', async () => {
+      const validEvt = createValidWebhookEvent();
+      delete validEvt.payload.data.transaction.status;
+
+      const db = createMockDatabase({ webhookEvents: [validEvt] });
+      const gateway = new TestRenewalGateway();
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+      assert.equal(result.outcome, 'INCOMPLETE_INVOICE_STATE');
+      assert.match(result.error ?? '', /expected "success"/);
+    });
   });
 
   describe('conflicts and replays', () => {
