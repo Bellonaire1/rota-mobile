@@ -616,9 +616,9 @@ export class PaystackReconciliationProcessor implements WebhookEventProcessor {
     for (let retry = 1; retry <= TRANSACTION_RETRIES; retry += 1) {
       try {
         await this.runFinancialTransaction(async (transaction) => {
-          await transaction.$queryRaw`SELECT "id" FROM "BillingPaymentAttempt" WHERE "id" = ${initialAttempt.id} FOR UPDATE`;
-          await transaction.$queryRaw`SELECT "id" FROM "BillingInvoice" WHERE "id" = ${initialAttempt.invoiceId} FOR UPDATE`;
           await transaction.$queryRaw`SELECT "id" FROM "BillingSubscription" WHERE "id" = ${initialAttempt.invoice.subscriptionId} FOR UPDATE`;
+          await transaction.$queryRaw`SELECT "id" FROM "BillingInvoice" WHERE "id" = ${initialAttempt.invoiceId} FOR UPDATE`;
+          await transaction.$queryRaw`SELECT "id" FROM "BillingPaymentAttempt" WHERE "id" = ${initialAttempt.id} FOR UPDATE`;
 
           const attempt = await transaction.billingPaymentAttempt.findUnique({
             where: { id: initialAttempt.id },
