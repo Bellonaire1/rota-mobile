@@ -21,6 +21,8 @@ import {
 } from './paystack-renewal-verifier.service';
 
 class TestRenewalGateway implements PaymentGateway {
+  public fetchSubscriptionCallCount = 0;
+  public verifyTransactionCallCount = 0;
   private subscriptions = new Map<string, VerifiedSubscription | PaymentGatewayError | null>();
   private transactions = new Map<string, VerifiedPayment | PaymentGatewayError>();
 
@@ -33,6 +35,7 @@ class TestRenewalGateway implements PaymentGateway {
   }
 
   async fetchSubscriptionByCode(input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null> {
+    this.fetchSubscriptionCallCount++;
     if (!this.subscriptions.has(input.subscriptionCode)) {
       return null;
     }
@@ -42,6 +45,7 @@ class TestRenewalGateway implements PaymentGateway {
   }
 
   async verifyTransaction(input: VerifyPaymentInput): Promise<VerifiedPayment> {
+    this.verifyTransactionCallCount++;
     if (!this.transactions.has(input.reference)) {
       throw new PaymentGatewayError('PROVIDER_FAILURE', `Transaction ${input.reference} not found`);
     }
@@ -684,6 +688,314 @@ describe('PaystackRenewalVerifier', () => {
       assert.equal(result.isReplayCandidate, true);
       assert.equal(result.isReadyForSettlement, false);
       assert.equal(result.cycleProof.cycleProofStatus, 'INSUFFICIENT_CYCLE_PROOF');
+    });
+
+    it('returns DEFINITIVE_CONTRADICTION when verified transaction lacks providerCustomerId', async () => {
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction(
+        'T_ren_123456789',
+        createValidVerifiedPayment({ providerCustomerId: undefined })
+      );
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Verified transaction lacks a provider customer ID/);
+    });
+  });
+
+  describe('strict identity consistency checks (Task 5E.3C3A-FIX1)', () => {
+    it('rejects incorrect webhook customer before making gateway calls', async () => {
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint({
+        customer: {
+          customer_code: 'CUS_intruder_wrong_999',
+          email: 'intruder@example.com',
+        },
+      });
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Webhook customer code .* does not match local subscription customer code/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0, 'Rejection must occur before fetchSubscriptionByCode');
+      assert.equal(gateway.verifyTransactionCallCount, 0, 'Rejection must occur before verifyTransaction');
+    });
+
+    it('rejects incorrect webhook amount before making gateway calls', async () => {
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint({
+        amount: 9999,
+        subscription: {
+          subscription_code: 'SUB_test_sub_123',
+          status: 'active',
+          amount: 9999,
+          plan: {
+            plan_code: 'PLN_starter_monthly',
+            amount: 9999,
+            currency: 'USD',
+            interval: 'monthly',
+          },
+        },
+      });
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Webhook amount .* does not match expected renewal amount/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0, 'Rejection must occur before fetchSubscriptionByCode');
+      assert.equal(gateway.verifyTransactionCallCount, 0, 'Rejection must occur before verifyTransaction');
+    });
+
+    it('rejects incorrect supplied webhook plan before making gateway calls', async () => {
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint({
+        plan: {
+          plan_code: 'PLN_wrong_enterprise_yearly',
+          amount: 2000,
+          currency: 'USD',
+          interval: 'monthly',
+        },
+        subscription: {
+          subscription_code: 'SUB_test_sub_123',
+          status: 'active',
+          amount: 2000,
+          plan: {
+            plan_code: 'PLN_wrong_enterprise_yearly',
+            amount: 2000,
+            currency: 'USD',
+            interval: 'monthly',
+          },
+        },
+      });
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Webhook plan code .* does not match expected provider plan code/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0, 'Rejection must occur before fetchSubscriptionByCode');
+      assert.equal(gateway.verifyTransactionCallCount, 0, 'Rejection must occur before verifyTransaction');
+    });
+
+    it('resolves expected provider plan code from authoritative recurring checkout evidence when local plan is Rota enum', async () => {
+      const db = createMockDatabase({
+        subscriptions: [
+          createValidLocalSubscription({
+            currentPlan: { code: 'STARTER' },
+            periods: [
+              {
+                sequence: 1,
+                planCodeSnapshot: 'STARTER',
+                totalAmountCents: 2000,
+              },
+            ],
+            invoices: [
+              {
+                id: 'inv_init_123',
+                paymentAttempts: [
+                  {
+                    id: 'att_init_123',
+                    idempotencyRecord: {
+                      responseBody: {
+                        recurring: true,
+                        providerPlanCode: 'PLN_starter_checkout_authoritative',
+                        amountCents: 2000,
+                        planCode: 'STARTER',
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+        ],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription(
+        'SUB_test_sub_123',
+        createValidVerifiedSubscription({ planCode: 'PLN_starter_checkout_authoritative' })
+      );
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint({
+        subscription: {
+          subscription_code: 'SUB_test_sub_123',
+          plan: {
+            plan_code: 'PLN_starter_checkout_authoritative',
+            amount: 2000,
+            currency: 'USD',
+            interval: 'monthly',
+          },
+        },
+      });
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'VERIFIED_PENDING_CYCLE_PROOF');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.equal(result.subscriptionProof?.planCode, 'PLN_starter_checkout_authoritative');
+      assert.equal(result.transactionProof?.providerCustomerId, 'CUS_test_cust_456');
+    });
+
+    it('fails closed before gateway calls when plan code is Rota enum and no checkout providerPlanCode exists', async () => {
+      const db = createMockDatabase({
+        subscriptions: [
+          createValidLocalSubscription({
+            currentPlan: { code: 'STARTER' },
+            periods: [
+              {
+                sequence: 1,
+                planCodeSnapshot: 'STARTER',
+                totalAmountCents: 2000,
+              },
+            ],
+            invoices: [],
+          }),
+        ],
+      });
+      const gateway = new TestRenewalGateway();
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Cannot unambiguously determine expected provider plan code/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0);
+      assert.equal(gateway.verifyTransactionCallCount, 0);
+    });
+
+    it('fails closed before gateway calls when multiple conflicting checkout plan codes exist', async () => {
+      const db = createMockDatabase({
+        subscriptions: [
+          createValidLocalSubscription({
+            invoices: [
+              {
+                paymentAttempts: [
+                  {
+                    idempotencyRecord: {
+                      responseBody: {
+                        recurring: true,
+                        providerPlanCode: 'PLN_plan_variant_a',
+                        amountCents: 2000,
+                      },
+                    },
+                  },
+                  {
+                    idempotencyRecord: {
+                      responseBody: {
+                        recurring: true,
+                        providerPlanCode: 'PLN_plan_variant_b',
+                        amountCents: 2000,
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+        ],
+      });
+      const gateway = new TestRenewalGateway();
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Cannot unambiguously determine expected provider plan code/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0);
+    });
+
+    it('fails closed before gateway calls when checkout amount contradicts period amount', async () => {
+      const db = createMockDatabase({
+        subscriptions: [
+          createValidLocalSubscription({
+            periods: [
+              {
+                sequence: 1,
+                planCodeSnapshot: 'PLN_starter_monthly',
+                totalAmountCents: 3000,
+              },
+            ],
+            invoices: [
+              {
+                paymentAttempts: [
+                  {
+                    idempotencyRecord: {
+                      responseBody: {
+                        recurring: true,
+                        providerPlanCode: 'PLN_starter_monthly',
+                        amountCents: 2000,
+                      },
+                    },
+                  },
+                ],
+              },
+            ],
+          }),
+        ],
+      });
+      const gateway = new TestRenewalGateway();
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Cannot unambiguously determine expected historical renewal amount/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0);
+    });
+
+    it('verifies valid matching identities successfully with mandatory transaction providerCustomerId', async () => {
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'VERIFIED_PENDING_CYCLE_PROOF');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.equal(result.subscriptionProof?.providerCustomerId, 'CUS_test_cust_456');
+      assert.equal(result.transactionProof?.providerCustomerId, 'CUS_test_cust_456');
+      assert.equal(gateway.fetchSubscriptionCallCount, 1);
+      assert.equal(gateway.verifyTransactionCallCount, 1);
     });
   });
 });

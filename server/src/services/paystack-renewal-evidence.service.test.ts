@@ -20,6 +20,8 @@ import {
 } from './paystack-renewal-evidence.service';
 
 class TestRenewalGateway implements PaymentGateway {
+  public fetchSubscriptionCallCount = 0;
+  public verifyTransactionCallCount = 0;
   private subscriptions = new Map<string, VerifiedSubscription | PaymentGatewayError | null>();
   private transactions = new Map<string, VerifiedPayment | PaymentGatewayError>();
 
@@ -32,6 +34,7 @@ class TestRenewalGateway implements PaymentGateway {
   }
 
   async fetchSubscriptionByCode(input: FetchSubscriptionByCodeInput): Promise<VerifiedSubscription | null> {
+    this.fetchSubscriptionCallCount++;
     if (!this.subscriptions.has(input.subscriptionCode)) {
       return null;
     }
@@ -41,6 +44,7 @@ class TestRenewalGateway implements PaymentGateway {
   }
 
   async verifyTransaction(input: VerifyPaymentInput): Promise<VerifiedPayment> {
+    this.verifyTransactionCallCount++;
     if (!this.transactions.has(input.reference)) {
       throw new PaymentGatewayError('PROVIDER_FAILURE', `Transaction ${input.reference} not found`);
     }
@@ -672,6 +676,201 @@ describe('PaystackAuthenticatedRenewalEvidenceService', () => {
 
       assert.equal(result.outcome, 'PROVIDER_OUTAGE');
       assert.equal(result.isReadyForSettlement, false);
+    });
+  });
+
+  describe('strict identity consistency checks (Task 5E.3C3A-FIX1)', () => {
+    it('rejects incorrect webhook customer before making gateway calls', async () => {
+      const db = createMockDatabase({
+        webhookEvents: [
+          createValidWebhookEvent({
+            payload: {
+              event: 'invoice.update',
+              data: {
+                id: 987654321,
+                invoice_code: 'INV_cycle_001',
+                subscription_code: 'SUB_test_sub_123',
+                customer: {
+                  customer_code: 'CUS_intruder_wrong_999',
+                  email: 'intruder@example.com',
+                },
+                amount: 2000,
+                currency: 'USD',
+                paid: true,
+                status: 'paid',
+                transaction: {
+                  reference: 'T_ren_123456789',
+                  status: 'success',
+                },
+              },
+            },
+          }),
+        ],
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Webhook customer code .* does not match local subscription customer code/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0, 'Rejection must occur before fetchSubscriptionByCode');
+      assert.equal(gateway.verifyTransactionCallCount, 0, 'Rejection must occur before verifyTransaction');
+    });
+
+    it('rejects incorrect webhook amount before making gateway calls', async () => {
+      const db = createMockDatabase({
+        webhookEvents: [
+          createValidWebhookEvent({
+            payload: {
+              event: 'invoice.update',
+              data: {
+                id: 987654321,
+                invoice_code: 'INV_cycle_001',
+                subscription_code: 'SUB_test_sub_123',
+                customer: {
+                  customer_code: 'CUS_test_cust_456',
+                  email: 'billing@example.com',
+                },
+                amount: 8888,
+                currency: 'USD',
+                paid: true,
+                status: 'paid',
+                transaction: {
+                  reference: 'T_ren_123456789',
+                  status: 'success',
+                },
+              },
+            },
+          }),
+        ],
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Webhook amount .* does not match expected renewal amount/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0, 'Rejection must occur before fetchSubscriptionByCode');
+      assert.equal(gateway.verifyTransactionCallCount, 0, 'Rejection must occur before verifyTransaction');
+    });
+
+    it('rejects incorrect supplied webhook plan code before making gateway calls', async () => {
+      const db = createMockDatabase({
+        webhookEvents: [
+          createValidWebhookEvent({
+            payload: {
+              event: 'invoice.update',
+              data: {
+                id: 987654321,
+                invoice_code: 'INV_cycle_001',
+                subscription_code: 'SUB_test_sub_123',
+                customer: {
+                  customer_code: 'CUS_test_cust_456',
+                  email: 'billing@example.com',
+                },
+                plan: {
+                  plan_code: 'PLN_wrong_plan_code',
+                  amount: 2000,
+                  currency: 'USD',
+                  interval: 'monthly',
+                },
+                amount: 2000,
+                currency: 'USD',
+                paid: true,
+                status: 'paid',
+                transaction: {
+                  reference: 'T_ren_123456789',
+                  status: 'success',
+                },
+              },
+            },
+          }),
+        ],
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Webhook plan code .* does not match expected provider plan code/);
+      assert.equal(gateway.fetchSubscriptionCallCount, 0, 'Rejection must occur before fetchSubscriptionByCode');
+      assert.equal(gateway.verifyTransactionCallCount, 0, 'Rejection must occur before verifyTransaction');
+    });
+
+    it('rejects when independently verified transaction lacks providerCustomerId', async () => {
+      const db = createMockDatabase({
+        webhookEvents: [createValidWebhookEvent()],
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction(
+        'T_ren_123456789',
+        createValidVerifiedPayment({ providerCustomerId: undefined })
+      );
+
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Verified transaction lacks a provider customer ID/);
+    });
+
+    it('rejects when independently verified transaction has incorrect providerCustomerId', async () => {
+      const db = createMockDatabase({
+        webhookEvents: [createValidWebhookEvent()],
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction(
+        'T_ren_123456789',
+        createValidVerifiedPayment({ providerCustomerId: 'CUS_attacker_mismatched_999' })
+      );
+
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+
+      assert.equal(result.outcome, 'DEFINITIVE_CONTRADICTION');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /does not match subscription customer code/);
+    });
+
+    it('produces authenticated renewal evidence when all identities match with mandatory transaction providerCustomerId', async () => {
+      const db = createMockDatabase({
+        webhookEvents: [createValidWebhookEvent()],
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const service = new PaystackAuthenticatedRenewalEvidenceService(db, gateway);
+      const result = await service.collectRenewalEvidence({ webhookEventId: 'webhook_evt_001' });
+
+      assert.equal(result.outcome, 'AUTHENTICATED_EVIDENCE_PRODUCED');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.equal(result.webhookAssociation?.customerCode, 'CUS_test_cust_456');
+      assert.equal(result.subscriptionProof?.providerCustomerId, 'CUS_test_cust_456');
+      assert.equal(result.transactionProof?.providerCustomerId, 'CUS_test_cust_456');
+      assert.equal(gateway.fetchSubscriptionCallCount, 1);
+      assert.equal(gateway.verifyTransactionCallCount, 1);
     });
   });
 });

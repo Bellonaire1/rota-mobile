@@ -4,6 +4,8 @@ import {
   PrismaClient,
 } from '@prisma/client';
 import {
+  PAYSTACK_PLAN_CODE_PATTERN,
+  PAYSTACK_USD_MINIMUM_CENTS,
   PaymentGatewayError,
   type PaymentGateway,
   type VerifiedPayment,
@@ -36,7 +38,7 @@ export interface VerifiedRenewalSubscriptionProof {
 export interface VerifiedRenewalTransactionProof {
   readonly reference: string;
   readonly providerTransactionId: string;
-  readonly providerCustomerId?: string;
+  readonly providerCustomerId: string;
   readonly amountCents: number;
   readonly currency: 'USD';
   readonly status: 'success';
@@ -59,11 +61,172 @@ export interface RenewalVerificationResult {
   readonly error?: string;
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+);
+
 const isProviderOutageError = (error: unknown): boolean => {
   if (error instanceof PaymentGatewayError) {
     return ['TIMEOUT', 'NETWORK', 'PROVIDER_FAILURE', 'HTTP'].includes(error.code);
   }
   return false;
+};
+
+interface LocalSubscriptionForPlanResolution {
+  readonly currentPlan?: { readonly code?: string } | null;
+  readonly periods?: ReadonlyArray<{ readonly planCodeSnapshot?: string | null }> | null;
+  readonly invoices?: ReadonlyArray<{
+    readonly paymentAttempts?: ReadonlyArray<{
+      readonly idempotencyRecord?: {
+        readonly responseBody?: unknown;
+      } | null;
+    }> | null;
+  }> | null;
+}
+
+interface LocalSubscriptionForAmountResolution {
+  readonly currentPrice?: { readonly monthlyPriceCents?: number | null } | null;
+  readonly periods?: ReadonlyArray<{ readonly totalAmountCents?: number | null }> | null;
+  readonly invoices?: ReadonlyArray<{
+    readonly paymentAttempts?: ReadonlyArray<{
+      readonly idempotencyRecord?: {
+        readonly responseBody?: unknown;
+      } | null;
+    }> | null;
+  }> | null;
+}
+
+export const resolveExpectedProviderPlanCode = (
+  localSubscription: LocalSubscriptionForPlanResolution
+): string | null => {
+  const checkoutPlanCodes = new Set<string>();
+
+  if (Array.isArray(localSubscription.invoices)) {
+    for (const invoice of localSubscription.invoices) {
+      if (!Array.isArray(invoice.paymentAttempts)) continue;
+      for (const attempt of invoice.paymentAttempts) {
+        let body = attempt.idempotencyRecord?.responseBody;
+        if (typeof body === 'string') {
+          try {
+            body = JSON.parse(body);
+          } catch {
+            body = null;
+          }
+        }
+        if (isRecord(body) && body.recurring === true) {
+          if (typeof body.providerPlanCode === 'string' && PAYSTACK_PLAN_CODE_PATTERN.test(body.providerPlanCode)) {
+            checkoutPlanCodes.add(body.providerPlanCode);
+          } else {
+            return null;
+          }
+        }
+      }
+    }
+  }
+
+  if (checkoutPlanCodes.size > 1) {
+    return null;
+  }
+
+  const periodCode = localSubscription.periods?.[0]?.planCodeSnapshot;
+  const isPeriodProviderCode = typeof periodCode === 'string' && PAYSTACK_PLAN_CODE_PATTERN.test(periodCode);
+
+  const currentPlanCode = localSubscription.currentPlan?.code;
+  const isCurrentPlanProviderCode = typeof currentPlanCode === 'string' && PAYSTACK_PLAN_CODE_PATTERN.test(currentPlanCode);
+
+  if (checkoutPlanCodes.size === 1) {
+    const [checkoutCode] = checkoutPlanCodes;
+    if (isPeriodProviderCode && periodCode !== checkoutCode) {
+      return null;
+    }
+    if (isCurrentPlanProviderCode && currentPlanCode !== checkoutCode) {
+      return null;
+    }
+    return checkoutCode;
+  }
+
+  if (isPeriodProviderCode && isCurrentPlanProviderCode) {
+    if (periodCode !== currentPlanCode) {
+      return null;
+    }
+    return periodCode;
+  }
+
+  if (isPeriodProviderCode) {
+    return periodCode;
+  }
+
+  if (isCurrentPlanProviderCode) {
+    return currentPlanCode;
+  }
+
+  return null;
+};
+
+export const resolveExpectedRenewalAmountCents = (
+  localSubscription: LocalSubscriptionForAmountResolution
+): number | null => {
+  const checkoutAmounts = new Set<number>();
+
+  if (Array.isArray(localSubscription.invoices)) {
+    for (const invoice of localSubscription.invoices) {
+      if (!Array.isArray(invoice.paymentAttempts)) continue;
+      for (const attempt of invoice.paymentAttempts) {
+        let body = attempt.idempotencyRecord?.responseBody;
+        if (typeof body === 'string') {
+          try {
+            body = JSON.parse(body);
+          } catch {
+            body = null;
+          }
+        }
+        if (isRecord(body) && body.recurring === true) {
+          if (
+            typeof body.amountCents === 'number' &&
+            Number.isSafeInteger(body.amountCents) &&
+            body.amountCents >= PAYSTACK_USD_MINIMUM_CENTS
+          ) {
+            checkoutAmounts.add(body.amountCents);
+          } else {
+            return null;
+          }
+        }
+      }
+    }
+  }
+
+  if (checkoutAmounts.size > 1) {
+    return null;
+  }
+
+  const periodAmount = localSubscription.periods?.[0]?.totalAmountCents;
+  const isPeriodAmountValid =
+    typeof periodAmount === 'number' &&
+    Number.isSafeInteger(periodAmount) &&
+    periodAmount >= PAYSTACK_USD_MINIMUM_CENTS;
+
+  if (checkoutAmounts.size === 1) {
+    const [checkoutAmount] = checkoutAmounts;
+    if (isPeriodAmountValid && periodAmount !== checkoutAmount) {
+      return null;
+    }
+    return checkoutAmount;
+  }
+
+  if (isPeriodAmountValid) {
+    return periodAmount;
+  }
+
+  const priceAmount = localSubscription.currentPrice?.monthlyPriceCents;
+  if (
+    typeof priceAmount === 'number' &&
+    Number.isSafeInteger(priceAmount) &&
+    priceAmount >= PAYSTACK_USD_MINIMUM_CENTS
+  ) {
+    return priceAmount;
+  }
+
+  return null;
 };
 
 export class PaystackRenewalVerifier {
@@ -105,6 +268,15 @@ export class PaystackRenewalVerifier {
           orderBy: { sequence: 'desc' },
           take: 1,
         },
+        invoices: {
+          include: {
+            paymentAttempts: {
+              include: {
+                idempotencyRecord: true,
+              },
+            },
+          },
+        },
       },
     });
 
@@ -145,11 +317,73 @@ export class PaystackRenewalVerifier {
     }
 
     const expectedCustomerCode = localSubscription.providerCustomerId;
-    const expectedPlanCode = localSubscription.periods[0]?.planCodeSnapshot ?? localSubscription.currentPlan.code;
-    const expectedAmountCents =
-      localSubscription.periods[0]?.totalAmountCents ?? localSubscription.currentPrice.monthlyPriceCents;
+    const expectedPlanCode = resolveExpectedProviderPlanCode(localSubscription);
+    if (!expectedPlanCode) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        cycleProof: defaultCycleProof,
+        error: 'Cannot unambiguously determine expected provider plan code from local subscription or checkout evidence',
+      };
+    }
 
-    // 3. Independently verify provider subscription identity via gateway
+    const expectedAmountCents = resolveExpectedRenewalAmountCents(localSubscription);
+    if (expectedAmountCents === null) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        cycleProof: defaultCycleProof,
+        error: 'Cannot unambiguously determine expected historical renewal amount from local subscription or period evidence',
+      };
+    }
+
+    // 3. Webhook pre-gateway identity consistency checks
+    if (hint.customer?.customerCode && hint.customer.customerCode !== expectedCustomerCode) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        cycleProof: defaultCycleProof,
+        error: `Webhook customer code (${hint.customer.customerCode}) does not match local subscription customer code (${expectedCustomerCode})`,
+      };
+    }
+
+    if (hint.amountCents !== undefined && hint.amountCents !== expectedAmountCents) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        cycleProof: defaultCycleProof,
+        error: `Webhook amount (${hint.amountCents}) does not match expected renewal amount (${expectedAmountCents})`,
+      };
+    }
+
+    if (hint.plan?.amountCents !== undefined && hint.plan.amountCents !== expectedAmountCents) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        cycleProof: defaultCycleProof,
+        error: `Webhook plan amount (${hint.plan.amountCents}) does not match expected renewal amount (${expectedAmountCents})`,
+      };
+    }
+
+    if (hint.transaction?.amountCents !== undefined && hint.transaction.amountCents !== expectedAmountCents) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        cycleProof: defaultCycleProof,
+        error: `Webhook transaction amount (${hint.transaction.amountCents}) does not match expected renewal amount (${expectedAmountCents})`,
+      };
+    }
+
+    if (hint.plan?.planCode && hint.plan.planCode !== expectedPlanCode) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        cycleProof: defaultCycleProof,
+        error: `Webhook plan code (${hint.plan.planCode}) does not match expected provider plan code (${expectedPlanCode})`,
+      };
+    }
+
+    // 4. Independently verify provider subscription identity via gateway
     let verifiedSub: VerifiedSubscription | null;
     try {
       verifiedSub = await this.gateway.fetchSubscriptionByCode({
@@ -216,7 +450,7 @@ export class PaystackRenewalVerifier {
       teamId: localSubscription.teamId,
     };
 
-    // 4. Check Provider Invoice Conflicts (if invoice code is supplied in hint)
+    // 5. Check Provider Invoice Conflicts (if invoice code is supplied in hint)
     if (hint.invoice?.invoiceCode) {
       const existingInvoice = await this.database.billingInvoice.findUnique({
         where: { providerInvoiceId: hint.invoice.invoiceCode },
@@ -232,7 +466,7 @@ export class PaystackRenewalVerifier {
       }
     }
 
-    // 5. Independently verify candidate transaction (if present)
+    // 6. Independently verify candidate transaction (if present)
     let transactionProof: VerifiedRenewalTransactionProof | undefined;
     let isReplayCandidate = false;
 
@@ -280,17 +514,19 @@ export class PaystackRenewalVerifier {
         };
       }
 
-      if (verifiedTx.providerCustomerId && verifiedTx.providerCustomerId !== expectedCustomerCode) {
+      if (!verifiedTx.providerCustomerId || verifiedTx.providerCustomerId !== expectedCustomerCode) {
         return {
           outcome: 'DEFINITIVE_CONTRADICTION',
           isReadyForSettlement: false,
           subscriptionProof,
           cycleProof: defaultCycleProof,
-          error: `Verified transaction customer code (${verifiedTx.providerCustomerId}) does not match subscription customer code (${expectedCustomerCode})`,
+          error: !verifiedTx.providerCustomerId
+            ? 'Verified transaction lacks a provider customer ID'
+            : `Verified transaction customer code (${verifiedTx.providerCustomerId}) does not match subscription customer code (${expectedCustomerCode})`,
         };
       }
 
-      // 6. Check transaction identity reuse across payment attempts
+      // 7. Check transaction identity reuse across payment attempts
       const existingAttempt = await this.database.billingPaymentAttempt.findUnique({
         where: { providerPaymentId: verifiedTx.providerTransactionId },
         include: { invoice: true },
@@ -312,14 +548,14 @@ export class PaystackRenewalVerifier {
       transactionProof = {
         reference: verifiedTx.reference,
         providerTransactionId: verifiedTx.providerTransactionId,
-        ...(verifiedTx.providerCustomerId ? { providerCustomerId: verifiedTx.providerCustomerId } : {}),
+        providerCustomerId: verifiedTx.providerCustomerId,
         amountCents: verifiedTx.amountCents,
         currency: 'USD',
         status: 'success',
       };
     }
 
-    // 7. Cycle Association Proof Assessment
+    // 8. Cycle Association Proof Assessment
     // Under official Paystack read-only APIs, neither GET /transaction/verify nor GET /subscription
     // provides an immutable proof binding the transaction to a distinct invoice or period cycle.
     // The cycle proof MUST remain unresolved/insufficient.

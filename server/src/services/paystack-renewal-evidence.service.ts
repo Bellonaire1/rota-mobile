@@ -320,6 +320,22 @@ export class PaystackAuthenticatedRenewalEvidenceService {
       ...(hint.invoice.paidAt ? { invoicePaidAt: hint.invoice.paidAt } : {}),
     };
 
+    if (
+      webhookAssociation.customerCode !== verifierResult.subscriptionProof.providerCustomerId ||
+      webhookAssociation.customerCode !== verifierResult.transactionProof.providerCustomerId ||
+      webhookAssociation.amountCents !== verifierResult.subscriptionProof.amountCents ||
+      webhookAssociation.amountCents !== verifierResult.transactionProof.amountCents ||
+      webhookAssociation.subscriptionCode !== verifierResult.subscriptionProof.subscriptionCode ||
+      webhookAssociation.transactionReference !== verifierResult.transactionProof.reference
+    ) {
+      return {
+        outcome: 'DEFINITIVE_CONTRADICTION',
+        isReadyForSettlement: false,
+        unresolvedFacts: DEFAULT_UNRESOLVED_FACTS,
+        error: 'Authenticated webhook association attributes contradict verified subscription or transaction proof',
+      };
+    }
+
     const isReplay = Boolean(verifierResult.isReplayCandidate || isInvoiceReplay);
 
     return {
