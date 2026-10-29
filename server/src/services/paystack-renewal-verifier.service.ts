@@ -1,4 +1,8 @@
 import {
+  BillingInvoiceStatus,
+  BillingLedgerTransactionStatus,
+  BillingLedgerTransactionType,
+  BillingPaymentAttemptStatus,
   BillingSubscriptionStatus,
   Prisma,
   PrismaClient,
@@ -18,6 +22,7 @@ export type RenewalVerificationDatabase = PrismaClient | Prisma.TransactionClien
 export type RenewalVerificationOutcome =
   | 'VERIFIED_PENDING_CYCLE_PROOF'
   | 'INSUFFICIENT_CYCLE_PROOF'
+  | 'INCOMPLETE_RECORD_STATE'
   | 'PROVIDER_OUTAGE'
   | 'DEFINITIVE_CONTRADICTION'
   | 'CONFLICT';
@@ -227,6 +232,310 @@ export const resolveExpectedRenewalAmountCents = (
   }
 
   return null;
+};
+
+export interface RenewalPairingEvaluationInput {
+  readonly localSubscriptionId: string;
+  readonly invoiceCode?: string;
+  readonly providerTransactionId: string;
+  readonly providerReference: string;
+}
+
+export type RenewalPairingOutcome =
+  | { readonly status: 'FIRST_TIME' }
+  | { readonly status: 'EXACT_REPLAY'; readonly invoiceId: string; readonly paymentAttemptId: string }
+  | { readonly status: 'CONFLICT'; readonly error: string }
+  | { readonly status: 'INCOMPLETE'; readonly error: string };
+
+export const evaluateRenewalPairing = async (
+  database: RenewalVerificationDatabase,
+  input: RenewalPairingEvaluationInput
+): Promise<RenewalPairingOutcome> => {
+  // 1. Existing Invoice lookup (by providerInvoiceId)
+  let existingInvoice: any = null;
+  if (input.invoiceCode) {
+    existingInvoice = await database.billingInvoice.findUnique({
+      where: { providerInvoiceId: input.invoiceCode },
+      include: {
+        paymentAttempts: true,
+      },
+    });
+  }
+
+  // 2. Existing Payment Attempt lookup (by providerPaymentId)
+  const existingPaymentByTxId = await database.billingPaymentAttempt.findUnique({
+    where: { providerPaymentId: input.providerTransactionId },
+    include: {
+      invoice: true,
+    },
+  });
+
+  // 3. Existing Payment Attempt lookup (by providerReference)
+  const existingPaymentByRef = await database.billingPaymentAttempt.findUnique({
+    where: { providerReference: input.providerReference },
+    include: {
+      invoice: true,
+    },
+  });
+
+  // 4. Existing Ledger lookup (by externalReference)
+  const ledgerExternalRef = `paystack:payment:${input.providerTransactionId}`;
+  const existingLedger = await database.billingLedgerTransaction.findUnique({
+    where: { externalReference: ledgerExternalRef },
+  });
+
+  // -------------------------------------------------------------
+  // Cross-Subscription Checks (Reject as CONFLICT)
+  // -------------------------------------------------------------
+  if (existingInvoice && existingInvoice.subscriptionId !== input.localSubscriptionId) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider invoice code ${input.invoiceCode} is already bound to another subscription (${existingInvoice.subscriptionId})`,
+    };
+  }
+
+  if (existingPaymentByTxId && existingPaymentByTxId.invoice?.subscriptionId !== input.localSubscriptionId) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction ID ${input.providerTransactionId} is already linked to another subscription (${existingPaymentByTxId.invoice?.subscriptionId})`,
+    };
+  }
+
+  if (existingPaymentByRef && existingPaymentByRef.invoice?.subscriptionId !== input.localSubscriptionId) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction reference ${input.providerReference} is already linked to another subscription (${existingPaymentByRef.invoice?.subscriptionId})`,
+    };
+  }
+
+  if (existingLedger && existingLedger.subscriptionId && existingLedger.subscriptionId !== input.localSubscriptionId) {
+    return {
+      status: 'CONFLICT',
+      error: `Ledger transaction for payment ${input.providerTransactionId} is already linked to another subscription (${existingLedger.subscriptionId})`,
+    };
+  }
+
+  // -------------------------------------------------------------
+  // Same-Subscription Inconsistencies / Cross-Cycle Reuse (Reject as CONFLICT)
+  // -------------------------------------------------------------
+  // Attempt by TxId and Attempt by Ref point to different attempts
+  if (existingPaymentByTxId && existingPaymentByRef && existingPaymentByTxId.id !== existingPaymentByRef.id) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction ID ${input.providerTransactionId} and reference ${input.providerReference} belong to different payment attempts (${existingPaymentByTxId.id} vs ${existingPaymentByRef.id})`,
+    };
+  }
+
+  // Transaction ID was previously recorded with a different reference
+  if (
+    existingPaymentByTxId &&
+    existingPaymentByTxId.providerReference &&
+    existingPaymentByTxId.providerReference !== input.providerReference
+  ) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction ID ${input.providerTransactionId} is associated with reference ${existingPaymentByTxId.providerReference}, not ${input.providerReference}`,
+    };
+  }
+
+  // Reference was previously recorded with a different transaction ID
+  if (
+    existingPaymentByRef &&
+    existingPaymentByRef.providerPaymentId &&
+    existingPaymentByRef.providerPaymentId !== input.providerTransactionId
+  ) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction reference ${input.providerReference} is associated with transaction ID ${existingPaymentByRef.providerPaymentId}, not ${input.providerTransactionId}`,
+    };
+  }
+
+  // Already-used transaction presented with a different invoice code
+  if (
+    existingPaymentByTxId &&
+    input.invoiceCode &&
+    existingPaymentByTxId.invoice?.providerInvoiceId &&
+    existingPaymentByTxId.invoice.providerInvoiceId !== input.invoiceCode
+  ) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction ID ${input.providerTransactionId} is already bound to a different invoice (${existingPaymentByTxId.invoice.providerInvoiceId})`,
+    };
+  }
+
+  if (
+    existingPaymentByRef &&
+    input.invoiceCode &&
+    existingPaymentByRef.invoice?.providerInvoiceId &&
+    existingPaymentByRef.invoice.providerInvoiceId !== input.invoiceCode
+  ) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction reference ${input.providerReference} is already bound to a different invoice (${existingPaymentByRef.invoice.providerInvoiceId})`,
+    };
+  }
+
+  // Already-used invoice presented with a different transaction
+  if (existingInvoice && Array.isArray(existingInvoice.paymentAttempts)) {
+    for (const attempt of existingInvoice.paymentAttempts) {
+      if (
+        attempt.providerPaymentId &&
+        attempt.providerPaymentId !== input.providerTransactionId
+      ) {
+        return {
+          status: 'CONFLICT',
+          error: `Provider invoice code ${input.invoiceCode} is already bound to a different transaction ID (${attempt.providerPaymentId})`,
+        };
+      }
+      if (
+        attempt.providerReference &&
+        attempt.providerReference !== input.providerReference
+      ) {
+        return {
+          status: 'CONFLICT',
+          error: `Provider invoice code ${input.invoiceCode} is already bound to a different transaction reference (${attempt.providerReference})`,
+        };
+      }
+    }
+  }
+
+  // Payment attempt points to a different local invoice than the matching provider invoice
+  if (existingInvoice && existingPaymentByTxId && existingPaymentByTxId.invoiceId !== existingInvoice.id) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction ID is linked to local invoice ${existingPaymentByTxId.invoiceId}, but provider invoice code matches invoice ${existingInvoice.id}`,
+    };
+  }
+
+  if (existingInvoice && existingPaymentByRef && existingPaymentByRef.invoiceId !== existingInvoice.id) {
+    return {
+      status: 'CONFLICT',
+      error: `Provider transaction reference is linked to local invoice ${existingPaymentByRef.invoiceId}, but provider invoice code matches invoice ${existingInvoice.id}`,
+    };
+  }
+
+  // Ledger transaction points to a different local invoice than the matching provider invoice
+  if (existingInvoice && existingLedger && existingLedger.invoiceId && existingLedger.invoiceId !== existingInvoice.id) {
+    return {
+      status: 'CONFLICT',
+      error: `Ledger transaction is linked to local invoice ${existingLedger.invoiceId}, not invoice ${existingInvoice.id}`,
+    };
+  }
+
+  // -------------------------------------------------------------
+  // First-Time vs Existing Records
+  // -------------------------------------------------------------
+  const hasExistingRecords = Boolean(
+    existingInvoice || existingPaymentByTxId || existingPaymentByRef || existingLedger
+  );
+
+  if (!hasExistingRecords) {
+    return { status: 'FIRST_TIME' };
+  }
+
+  // -------------------------------------------------------------
+  // Partial Persistence / Incomplete State Checks
+  // -------------------------------------------------------------
+  // Invoice-only match: invoice exists, but payment attempt does not
+  const matchingAttempt = existingPaymentByTxId ?? existingPaymentByRef;
+  if (existingInvoice && !matchingAttempt) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal persistence: provider invoice ${input.invoiceCode} exists locally, but matching payment attempt for transaction ${input.providerTransactionId} is missing`,
+    };
+  }
+
+  // Payment-only match: payment attempt exists, but invoice does not
+  if (matchingAttempt && !existingInvoice) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal persistence: payment attempt for transaction ${input.providerTransactionId} exists locally, but matching provider invoice ${input.invoiceCode ?? 'unknown'} is missing`,
+    };
+  }
+
+  // Ledger-only match (or ledger exists but invoice/attempt missing)
+  if (existingLedger && (!existingInvoice || !matchingAttempt)) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal persistence: ledger transaction exists for ${input.providerTransactionId}, but matching local invoice or payment attempt is missing`,
+    };
+  }
+
+  if (!existingInvoice || !matchingAttempt) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal persistence: local invoice or payment attempt is missing for ${input.providerTransactionId}`,
+    };
+  }
+
+  // Missing providerPaymentId or providerReference on attempt
+  if (!matchingAttempt.providerPaymentId || matchingAttempt.providerPaymentId !== input.providerTransactionId) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal persistence: payment attempt lacks matching provider transaction ID (expected ${input.providerTransactionId})`,
+    };
+  }
+
+  if (!matchingAttempt.providerReference || matchingAttempt.providerReference !== input.providerReference) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal persistence: payment attempt lacks matching provider reference (expected ${input.providerReference})`,
+    };
+  }
+
+  // Verify payment attempt status is SUCCEEDED
+  if (matchingAttempt.status !== BillingPaymentAttemptStatus.SUCCEEDED) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal payment state: payment attempt status is ${matchingAttempt.status}; expected SUCCEEDED for completed renewal replay`,
+    };
+  }
+
+  // Verify local invoice status is PAID
+  if (existingInvoice.status !== BillingInvoiceStatus.PAID) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal invoice state: local invoice status is ${existingInvoice.status}; expected PAID for completed renewal replay`,
+    };
+  }
+
+  // Verify posted ledger transaction exists
+  if (!existingLedger) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal ledger state: no posted ledger transaction found for payment ${input.providerTransactionId}`,
+    };
+  }
+
+  if (existingLedger.status !== BillingLedgerTransactionStatus.POSTED) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal ledger state: ledger transaction status is ${existingLedger.status}; expected POSTED`,
+    };
+  }
+
+  if (existingLedger.invoiceId && existingLedger.invoiceId !== existingInvoice.id) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal ledger state: ledger transaction invoice link (${existingLedger.invoiceId}) does not match local invoice (${existingInvoice.id})`,
+    };
+  }
+
+  if (existingLedger.type && existingLedger.type !== BillingLedgerTransactionType.PAYMENT) {
+    return {
+      status: 'INCOMPLETE',
+      error: `Incomplete renewal ledger state: ledger transaction type is ${existingLedger.type}; expected PAYMENT`,
+    };
+  }
+
+  // -------------------------------------------------------------
+  // Exact Replay Confirmed
+  // -------------------------------------------------------------
+  return {
+    status: 'EXACT_REPLAY',
+    invoiceId: existingInvoice.id,
+    paymentAttemptId: matchingAttempt.id,
+  };
 };
 
 export class PaystackRenewalVerifier {
@@ -526,22 +835,35 @@ export class PaystackRenewalVerifier {
         };
       }
 
-      // 7. Check transaction identity reuse across payment attempts
-      const existingAttempt = await this.database.billingPaymentAttempt.findUnique({
-        where: { providerPaymentId: verifiedTx.providerTransactionId },
-        include: { invoice: true },
+      // 7. Check exact replay, conflicts, and invoice pairing
+      const pairingResult = await evaluateRenewalPairing(this.database, {
+        localSubscriptionId: localSubscription.id,
+        invoiceCode: hint.invoice?.invoiceCode,
+        providerTransactionId: verifiedTx.providerTransactionId,
+        providerReference: verifiedTx.reference,
       });
 
-      if (existingAttempt) {
-        if (existingAttempt.invoice.subscriptionId !== localSubscription.id) {
-          return {
-            outcome: 'CONFLICT',
-            isReadyForSettlement: false,
-            subscriptionProof,
-            cycleProof: defaultCycleProof,
-            error: `Provider transaction ID ${verifiedTx.providerTransactionId} is already linked to another subscription (${existingAttempt.invoice.subscriptionId})`,
-          };
-        }
+      if (pairingResult.status === 'CONFLICT') {
+        return {
+          outcome: 'CONFLICT',
+          isReadyForSettlement: false,
+          subscriptionProof,
+          cycleProof: defaultCycleProof,
+          error: pairingResult.error,
+        };
+      }
+
+      if (pairingResult.status === 'INCOMPLETE') {
+        return {
+          outcome: 'INCOMPLETE_RECORD_STATE',
+          isReadyForSettlement: false,
+          subscriptionProof,
+          cycleProof: defaultCycleProof,
+          error: pairingResult.error,
+        };
+      }
+
+      if (pairingResult.status === 'EXACT_REPLAY') {
         isReplayCandidate = true;
       }
 

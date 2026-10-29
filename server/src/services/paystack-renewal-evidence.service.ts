@@ -247,7 +247,6 @@ export class PaystackAuthenticatedRenewalEvidenceService {
       where: { providerInvoiceId: hint.invoice.invoiceCode },
     });
 
-    let isInvoiceReplay = false;
     if (existingInvoice) {
       // Find local subscription to verify ownership
       const localSub = await this.database.billingSubscription.findUnique({
@@ -261,7 +260,6 @@ export class PaystackAuthenticatedRenewalEvidenceService {
           error: `Provider invoice code ${hint.invoice.invoiceCode} is already bound to another subscription (${existingInvoice.subscriptionId})`,
         };
       }
-      isInvoiceReplay = true;
     }
 
     // 7. Perform Independent Read-Only Paystack Lookups
@@ -288,6 +286,15 @@ export class PaystackAuthenticatedRenewalEvidenceService {
     if (verifierResult.outcome === 'CONFLICT') {
       return {
         outcome: 'CONFLICT',
+        isReadyForSettlement: false,
+        unresolvedFacts: DEFAULT_UNRESOLVED_FACTS,
+        error: verifierResult.error,
+      };
+    }
+
+    if (verifierResult.outcome === 'INCOMPLETE_RECORD_STATE') {
+      return {
+        outcome: 'INCOMPLETE_INVOICE_STATE',
         isReadyForSettlement: false,
         unresolvedFacts: DEFAULT_UNRESOLVED_FACTS,
         error: verifierResult.error,
@@ -336,7 +343,7 @@ export class PaystackAuthenticatedRenewalEvidenceService {
       };
     }
 
-    const isReplay = Boolean(verifierResult.isReplayCandidate || isInvoiceReplay);
+    const isReplay = Boolean(verifierResult.isReplayCandidate);
 
     return {
       outcome: 'AUTHENTICATED_EVIDENCE_PRODUCED',

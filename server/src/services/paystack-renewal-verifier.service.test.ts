@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { BillingSubscriptionStatus } from '@prisma/client';
+import {
+  BillingInvoiceStatus,
+  BillingLedgerTransactionStatus,
+  BillingLedgerTransactionType,
+  BillingPaymentAttemptStatus,
+  BillingSubscriptionStatus,
+} from '@prisma/client';
 import {
   PaymentGatewayError,
   type CreatePlanInput,
@@ -71,12 +77,14 @@ interface MockDatabaseState {
   subscriptions?: any[];
   invoices?: any[];
   paymentAttempts?: any[];
+  ledgerTransactions?: any[];
 }
 
 const createMockDatabase = (state: MockDatabaseState = {}): RenewalVerificationDatabase => {
   const subscriptions = state.subscriptions ?? [];
   const invoices = state.invoices ?? [];
   const paymentAttempts = state.paymentAttempts ?? [];
+  const ledgerTransactions = state.ledgerTransactions ?? [];
 
   return {
     billingSubscription: {
@@ -92,12 +100,80 @@ const createMockDatabase = (state: MockDatabaseState = {}): RenewalVerificationD
       },
     },
     billingPaymentAttempt: {
-      findUnique: async ({ where }: { where: { providerPaymentId: string } }) => {
-        const found = paymentAttempts.find((att) => att.providerPaymentId === where.providerPaymentId);
+      findUnique: async ({ where }: { where: { providerPaymentId?: string; providerReference?: string } }) => {
+        const found = paymentAttempts.find((att) => {
+          if (where.providerPaymentId && att.providerPaymentId === where.providerPaymentId) return true;
+          if (where.providerReference && att.providerReference === where.providerReference) return true;
+          return false;
+        });
+        return found ? JSON.parse(JSON.stringify(found)) : null;
+      },
+    },
+    billingLedgerTransaction: {
+      findUnique: async ({ where }: { where: { externalReference?: string; id?: string } }) => {
+        const found = ledgerTransactions.find((tx) => {
+          if (where.externalReference && tx.externalReference === where.externalReference) return true;
+          if (where.id && tx.id === where.id) return true;
+          return false;
+        });
         return found ? JSON.parse(JSON.stringify(found)) : null;
       },
     },
   } as unknown as RenewalVerificationDatabase;
+};
+
+const createValidExactReplayFixtures = (overrides: {
+  invoiceId?: string;
+  subscriptionId?: string;
+  providerInvoiceId?: string;
+  providerPaymentId?: string;
+  providerReference?: string;
+  attemptStatus?: BillingPaymentAttemptStatus;
+  invoiceStatus?: BillingInvoiceStatus;
+  ledgerStatus?: BillingLedgerTransactionStatus;
+  ledgerType?: BillingLedgerTransactionType;
+  ledgerInvoiceId?: string;
+  ledgerSubscriptionId?: string;
+} = {}) => {
+  const invoiceId = overrides.invoiceId ?? 'inv_same_123';
+  const subscriptionId = overrides.subscriptionId ?? 'sub_local_123';
+  const providerInvoiceId = overrides.providerInvoiceId ?? 'INV_2026_cycle_02';
+  const providerPaymentId = overrides.providerPaymentId ?? '987654321';
+  const providerReference = overrides.providerReference ?? 'T_ren_123456789';
+
+  const invoice = {
+    id: invoiceId,
+    subscriptionId,
+    providerInvoiceId,
+    status: overrides.invoiceStatus ?? BillingInvoiceStatus.PAID,
+    paymentAttempts: [] as any[],
+  };
+
+  const attempt = {
+    id: 'att_same_123',
+    invoiceId,
+    providerPaymentId,
+    providerReference,
+    status: overrides.attemptStatus ?? BillingPaymentAttemptStatus.SUCCEEDED,
+    invoice: {
+      id: invoiceId,
+      subscriptionId,
+      providerInvoiceId,
+    },
+  };
+
+  invoice.paymentAttempts = [attempt];
+
+  const ledgerTransaction = {
+    id: 'led_tx_same_123',
+    externalReference: `paystack:payment:${providerPaymentId}`,
+    status: overrides.ledgerStatus ?? BillingLedgerTransactionStatus.POSTED,
+    type: overrides.ledgerType ?? BillingLedgerTransactionType.PAYMENT,
+    invoiceId: overrides.ledgerInvoiceId ?? invoiceId,
+    subscriptionId: overrides.ledgerSubscriptionId ?? subscriptionId,
+  };
+
+  return { invoice, attempt, ledgerTransaction };
 };
 
 const createValidLocalSubscription = (overrides: Record<string, any> = {}) => ({
@@ -534,15 +610,12 @@ describe('PaystackRenewalVerifier', () => {
     });
 
     it('allows invoice code if bound to the same subscription (replay / idempotent check)', async () => {
+      const fixtures = createValidExactReplayFixtures();
       const db = createMockDatabase({
         subscriptions: [createValidLocalSubscription()],
-        invoices: [
-          {
-            id: 'inv_same_123',
-            subscriptionId: 'sub_local_123',
-            providerInvoiceId: 'INV_2026_cycle_02',
-          },
-        ],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+        ledgerTransactions: [fixtures.ledgerTransaction],
       });
       const gateway = new TestRenewalGateway();
       gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
@@ -663,18 +736,12 @@ describe('PaystackRenewalVerifier', () => {
     });
 
     it('flags isReplayCandidate when transaction ID was already recorded on the SAME subscription', async () => {
+      const fixtures = createValidExactReplayFixtures();
       const db = createMockDatabase({
         subscriptions: [createValidLocalSubscription()],
-        paymentAttempts: [
-          {
-            id: 'att_same_123',
-            providerPaymentId: '987654321',
-            invoice: {
-              id: 'inv_same_123',
-              subscriptionId: 'sub_local_123',
-            },
-          },
-        ],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+        ledgerTransactions: [fixtures.ledgerTransaction],
       });
       const gateway = new TestRenewalGateway();
       gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
@@ -996,6 +1063,331 @@ describe('PaystackRenewalVerifier', () => {
       assert.equal(result.transactionProof?.providerCustomerId, 'CUS_test_cust_456');
       assert.equal(gateway.fetchSubscriptionCallCount, 1);
       assert.equal(gateway.verifyTransactionCallCount, 1);
+    });
+  });
+
+  describe('strict renewal replay and invoice pairing (Task 5E.3C3A-FIX2)', () => {
+    it('exact replay: identifies complete matching invoice, attempt and posted ledger as replay candidate', async () => {
+      const fixtures = createValidExactReplayFixtures();
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+        ledgerTransactions: [fixtures.ledgerTransaction],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'VERIFIED_PENDING_CYCLE_PROOF');
+      assert.equal(result.isReplayCandidate, true);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.equal(result.cycleProof.cycleProofStatus, 'INSUFFICIENT_CYCLE_PROOF');
+    });
+
+    it('cross-subscription reuse: rejects invoice code bound to another subscription as CONFLICT', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        subscriptionId: 'sub_foreign_another_team',
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'CONFLICT');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /already bound to another subscription/);
+    });
+
+    it('cross-subscription reuse: rejects payment attempt bound to another subscription as CONFLICT', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        subscriptionId: 'sub_foreign_another_team',
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        paymentAttempts: [fixtures.attempt],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'CONFLICT');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /already linked to another subscription/);
+    });
+
+    it('cross-subscription reuse: rejects ledger transaction bound to another subscription as CONFLICT', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        ledgerSubscriptionId: 'sub_foreign_another_team',
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        ledgerTransactions: [fixtures.ledgerTransaction],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'CONFLICT');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /already linked to another subscription/);
+    });
+
+    it('same-subscription cross-cycle reuse: rejects already-used transaction presented with different invoice code', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        providerInvoiceId: 'INV_2026_cycle_01_old',
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        paymentAttempts: [fixtures.attempt],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      // hint presents INV_2026_cycle_02, but transaction is already bound to INV_2026_cycle_01_old
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'CONFLICT');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /already bound to a different invoice/);
+    });
+
+    it('same-subscription cross-cycle reuse: rejects already-used invoice presented with different transaction ID', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        providerPaymentId: '999999999_different',
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'CONFLICT');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /already bound to a different transaction ID/);
+    });
+
+    it('mismatched references: rejects transaction ID recorded with a different reference as CONFLICT', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        providerReference: 'T_ren_different_ref_111',
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        paymentAttempts: [fixtures.attempt],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'CONFLICT');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /associated with reference T_ren_different_ref_111, not T_ren_123456789/);
+    });
+
+    it('invoice-only match: returns INCOMPLETE_RECORD_STATE without replay classification', async () => {
+      const fixtures = createValidExactReplayFixtures();
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'INCOMPLETE_RECORD_STATE');
+      assert.equal(result.isReplayCandidate, undefined);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Incomplete renewal persistence: provider invoice INV_2026_cycle_02 exists locally, but matching payment attempt/);
+    });
+
+    it('payment-only match: returns INCOMPLETE_RECORD_STATE without replay classification', async () => {
+      const fixtures = createValidExactReplayFixtures();
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        paymentAttempts: [fixtures.attempt],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'INCOMPLETE_RECORD_STATE');
+      assert.equal(result.isReplayCandidate, undefined);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /payment attempt for transaction 987654321 exists locally, but matching provider invoice/);
+    });
+
+    it('incomplete payment status: returns INCOMPLETE_RECORD_STATE when attempt is not SUCCEEDED', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        attemptStatus: BillingPaymentAttemptStatus.PENDING,
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+        ledgerTransactions: [fixtures.ledgerTransaction],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'INCOMPLETE_RECORD_STATE');
+      assert.equal(result.isReplayCandidate, undefined);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /payment attempt status is PENDING; expected SUCCEEDED/);
+    });
+
+    it('incomplete invoice status: returns INCOMPLETE_RECORD_STATE when invoice is not PAID', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        invoiceStatus: BillingInvoiceStatus.OPEN,
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+        ledgerTransactions: [fixtures.ledgerTransaction],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'INCOMPLETE_RECORD_STATE');
+      assert.equal(result.isReplayCandidate, undefined);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /local invoice status is OPEN; expected PAID/);
+    });
+
+    it('incomplete ledger state: returns INCOMPLETE_RECORD_STATE when ledger transaction is missing', async () => {
+      const fixtures = createValidExactReplayFixtures();
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'INCOMPLETE_RECORD_STATE');
+      assert.equal(result.isReplayCandidate, undefined);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /no posted ledger transaction found for payment 987654321/);
+    });
+
+    it('incomplete ledger state: returns INCOMPLETE_RECORD_STATE when ledger transaction is DRAFT', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        ledgerStatus: BillingLedgerTransactionStatus.DRAFT,
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+        ledgerTransactions: [fixtures.ledgerTransaction],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'INCOMPLETE_RECORD_STATE');
+      assert.equal(result.isReplayCandidate, undefined);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /ledger transaction status is DRAFT; expected POSTED/);
+    });
+
+    it('incomplete ledger state: returns CONFLICT when ledger is linked to wrong invoice', async () => {
+      const fixtures = createValidExactReplayFixtures({
+        ledgerInvoiceId: 'inv_mismatched_wrong',
+      });
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+        invoices: [fixtures.invoice],
+        paymentAttempts: [fixtures.attempt],
+        ledgerTransactions: [fixtures.ledgerTransaction],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'CONFLICT');
+      assert.equal(result.isReadyForSettlement, false);
+      assert.match(result.error ?? '', /Ledger transaction is linked to local invoice inv_mismatched_wrong, not invoice inv_same_123/);
+    });
+
+    it('valid first-time renewal evidence: preserves first-time candidate as non-settling without replay flag', async () => {
+      const db = createMockDatabase({
+        subscriptions: [createValidLocalSubscription()],
+      });
+      const gateway = new TestRenewalGateway();
+      gateway.setSubscription('SUB_test_sub_123', createValidVerifiedSubscription());
+      gateway.setTransaction('T_ren_123456789', createValidVerifiedPayment());
+
+      const verifier = new PaystackRenewalVerifier(db, gateway);
+      const hint = createValidRenewalHint();
+
+      const result = await verifier.verifyRenewal(hint);
+      assert.equal(result.outcome, 'VERIFIED_PENDING_CYCLE_PROOF');
+      assert.equal(result.isReplayCandidate, undefined);
+      assert.equal(result.isReadyForSettlement, false);
+      assert.equal(result.cycleProof.cycleProofStatus, 'INSUFFICIENT_CYCLE_PROOF');
     });
   });
 });
