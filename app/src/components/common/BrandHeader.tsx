@@ -3,18 +3,20 @@ import { View, Text, StyleSheet } from 'react-native';
 import { colors, spacing, typography } from '@/constants/theme';
 
 interface BrandHeaderProps {
+  badge?: string;
   title?: string;
   subtitle?: string;
 }
 
 export const BrandHeader: React.FC<BrandHeaderProps> = ({
+  badge = 'ROTA',
   title = 'Rota',
   subtitle = 'Team scheduling made simple',
 }) => {
   return (
     <View style={styles.container}>
       <View style={styles.badge}>
-        <Text style={styles.badgeText}>FOUNDATION</Text>
+        <Text style={styles.badgeText}>{badge}</Text>
       </View>
       <Text style={styles.title}>{title}</Text>
       <Text style={styles.subtitle}>{subtitle}</Text>

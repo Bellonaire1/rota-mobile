@@ -77,7 +77,7 @@ const shiftDisplay = (shift: Shift) => {
   const date = start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
   const startTime = start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
   const endTime = end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-  return `${date} · ${startTime}–${endTime}`;
+  return `${date} \u2022 ${startTime} \u2013 ${endTime}`;
 };
 
 const formForShift = (shift: Shift): ShiftFormState => {
@@ -229,7 +229,7 @@ export default function DashboardScreen() {
   };
 
   const cancelShift = (shift: Shift) => {
-    Alert.alert('Cancel shift?', `Cancel “${shift.title}” for ${shift.assignedTo.name || shift.assignedTo.email}?`, [
+    Alert.alert('Cancel shift?', `Cancel "${shift.title}" for ${shift.assignedTo.name || shift.assignedTo.email}?`, [
       { text: 'Keep shift', style: 'cancel' },
       {
         text: 'Cancel shift',
@@ -275,13 +275,13 @@ export default function DashboardScreen() {
       contentContainerStyle={styles.content}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadShifts(true); }} tintColor={colors.primary} />}
     >
-      <BrandHeader title={selectedTeam.name} subtitle={`Schedule · ${role ? role.toLowerCase() : 'team member'}`} />
+      <BrandHeader badge="WORKSPACE" title={selectedTeam.name} subtitle={`Schedule · ${role ? role.toLowerCase() : 'team member'}`} />
       <View style={styles.headerRow}>
         <View>
           <Text style={styles.eyebrow}>TEAM SCHEDULE</Text>
           <Text style={styles.title}>Shifts</Text>
         </View>
-        {canManage ? <ActionButton label="Add shift" onPress={openCreate} /> : null}
+        {canManage ? <ActionButton size="small" label="Add shift" onPress={openCreate} /> : null}
       </View>
       <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/members')} style={styles.membersLink}>
         <Text style={styles.membersLinkText}>View team members →</Text>
@@ -326,19 +326,21 @@ export default function DashboardScreen() {
               <Text style={styles.assignee}>Assigned to {shift.assignedTo.name || shift.assignedTo.email}</Text>
               {canManage && shift.status === 'SCHEDULED' ? (
                 <View style={styles.shiftActions}>
-                  <ActionButton label="Edit" onPress={() => openEdit(shift)} variant="secondary" />
-                  <ActionButton label={cancellingId === shift.id ? 'Cancelling…' : 'Cancel'} onPress={() => cancelShift(shift)} variant="quiet" loading={cancellingId === shift.id} />
+                  <ActionButton size="small" label="Edit" onPress={() => openEdit(shift)} variant="secondary" />
+                  <ActionButton size="small" label={cancellingId === shift.id ? 'Cancelling...' : 'Cancel'} onPress={() => cancelShift(shift)} variant="quiet" loading={cancellingId === shift.id} />
                 </View>
               ) : null}
             </View>
           ))}
-          {hasMore ? <ActionButton label={loadingMore ? 'Loading…' : 'Load more'} onPress={() => loadShifts(false)} loading={loadingMore} variant="secondary" /> : null}
+          {hasMore ? <ActionButton label={loadingMore ? 'Loading...' : 'Load more'} onPress={() => loadShifts(false)} loading={loadingMore} variant="secondary" /> : null}
         </View>
       )}
 
       {!isPersistenceAvailable ? <Text style={styles.notice}>Secure session persistence is unavailable on this platform. You will need to sign in again after closing the app.</Text> : null}
-      <ActionButton label="Change team" onPress={() => router.push('/(app)/select-team')} variant="secondary" />
-      <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
+      <View style={styles.bottomActions}>
+        <ActionButton label="Change team" onPress={() => router.push('/(app)/select-team')} variant="secondary" />
+        <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
+      </View>
 
       <Modal visible={modalVisible} animationType="slide" transparent onRequestClose={() => setModalVisible(false)}>
         <KeyboardAvoidingView style={styles.modalBackdrop} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
@@ -353,12 +355,14 @@ export default function DashboardScreen() {
               </View>
               <FormField label="Title" value={form.title} onChangeText={(value) => updateForm('title', value)} placeholder="Front desk cover" maxLength={200} />
               <Text style={styles.formLabel}>Assignee</Text>
-              {members.length === 0 ? <Text style={styles.muted}>No team members are available to assign.</Text> : members.map((member) => (
-                <Pressable key={member.userId} accessibilityRole="radio" accessibilityState={{ checked: form.assignedToUserId === member.userId }} onPress={() => updateForm('assignedToUserId', member.userId)} style={[styles.assigneeOption, form.assignedToUserId === member.userId && styles.assigneeSelected]}>
-                  <Text style={styles.assigneeOptionName}>{displayName(member)}</Text>
-                  <Text style={styles.assigneeOptionRole}>{member.role}</Text>
-                </Pressable>
-              ))}
+              <View style={styles.assigneeContainer}>
+                {members.length === 0 ? <Text style={styles.muted}>No team members are available to assign.</Text> : members.map((member) => (
+                  <Pressable key={member.userId} accessibilityRole="radio" accessibilityState={{ checked: form.assignedToUserId === member.userId }} onPress={() => updateForm('assignedToUserId', member.userId)} style={[styles.assigneeOption, form.assignedToUserId === member.userId && styles.assigneeSelected]}>
+                    <Text style={styles.assigneeOptionName}>{displayName(member)}</Text>
+                    <Text style={styles.assigneeOptionRole}>{member.role}</Text>
+                  </Pressable>
+                ))}
+              </View>
               <View style={styles.twoColumns}>
                 <View style={styles.column}><FormField label="Start date" value={form.startDate} onChangeText={(value) => updateForm('startDate', value)} placeholder="YYYY-MM-DD" autoCapitalize="none" /></View>
                 <View style={styles.column}><FormField label="Start time" value={form.startTime} onChangeText={(value) => updateForm('startTime', value)} placeholder="09:00" keyboardType="numbers-and-punctuation" /></View>
@@ -425,4 +429,6 @@ const styles = StyleSheet.create({
   assigneeOptionRole: { color: colors.textSecondary, fontSize: typography.sizes.xs },
   twoColumns: { flexDirection: 'row', gap: spacing.sm },
   column: { flex: 1 },
+  assigneeContainer: { maxHeight: 180, marginBottom: spacing.sm },
+  bottomActions: { marginTop: spacing.xl, gap: spacing.sm },
 });

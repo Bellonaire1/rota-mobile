@@ -23,6 +23,10 @@ export const spacing = {
 } as const;
 
 export const typography = {
+  fontFamily: {
+    sans: 'sans-serif',
+    mono: 'monospace',
+  },
   sizes: {
     xs: 12,
     sm: 14,

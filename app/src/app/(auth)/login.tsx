@@ -36,11 +36,11 @@ export default function LoginScreen() {
   return (
     <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <BrandHeader subtitle="Your team, in rhythm" />
+        <BrandHeader badge="ROTA" subtitle="Your team, in rhythm" />
         <View style={styles.card}>
           <Text style={styles.eyebrow}>WELCOME BACK</Text>
           <Text style={styles.title}>Sign in to Rota</Text>
-          <Text style={styles.subtitle}>See today’s schedule and keep your team moving.</Text>
+          <Text style={styles.subtitle}>See today's schedule and keep your team moving.</Text>
           <View style={styles.form}>
             <FormField label="Email" value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" autoComplete="email" placeholder="you@example.com" />
             <FormField label="Password" value={password} onChangeText={setPassword} secureTextEntry autoComplete="password" placeholder="Your password" />

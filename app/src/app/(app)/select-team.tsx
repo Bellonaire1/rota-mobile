@@ -61,12 +61,25 @@ export default function SelectTeamScreen() {
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadTeams(); }} tintColor={colors.primary} />}>
-      <BrandHeader title="Choose your team" subtitle={user?.name ? `Welcome, ${user.name}` : 'Select a workspace to continue'} />
+      <BrandHeader badge="TEAMS" title="Choose your team" subtitle={user?.name ? `Welcome, ${user.name}` : 'Select a workspace to continue'} />
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Your teams</Text>
-        {loading ? <ActivityIndicator color={colors.primary} style={styles.loader} /> : teams.length === 0 ? <Text style={styles.muted}>You are not part of a team yet. Create your first one below.</Text> : teams.map((team) => (
-          <ActionButton key={team.id} label={`${team.name}${selectedTeam?.id === team.id ? '  •  Selected' : ''}`} onPress={() => choose(team)} variant={selectedTeam?.id === team.id ? 'primary' : 'secondary'} />
-        ))}
+        {loading ? (
+          <ActivityIndicator color={colors.primary} style={styles.loader} />
+        ) : teams.length === 0 ? (
+          <Text style={styles.muted}>You are not part of a team yet. Create your first one below.</Text>
+        ) : (
+          <View style={styles.teamList}>
+            {teams.map((team) => (
+              <ActionButton
+                key={team.id}
+                label={`${team.name}${selectedTeam?.id === team.id ? '  \u2022  Selected' : ''}`}
+                onPress={() => choose(team)}
+                variant={selectedTeam?.id === team.id ? 'primary' : 'secondary'}
+              />
+            ))}
+          </View>
+        )}
       </View>
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Create a team</Text>
@@ -74,7 +87,9 @@ export default function SelectTeamScreen() {
         <ActionButton label="Create team" onPress={createTeam} loading={creating} />
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
+      <View style={styles.signOutRow}>
+        <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
+      </View>
     </ScrollView>
   );
 }
@@ -84,6 +99,8 @@ const styles = StyleSheet.create({
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
   section: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 20, padding: spacing.lg, marginBottom: spacing.md },
   sectionTitle: { color: colors.text, fontSize: typography.sizes.lg, fontWeight: '800', marginBottom: spacing.md },
+  teamList: { gap: spacing.sm },
+  signOutRow: { marginTop: spacing.sm },
   loader: { paddingVertical: spacing.lg },
   muted: { color: colors.textSecondary, fontSize: typography.sizes.sm, lineHeight: 21, marginBottom: spacing.sm },
   error: { color: colors.error, fontSize: typography.sizes.sm, marginBottom: spacing.md },

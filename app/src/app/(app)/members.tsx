@@ -143,10 +143,10 @@ export default function MembersScreen() {
       contentContainerStyle={styles.content}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadMembers(true); }} tintColor={colors.primary} />}
     >
-      <BrandHeader title={selectedTeam.name} subtitle="Team members" />
+      <BrandHeader badge="MEMBERS" title={selectedTeam.name} subtitle="Team members" />
       <View style={styles.navigationRow}>
         <Pressable accessibilityRole="button" onPress={() => router.replace('/(app)')}><Text style={styles.navLink}>Schedule</Text></Pressable>
-        <Text style={styles.navDivider}>·</Text>
+        <Text style={styles.navDivider}>{'\u00B7'}</Text>
         <Text style={styles.navCurrent}>Members</Text>
       </View>
 
@@ -179,7 +179,7 @@ export default function MembersScreen() {
           <Text style={styles.sectionTitle}>People on this team</Text>
           <Text style={styles.muted}>{role ? `You are a ${role.toLowerCase()}.` : 'Your membership role is unavailable.'}</Text>
         </View>
-        <Text style={styles.count}>{pagination.page === 1 ? members.length : '…'}</Text>
+        <Text style={styles.count}>{pagination.page === 1 ? members.length : '...'}</Text>
       </View>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -196,16 +196,18 @@ export default function MembersScreen() {
           </View>
           {isOwner && member.role !== 'OWNER' ? (
             <View style={styles.memberActions}>
-              <ActionButton label={busyMemberId === member.userId ? 'Saving…' : member.role === 'STAFF' ? 'Make manager' : 'Make staff'} onPress={() => changeRole(member)} loading={busyMemberId === member.userId} variant="secondary" />
-              <ActionButton label="Remove" onPress={() => removeMember(member)} disabled={busyMemberId !== null} variant="quiet" />
+              <ActionButton size="small" label={busyMemberId === member.userId ? 'Saving...' : member.role === 'STAFF' ? 'Make manager' : 'Make staff'} onPress={() => changeRole(member)} loading={busyMemberId === member.userId} variant="secondary" />
+              <ActionButton size="small" label="Remove" onPress={() => removeMember(member)} disabled={busyMemberId !== null} variant="quiet" />
             </View>
           ) : member.role === 'OWNER' ? <Text style={styles.ownerNote}>Owners cannot be changed or removed.</Text> : null}
         </View>
       ))}
-      {hasMore ? <ActionButton label={loadingMore ? 'Loading…' : 'Load more members'} onPress={() => loadMembers(false)} loading={loadingMore} variant="secondary" /> : null}
+      {hasMore ? <ActionButton label={loadingMore ? 'Loading...' : 'Load more members'} onPress={() => loadMembers(false)} loading={loadingMore} variant="secondary" /> : null}
 
-      <ActionButton label="Change team" onPress={() => router.push('/(app)/select-team')} variant="secondary" />
-      <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
+      <View style={styles.bottomActions}>
+        <ActionButton label="Change team" onPress={() => router.push('/(app)/select-team')} variant="secondary" />
+        <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
+      </View>
     </ScrollView>
   );
 }
@@ -244,4 +246,5 @@ const styles = StyleSheet.create({
   emptyCard: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 18, padding: spacing.lg, marginBottom: spacing.md },
   emptyTitle: { color: colors.text, fontSize: typography.sizes.lg, fontWeight: '800' },
   error: { color: colors.error, fontSize: typography.sizes.sm, lineHeight: 20, marginBottom: spacing.md },
+  bottomActions: { marginTop: spacing.xl, gap: spacing.sm },
 });

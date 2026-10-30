@@ -17,10 +17,16 @@ const resolveApiBaseUrl = (): string => {
   }
 
   // Derive host IP when running in Expo Go / dev client
-  const hostUri = Constants.expoConfig?.hostUri;
-  if (hostUri) {
-    const hostIp = hostUri.split(':')[0];
-    if (hostIp) {
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    (Constants as any).manifest2?.extra?.expoGo?.debuggerHost ||
+    (Constants as any).manifest?.debuggerHost ||
+    Constants.experienceUrl;
+
+  if (hostUri && typeof hostUri === 'string') {
+    const sanitized = hostUri.replace(/^[a-z]+:\/\//i, '');
+    const hostIp = sanitized.split(':')[0]?.split('/')[0];
+    if (hostIp && hostIp !== 'localhost' && hostIp !== '127.0.0.1') {
       return `http://${hostIp}:5000/api/v1`;
     }
   }

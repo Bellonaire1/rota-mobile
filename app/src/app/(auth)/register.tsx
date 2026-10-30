@@ -37,7 +37,7 @@ export default function RegisterScreen() {
   return (
     <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <BrandHeader subtitle="Your team, in rhythm" />
+        <BrandHeader badge="GET STARTED" subtitle="Your team, in rhythm" />
         <View style={styles.card}>
           <Text style={styles.eyebrow}>GET STARTED</Text>
           <Text style={styles.title}>Create your account</Text>
