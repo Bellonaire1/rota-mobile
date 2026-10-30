@@ -8,6 +8,12 @@ const envSchema = z.object({
   PORT: z.coerce.number().default(5000),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   DATABASE_URL: z.string().optional(),
+  DIRECT_URL: z.string().optional(),
+  DEMO_MODE: z
+    .string()
+    .optional()
+    .transform((val) => val === 'true' || val === '1')
+    .default('false'),
   JWT_ACCESS_SECRET: z.string().min(32),
   ACCESS_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(15),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(30),

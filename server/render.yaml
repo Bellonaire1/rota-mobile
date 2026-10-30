@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: rota-api-demo
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install && npm run prisma:generate && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: ACCESS_TOKEN_TTL_MINUTES
+        value: 15
+      - key: REFRESH_TOKEN_TTL_DAYS
+        value: 30
+      - key: PAYSTACK_MODE
+        value: test
+      - key: DEMO_MODE
+        value: "true"

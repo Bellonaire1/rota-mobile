@@ -12,11 +12,46 @@ import { Platform } from 'react-native';
  * 4. Default localhost fallback (for web or iOS simulator).
  */
 const resolveApiBaseUrl = (): string => {
-  if (process.env.EXPO_PUBLIC_API_URL) {
-    return process.env.EXPO_PUBLIC_API_URL;
+  const isDistributionBuild =
+    Constants.executionEnvironment === 'standalone' ||
+    (!__DEV__ && (Constants as any).appOwnership !== 'expo');
+
+  const configuredUrl = process.env.EXPO_PUBLIC_API_URL?.trim();
+
+  // Distribution / Standalone APK builds MUST have a valid public HTTPS endpoint.
+  if (isDistributionBuild) {
+    if (!configuredUrl) {
+      throw new Error(
+        'Distribution APK build requires an explicitly configured public HTTPS EXPO_PUBLIC_API_URL. Silent fallback to localhost, emulator loopback, or private hotspot IPs is strictly prohibited in standalone builds.'
+      );
+    }
+
+    if (!configuredUrl.startsWith('https://')) {
+      throw new Error(
+        `Distribution APK build requires a secure public HTTPS endpoint (e.g. https://your-service.onrender.com/api/v1). Insecure or non-HTTPS URL: "${configuredUrl}"`
+      );
+    }
+
+    if (
+      configuredUrl.includes('localhost') ||
+      configuredUrl.includes('127.0.0.1') ||
+      configuredUrl.includes('10.0.2.2') ||
+      /https:\/\/(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/.test(configuredUrl)
+    ) {
+      throw new Error(
+        `Distribution APK build cannot target private or local network IP addresses: "${configuredUrl}". A publicly accessible HTTPS host is required.`
+      );
+    }
+
+    return configuredUrl;
   }
 
-  // Derive host IP when running in Expo Go / dev client
+  // Local development / Expo Go: allow explicit override if supplied
+  if (configuredUrl) {
+    return configuredUrl;
+  }
+
+  // Local development: derive host IP when running in Expo Go / dev client
   const hostUri =
     Constants.expoConfig?.hostUri ||
     (Constants as any).manifest2?.extra?.expoGo?.debuggerHost ||

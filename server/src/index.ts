@@ -1,7 +1,7 @@
 import { app } from './app';
 import { env } from './config/env';
 
-const server = app.listen(env.PORT, () => {
+const server = app.listen(env.PORT, '0.0.0.0', () => {
   console.log(`[Rota Server] Running in ${env.NODE_ENV} mode on port ${env.PORT}`);
   console.log(`[Rota Server] Health check available at: http://localhost:${env.PORT}/api/v1/health`);
 });

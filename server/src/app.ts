@@ -7,6 +7,9 @@ import { errorHandler } from './middleware/errorHandler';
 export const createApp = (): Application => {
   const app = express();
 
+  // Trust first proxy hop (Render / reverse proxy TLS termination)
+  app.set('trust proxy', 1);
+
   // Middleware
   app.use(cors());
   app.use('/api/v1/billing/webhooks/paystack', express.raw({
