@@ -30,6 +30,13 @@
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "66658de4-4c3b-4467-b8b6-eb799dac09ad"
+      }
+    },
+    "owner": "bellonaire"
   }
 }
