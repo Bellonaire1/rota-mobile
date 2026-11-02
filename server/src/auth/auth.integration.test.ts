@@ -7,6 +7,7 @@ import { app } from '../app';
 import { env } from '../config/env';
 import { prisma } from '../database/prisma';
 import { hashRefreshToken } from './tokens';
+import { authIntegrationSkipReason } from './auth-test-safety';
 
 interface AuthResponse {
   user?: {
@@ -49,17 +50,23 @@ const register = async (suffix = randomUUID()): Promise<AuthResponse> => {
   return body;
 };
 
-describe('authentication API', () => {
+const skipReason = authIntegrationSkipReason();
+
+describe('authentication API', { concurrency: false, skip: skipReason }, () => {
   before(async () => {
+    if (skipReason) return;
     server = app.listen(0);
     await new Promise<void>((resolve) => server.once('listening', resolve));
     baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/v1`;
   });
 
   after(async () => {
-    await new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve()))
-    );
+    if (skipReason) return;
+    if (server) {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
     await prisma.authSession.deleteMany({ where: { userId: { in: createdUserIds } } });
     await prisma.user.deleteMany({ where: { email: { in: createdEmails } } });
     await prisma.$disconnect();
