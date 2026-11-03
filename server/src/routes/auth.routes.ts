@@ -5,6 +5,8 @@ import { validateRequest } from '../middleware/validateRequest';
 import {
   loginSchema,
   refreshTokenSchema,
+  passwordResetConfirmSchema,
+  passwordResetRequestSchema,
   registerSchema,
 } from '../schemas/auth.schema';
 
@@ -16,5 +18,15 @@ router.post('/refresh', validateRequest({ body: refreshTokenSchema }), authContr
 router.post('/logout', validateRequest({ body: refreshTokenSchema }), authController.logout);
 router.post('/logout-all', authenticate, authController.logoutAll);
 router.get('/me', authenticate, authController.me);
+router.post(
+  '/password-reset/request',
+  validateRequest({ body: passwordResetRequestSchema }),
+  authController.requestPasswordReset
+);
+router.post(
+  '/password-reset/confirm',
+  validateRequest({ body: passwordResetConfirmSchema }),
+  authController.confirmPasswordReset
+);
 
 export default router;

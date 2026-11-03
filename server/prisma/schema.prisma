@@ -97,6 +97,7 @@ model User {
   teamsCreated Team[]           @relation("CreatedTeams")
   memberships  TeamMembership[]
   authSessions AuthSession[]
+  passwordResetTokens PasswordResetToken[]
   assignedShifts Shift[]         @relation("AssignedShifts")
   createdShifts  Shift[]         @relation("CreatedShifts")
   billingIdempotencyKeys BillingIdempotencyKey[]
@@ -117,6 +118,28 @@ model AuthSession {
   @@index([userId])
   @@index([familyId])
   @@index([expiresAt])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+}
+
+model PasswordResetRequest {
+  id        String   @id @default(uuid())
+  email     String
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
 }
 
 model Team {

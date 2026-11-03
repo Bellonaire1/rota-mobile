@@ -10,6 +10,12 @@ export interface AccessTokenClaims {
 export const hashRefreshToken = (token: string): string =>
   createHash('sha256').update(token).digest('hex');
 
+export const createPasswordResetToken = (): string =>
+  randomBytes(32).toString('hex');
+
+export const hashPasswordResetToken = (token: string): string =>
+  createHash('sha256').update(token).digest('hex');
+
 export const createRefreshToken = (): string =>
   randomBytes(48).toString('base64url');
 

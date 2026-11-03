@@ -7,11 +7,26 @@ import {
   createAccessToken,
   createFamilyId,
   createRefreshToken,
+  createPasswordResetToken,
+  hashPasswordResetToken,
   hashRefreshToken,
 } from '../auth/tokens';
-import { LoginInput, RegisterInput } from '../schemas/auth.schema';
+import {
+  LoginInput,
+  PasswordResetConfirmInput,
+  PasswordResetRequestInput,
+  RegisterInput,
+} from '../schemas/auth.schema';
+import { emailService } from './email';
 
 const PASSWORD_HASH_ROUNDS = 12;
+const PASSWORD_RESET_TOKEN_TTL_MS = 30 * 60 * 1000;
+const RESET_REQUEST_WINDOW_MS = 15 * 60 * 1000;
+const MAX_RESET_REQUESTS_PER_WINDOW = 3;
+const GENERIC_RESET_REQUEST_MESSAGE =
+  'If an account exists with that email, a password reset link has been sent.';
+const GENERIC_RESET_SUCCESS_MESSAGE =
+  'Password has been reset successfully. Please log in with your new password.';
 const DUMMY_PASSWORD_HASH =
   '$2b$12$mGX9iu2Lwu9a.7hjCNrC/OA9txTf6A5twVjoNx53i7w5oPte4iCJy';
 
@@ -229,5 +244,169 @@ export const authService = {
     }
 
     return user;
+  },
+
+  async requestPasswordReset(
+    input: PasswordResetRequestInput,
+    clientBaseUrl?: string
+  ): Promise<{ message: string }> {
+    // 1. Verify email delivery provider is configured and operational
+    try {
+      await emailService.verifyDeliveryAvailable();
+    } catch {
+      throw new AppError(500, 'Unable to send password reset email at this time');
+    }
+
+    // 2. Persistent database-backed atomic throttling across all emails (known and unknown)
+    const windowStart = new Date(Date.now() - RESET_REQUEST_WINDOW_MS);
+    try {
+      await prisma.$transaction(async (tx) => {
+        // Linearize concurrent requests for the same normalized email using an advisory lock
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${input.email}))`;
+
+        const recentRequestsCount = await tx.passwordResetRequest.count({
+          where: {
+            email: input.email,
+            createdAt: { gte: windowStart },
+          },
+        });
+
+        if (recentRequestsCount >= MAX_RESET_REQUESTS_PER_WINDOW) {
+          throw new AppError(429, 'Too many password reset requests. Please try again later.');
+        }
+
+        await tx.passwordResetRequest.create({
+          data: {
+            email: input.email,
+          },
+        });
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        (error.code === 'P2034' || error.code === 'P2002')
+      ) {
+        throw new AppError(429, 'Too many password reset requests. Please try again later.');
+      }
+      throw error;
+    }
+
+    // 3. User lookup
+    const user = await prisma.user.findUnique({
+      where: { email: input.email },
+    });
+
+    if (!user) {
+      // Constant-time dummy work to mitigate timing attacks
+      await bcrypt.compare(input.email, DUMMY_PASSWORD_HASH);
+      return { message: GENERIC_RESET_REQUEST_MESSAGE };
+    }
+
+    // 4. Generate secure token for existing user
+    const rawToken = createPasswordResetToken();
+    const tokenHash = hashPasswordResetToken(rawToken);
+    const expiresAt = new Date(Date.now() + PASSWORD_RESET_TOKEN_TTL_MS);
+
+    const tokenRecord = await prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        expiresAt,
+      },
+    });
+
+    try {
+      await emailService.sendPasswordResetEmail({
+        to: user.email,
+        resetToken: rawToken,
+        clientBaseUrl,
+      });
+    } catch (error) {
+      // 1. Clean up unused token so no orphaned, unreceived token lingers in DB
+      await prisma.passwordResetToken.delete({ where: { id: tokenRecord.id } }).catch(() => {});
+
+      // 2. Alert internal monitoring (never silently swallow failure for operations)
+      console.error(
+        `[AuthService] Password reset email dispatch failed for user ${user.id}:`,
+        error
+      );
+
+      // 3. Return the neutral conditional response to prevent external account enumeration
+      // Note: requestRecord is deliberately preserved to maintain rate limiting against failing downstream gateways
+      return { message: GENERIC_RESET_REQUEST_MESSAGE };
+    }
+
+    return { message: GENERIC_RESET_REQUEST_MESSAGE };
+  },
+
+  async confirmPasswordReset(
+    input: PasswordResetConfirmInput
+  ): Promise<{ message: string }> {
+    const tokenHash = hashPasswordResetToken(input.token);
+
+    try {
+      return await prisma.$transaction(async (tx) => {
+      const tokenRecord = await tx.passwordResetToken.findUnique({
+        where: { tokenHash },
+      });
+
+      if (!tokenRecord) {
+        throw new AppError(400, 'Invalid or expired password reset token');
+      }
+
+      if (tokenRecord.usedAt) {
+        throw new AppError(400, 'Password reset token has already been used');
+      }
+
+      const now = new Date();
+      if (tokenRecord.expiresAt <= now) {
+        throw new AppError(400, 'Password reset token has expired');
+      }
+
+      const claim = await tx.passwordResetToken.updateMany({
+        where: {
+          id: tokenRecord.id,
+          usedAt: null,
+        },
+        data: {
+          usedAt: now,
+        },
+      });
+
+      if (claim.count !== 1) {
+        throw new AppError(400, 'Password reset token has already been used');
+      }
+
+      const passwordHash = await bcrypt.hash(input.password, PASSWORD_HASH_ROUNDS);
+
+      await tx.user.update({
+        where: { id: tokenRecord.userId },
+        data: { passwordHash },
+      });
+
+      await tx.authSession.updateMany({
+        where: {
+          userId: tokenRecord.userId,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: now,
+        },
+      });
+
+      return { message: GENERIC_RESET_SUCCESS_MESSAGE };
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2034'
+      ) {
+        throw new AppError(400, 'Password reset token has already been used');
+      }
+      throw error;
+    }
   },
 };

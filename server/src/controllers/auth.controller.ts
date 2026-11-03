@@ -46,6 +46,27 @@ export const authController = {
     }
   },
 
+  async requestPasswordReset(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const clientBaseUrl = req.headers['x-forwarded-host']
+        ? `${req.protocol}://${req.headers['x-forwarded-host']}`
+        : undefined;
+      const result = await authService.requestPasswordReset(req.body, clientBaseUrl);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+
+  async confirmPasswordReset(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await authService.confirmPasswordReset(req.body);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+
   async me(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       res.status(200).json({ user: await authService.getSafeUser(req.auth!.userId) });
