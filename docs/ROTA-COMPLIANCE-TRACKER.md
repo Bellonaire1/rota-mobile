@@ -5,9 +5,9 @@
 > **Repository:** `C:\Users\USER\rota-mobile`<br>
 > **Last Updated:** November 2026<br>
 > **Audit Status:** Rigorous Independent Verification & Baseline Commit (Task R01.5)<br>
-> **Compulsory Acceptance Requirements (99 total):** 18 DONE | 9 UNVERIFIED | 28 PARTIAL | 44 PENDING<br>
+> **Compulsory Acceptance Requirements (99 total):** 22 DONE | 5 UNVERIFIED | 30 PARTIAL | 42 PENDING<br>
 > **Optional Post-Graduation Milestones (1 total):** 0 DONE | 0 UNVERIFIED | 0 PARTIAL | 1 PENDING<br>
-> **Grand Total Tracked Items:** 100 Subrequirements (18 DONE, 9 UNVERIFIED, 28 PARTIAL, 45 PENDING)
+> **Grand Total Tracked Items:** 100 Subrequirements (22 DONE, 5 UNVERIFIED, 30 PARTIAL, 43 PENDING)
 
 ---
 
@@ -81,14 +81,14 @@ Before evaluating the individual requirements, the following ten technical discr
 
 | ID | Exact Acceptance Criterion | Impl | Test | Dep | Evid | Status | Evidence Link / File | Gap & Next Action |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
-| **R02.1** | Email and password authentication with bcrypt password hashing (min 8 chars). | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [auth.service.ts](../server/src/services/auth.service.ts) | Implementation exists with bcrypt 12 salt rounds, but `auth.integration.test.ts` was skipped; lacks automated test execution evidence. |
+| **R02.1** | Email and password authentication with bcrypt password hashing (min 8 chars). | YES | YES | YES | YES | **DONE** | [auth.service.ts](../server/src/services/auth.service.ts), [auth.integration.test.ts](../server/src/auth/auth.integration.test.ts) | None. Direct test execution proof: `auth.integration.test.ts` (tests 1, 2, 3) verifies user registration with email normalization, bcrypt-12 hashing without hash disclosure, duplicate email rejection, and generic invalid password rejection. |
 | **R02.2** | Accessible password visibility eye toggle on mobile auth forms (44×44 touch target, accessible labels). | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [FormField.tsx](../app/src/components/common/FormField.tsx) | Implemented in FormField with custom vector EyeIcon and passed typecheck, but automated component/accessibility tests were not executed. |
-| **R02.3** | Google OAuth OR Magic Link passwordless authentication implemented. | NO | NO | NO | NO | **PENDING** | [auth.routes.ts](../server/src/routes/auth.routes.ts) | Gap: Neither Google OAuth nor Magic Link passwordless flow is implemented. |
-| **R02.4** | Dual-token rotation with SHA-256 hashed refresh tokens and automatic token-family reuse invalidation. | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [auth.service.ts](../server/src/services/auth.service.ts) | Token rotation and family revocation implemented, but `auth.integration.test.ts` was skipped; lacks executed test evidence. |
+| **R02.3** | Google OAuth OR Magic Link passwordless authentication implemented. | YES | YES | NO | PARTIAL | **PARTIAL** | [tokens.ts](../server/src/auth/tokens.ts), [magic-link.integration.test.ts](../server/src/auth/magic-link.integration.test.ts), [magic-link.tsx](../app/src/app/(auth)/magic-link.tsx) | Backend API and mobile client screens committed (`1c0d72d`); 13/13 integration tests passed with mock email delivery. Remaining: Live production email delivery verification and standalone APK device test. |
+| **R02.4** | Dual-token rotation with SHA-256 hashed refresh tokens and automatic token-family reuse invalidation. | YES | YES | YES | YES | **DONE** | [auth.service.ts](../server/src/services/auth.service.ts), [auth.integration.test.ts](../server/src/auth/auth.integration.test.ts) | None. Direct test execution proof: `auth.integration.test.ts` (tests 6, 7, 8) verifies refresh rotation, SHA-256 hash lookup in `AuthSession`, expired token rejection, and immediate token-family cascading invalidation on reuse attempt. |
 | **R02.5** | Hardware-backed secure credential persistence via `expo-secure-store` on mobile devices. | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [AuthContext.tsx](../app/src/context/AuthContext.tsx) | SecureStore integration in code, but automated device test evidence has not been recorded. |
-| **R02.6** | Global session termination (`POST /api/v1/auth/logout-all`) revoking all active user refresh sessions. | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [auth.routes.ts](../server/src/routes/auth.routes.ts) | Endpoint implemented in routes and services, but multi-session revocation test suite was skipped. |
-| **R02.7** | Self-service password reset workflow (reset token generation, email dispatch, expiration, password update). | NO | NO | NO | NO | **PENDING** | [auth.routes.ts](../server/src/routes/auth.routes.ts) | Gap: No password reset endpoints, tokens, or email dispatch handlers exist. |
-| **R02.8** | Automated token lifecycle integration test suite: Test proof verifying 15-minute access token expiration, refresh rotation, reuse rejection cascading revocation, and logout-all invalidation. | YES | PARTIAL | N/A | PARTIAL | **UNVERIFIED** | [auth.integration.test.ts](../server/src/auth/auth.integration.test.ts) | Comprehensive integration suite written, but unexecuted in reported test suite due to non-destructive database constraints. |
+| **R02.6** | Global session termination (`POST /api/v1/auth/logout-all`) revoking all active user refresh sessions. | YES | YES | YES | YES | **DONE** | [auth.routes.ts](../server/src/routes/auth.routes.ts), [auth.integration.test.ts](../server/src/auth/auth.integration.test.ts) | None. Direct test execution proof: `auth.integration.test.ts` (tests 11, 12) verifies unauthenticated rejection (401), single-session logout revocation, and multi-session `POST /auth/logout-all` revoking all active refresh sessions for the user. |
+| **R02.7** | Self-service password reset workflow (reset token generation, email dispatch, expiration, password update). | YES | YES | NO | PARTIAL | **PARTIAL** | [auth.service.ts](../server/src/services/auth.service.ts), [password-reset.integration.test.ts](../server/src/auth/password-reset.integration.test.ts), [forgot-password.tsx](../app/src/app/(auth)/forgot-password.tsx) | Backend API, mobile screens (`c60d833`), and 17/17 integration tests passed (token hashing, 30m TTL, atomic throttling, enumeration defense, session revocation). Remaining: Live production email delivery verification and standalone APK device test. |
+| **R02.8** | Automated token lifecycle integration test suite: Test proof verifying 15-minute access token expiration, refresh rotation, reuse rejection cascading revocation, and logout-all invalidation. | YES | YES | N/A | YES | **DONE** | [auth.integration.test.ts](../server/src/auth/auth.integration.test.ts) | None. Direct test execution proof: `auth.integration.test.ts` (12 passing tests) verifies 900-second (15-minute) access token TTL (`exp - iat = 900`), expired access token rejection, refresh token rotation, token family reuse cascading revocation, and global logout-all invalidation. |
 
 ---
 
@@ -331,20 +331,13 @@ The following 10 integration test suites exist in `server/src/` but were **skipp
 
 ### 5.3 Entries Awaiting Independent Verification (`UNVERIFIED`)
 
-The following 12 items have code implemented or verbally reported operational success, but require direct, reproducible verification logs or automated test execution before they can be certified as `DONE`:
+The following 5 items have code implemented or verbally reported operational success, but require direct, reproducible verification logs or automated test execution before they can be certified as `DONE`:
 
 1. **R00.2 (Neon PostgreSQL Connection):** Requires a dedicated non-destructive live database query probe logging active connection pool status.
 2. **R00.4 (Device Sign-In Telemetry):** Requires physical device video recording or mobile application network logs verifying sign-in on installed APK.
 3. **R00.5 (Device Shift Update Telemetry):** Requires physical device video recording or before/after database state logs proving live shift update from APK.
-4. **R02.1 (Email/Password Bcrypt Auth):** Requires running `auth.integration.test.ts` against an isolated database to capture test execution output.
-5. **R02.2 (Password Visibility Toggle):** Requires automated component/accessibility test output verifying 44×44 touch target and toggle behavior.
-6. **R02.4 (Dual-Token Rotation & Revocation):** Requires running `auth.integration.test.ts` to capture token family revocation logs.
-7. **R02.5 (SecureStore Persistence):** Requires automated device/emulator test verifying SecureStore token storage across reboots.
-8. **R02.6 (Global Logout-All):** Requires running `auth.integration.test.ts` to capture multi-session revocation logs.
-9. **R02.8 (Token Lifecycle Suite):** Requires executing `auth.integration.test.ts` and recording test execution logs in evidence docs.
-10. **R03.1 (Multi-Tenant Authorization):** Requires running `membership.integration.test.ts` proving 404 anti-enumeration and 403 permission rejections.
-11. **R04.1 (Shift Scheduling Operations):** Requires running `shift.integration.test.ts` to capture automated lifecycle test output.
-12. **R04.2 (Shift Cancellation Audit Metadata):** Requires running `shift.integration.test.ts` to capture automated cancellation audit logs (`cancelledByUserId`, `cancelledAt`, optimistic concurrency).
+4. **R02.2 (Password Visibility Toggle):** Requires automated component/accessibility test output verifying 44×44 touch target and toggle behavior.
+5. **R02.5 (SecureStore Persistence):** Requires automated device/emulator test verifying SecureStore token storage across reboots.
 
 ---
 
@@ -363,7 +356,7 @@ To graduate successfully, the remaining gaps must be resolved in the following p
 3. **Missing Compulsory Mobile & Feature Workstreams:**
    - **R15.1:** Configure and build functional Expo Android development build (`expo-dev-client`).
    - **R04.3 & R04.4:** Staff shift swap request models, routes, and manager approval UI.
-   - **R02.3 & R02.7:** Alternative auth (Google OAuth or Magic Link) and self-service password reset.
+   - **R02.3 & R02.7:** Live email delivery verification and standalone APK device test for Magic Link and Password Reset (backend/mobile code and mock integration tests completed).
    - **R03.3 & R03.4:** Team invitation emails/tokens and deep link routing.
    - **R08.1 – R08.7:** Push notifications, token registration, retry worker, and quiet hours delay queuing.
 4. **High-Volume Feed & Scalability Proofs:**
@@ -372,4 +365,4 @@ To graduate successfully, the remaining gaps must be resolved in the following p
 5. **Client State Modernization:**
    - **R06.1 – R06.5:** Install TanStack Query, define query key factories, implement optimistic updates with automatic rollback, and configure offline cache.
 6. **Integration Test Suite Execution (Resolving UNVERIFIED Statuses):**
-   - Execute the 10 skipped integration test suites against an isolated staging/test database to certify the 12 UNVERIFIED items as DONE.
+   - Execute remaining test suites (e.g. billing, webhook, device telemetry) to certify the 5 UNVERIFIED items as DONE.

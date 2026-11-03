@@ -55,6 +55,10 @@ const skipReason = authIntegrationSkipReason();
 describe('authentication API', { concurrency: false, skip: skipReason }, () => {
   before(async () => {
     if (skipReason) return;
+    const safetyCheck = authIntegrationSkipReason();
+    if (safetyCheck) {
+      throw new Error(`Safety guard rejected database connection: ${safetyCheck}`);
+    }
     server = app.listen(0);
     await new Promise<void>((resolve) => server.once('listening', resolve));
     baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/v1`;
@@ -136,6 +140,11 @@ describe('authentication API', { concurrency: false, skip: skipReason }, () => {
     assert.equal(response.status, 200);
     assert.equal(me.user?.id, body.user?.id);
     assert.equal(me.user?.passwordHash, undefined);
+
+    const decoded = jwt.decode(body.accessToken!) as { exp?: number; iat?: number; typ?: string };
+    assert.ok(decoded?.exp && decoded?.iat);
+    assert.equal(decoded.exp - decoded.iat, 900, 'Access token TTL must be exactly 900 seconds (15 minutes)');
+    assert.equal(decoded.typ, 'access');
   });
 
   it('rejects invalid and expired access tokens', async () => {
