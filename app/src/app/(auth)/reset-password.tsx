@@ -111,8 +111,8 @@ export default function ResetPasswordScreen() {
               </View>
               <Text style={styles.successTitle}>Password updated</Text>
               <Text style={styles.successText}>
-                Your password has been reset successfully and all existing sessions have been signed out.
-                Please sign in with your new password.
+                Your password has been reset successfully. Any active login sessions will expire shortly,
+                and new sign-ins must use your new password. Please sign in to continue.
               </Text>
               <ActionButton
                 label="Sign in"
