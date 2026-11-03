@@ -4,9 +4,11 @@ import { authenticate } from '../middleware/authenticate';
 import { validateRequest } from '../middleware/validateRequest';
 import {
   loginSchema,
-  refreshTokenSchema,
+  magicLinkConfirmSchema,
+  magicLinkRequestSchema,
   passwordResetConfirmSchema,
   passwordResetRequestSchema,
+  refreshTokenSchema,
   registerSchema,
 } from '../schemas/auth.schema';
 
@@ -27,6 +29,16 @@ router.post(
   '/password-reset/confirm',
   validateRequest({ body: passwordResetConfirmSchema }),
   authController.confirmPasswordReset
+);
+router.post(
+  '/magic-link/request',
+  validateRequest({ body: magicLinkRequestSchema }),
+  authController.requestMagicLink
+);
+router.post(
+  '/magic-link/confirm',
+  validateRequest({ body: magicLinkConfirmSchema }),
+  authController.confirmMagicLink
 );
 
 export default router;

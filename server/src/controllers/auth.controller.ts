@@ -67,6 +67,27 @@ export const authController = {
     }
   },
 
+  async requestMagicLink(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const clientBaseUrl = req.headers['x-forwarded-host']
+        ? `${req.protocol}://${req.headers['x-forwarded-host']}`
+        : undefined;
+      const result = await authService.requestMagicLink(req.body, clientBaseUrl);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+
+  async confirmMagicLink(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const result = await authService.confirmMagicLink(req.body);
+      res.status(200).json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+
   async me(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       res.status(200).json({ user: await authService.getSafeUser(req.auth!.userId) });

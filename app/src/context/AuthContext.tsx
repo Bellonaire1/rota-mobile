@@ -15,6 +15,7 @@ interface AuthContextValue {
   isLoading: boolean;
   isPersistenceAvailable: boolean;
   signIn(email: string, password: string): Promise<void>;
+  signInWithMagicLink(token: string): Promise<void>;
   register(email: string, name: string, password: string): Promise<void>;
   selectTeam(team: Team): Promise<void>;
   signOut(): Promise<void>;
@@ -158,6 +159,13 @@ export function AuthProvider({ children }: PropsWithChildren) {
     setSelectedTeam(null);
   }, [applyAuthResult]);
 
+  const signInWithMagicLink = useCallback(async (token: string) => {
+    const result = await authService.confirmMagicLink({ token });
+    await applyAuthResult(result);
+    if (persistenceAvailableRef.current) await SecureStore.setItemAsync('rota.last-user-id', result.user.id);
+    setSelectedTeam(null);
+  }, [applyAuthResult]);
+
   const register = useCallback(async (email: string, name: string, password: string) => {
     const result = await authService.register({ email, name, password });
     await applyAuthResult(result);
@@ -191,10 +199,11 @@ export function AuthProvider({ children }: PropsWithChildren) {
     isLoading,
     isPersistenceAvailable,
     signIn,
+    signInWithMagicLink,
     register,
     selectTeam,
     signOut,
-  }), [isLoading, isPersistenceAvailable, register, selectedTeam, selectTeam, signIn, signOut, user]);
+  }), [isLoading, isPersistenceAvailable, register, selectedTeam, selectTeam, signIn, signInWithMagicLink, signOut, user]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

@@ -57,6 +57,17 @@ export default function LoginScreen() {
             </View>
             {error ? <Text style={styles.error}>{error}</Text> : null}
             <ActionButton label="Sign in" onPress={submit} loading={loading} />
+            <View style={styles.dividerRow}>
+              <View style={styles.dividerLine} />
+              <Text style={styles.dividerText}>or</Text>
+              <View style={styles.dividerLine} />
+            </View>
+            <ActionButton
+              label="Sign in with email"
+              variant="secondary"
+              onPress={() => router.push('/(auth)/magic-link')}
+              disabled={loading}
+            />
           </View>
         </View>
         <View style={styles.switchRow}>
@@ -80,6 +91,9 @@ const styles = StyleSheet.create({
   forgotButton: { minHeight: 44, justifyContent: 'center' },
   forgotLink: { color: colors.primary, fontSize: typography.sizes.sm, fontWeight: '700' },
   error: { color: colors.error, fontSize: typography.sizes.sm, marginBottom: spacing.md },
+  dividerRow: { flexDirection: 'row', alignItems: 'center', marginVertical: spacing.md },
+  dividerLine: { flex: 1, height: 1, backgroundColor: colors.border },
+  dividerText: { color: colors.textSecondary, fontSize: typography.sizes.xs, paddingHorizontal: spacing.sm, textTransform: 'uppercase', fontWeight: '600' },
   switchRow: { flexDirection: 'row', justifyContent: 'center', gap: spacing.xs, marginTop: spacing.lg },
   switchText: { color: colors.textSecondary, fontSize: typography.sizes.sm },
   link: { color: colors.primary, fontSize: typography.sizes.sm, fontWeight: '700' },

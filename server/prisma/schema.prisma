@@ -98,6 +98,7 @@ model User {
   memberships  TeamMembership[]
   authSessions AuthSession[]
   passwordResetTokens PasswordResetToken[]
+  magicLinkTokens MagicLinkToken[]
   assignedShifts Shift[]         @relation("AssignedShifts")
   createdShifts  Shift[]         @relation("CreatedShifts")
   billingIdempotencyKeys BillingIdempotencyKey[]
@@ -135,6 +136,28 @@ model PasswordResetToken {
 }
 
 model PasswordResetRequest {
+  id        String   @id @default(uuid())
+  email     String
+  createdAt DateTime @default(now())
+
+  @@index([email, createdAt])
+}
+
+model MagicLinkToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+}
+
+model MagicLinkRequest {
   id        String   @id @default(uuid())
   email     String
   createdAt DateTime @default(now())

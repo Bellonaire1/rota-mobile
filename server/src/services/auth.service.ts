@@ -9,10 +9,14 @@ import {
   createRefreshToken,
   createPasswordResetToken,
   hashPasswordResetToken,
+  createMagicLinkToken,
+  hashMagicLinkToken,
   hashRefreshToken,
 } from '../auth/tokens';
 import {
   LoginInput,
+  MagicLinkConfirmInput,
+  MagicLinkRequestInput,
   PasswordResetConfirmInput,
   PasswordResetRequestInput,
   RegisterInput,
@@ -27,6 +31,11 @@ const GENERIC_RESET_REQUEST_MESSAGE =
   'If an account exists with that email, a password reset link has been sent.';
 const GENERIC_RESET_SUCCESS_MESSAGE =
   'Password has been reset successfully. Please log in with your new password.';
+const MAGIC_LINK_TOKEN_TTL_MS = 15 * 60 * 1000;
+const MAGIC_LINK_REQUEST_WINDOW_MS = 15 * 60 * 1000;
+const MAX_MAGIC_LINK_REQUESTS_PER_WINDOW = 3;
+const GENERIC_MAGIC_LINK_REQUEST_MESSAGE =
+  'If an account exists with that email, a sign-in link has been sent.';
 const DUMMY_PASSWORD_HASH =
   '$2b$12$mGX9iu2Lwu9a.7hjCNrC/OA9txTf6A5twVjoNx53i7w5oPte4iCJy';
 
@@ -405,6 +414,181 @@ export const authService = {
         error.code === 'P2034'
       ) {
         throw new AppError(400, 'Password reset token has already been used');
+      }
+      throw error;
+    }
+  },
+
+  async requestMagicLink(
+    input: MagicLinkRequestInput,
+    clientBaseUrl?: string
+  ): Promise<{ message: string }> {
+    // 1. Verify email delivery provider is configured and operational
+    try {
+      await emailService.verifyDeliveryAvailable();
+    } catch {
+      throw new AppError(500, 'Unable to send magic link email at this time');
+    }
+
+    // 2. Persistent database-backed atomic throttling across all emails (known and unknown)
+    const windowStart = new Date(Date.now() - MAGIC_LINK_REQUEST_WINDOW_MS);
+    try {
+      await prisma.$transaction(async (tx) => {
+        // Linearize concurrent requests for the same normalized email using an advisory lock
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${input.email}))`;
+
+        const recentRequestsCount = await tx.magicLinkRequest.count({
+          where: {
+            email: input.email,
+            createdAt: { gte: windowStart },
+          },
+        });
+
+        if (recentRequestsCount >= MAX_MAGIC_LINK_REQUESTS_PER_WINDOW) {
+          throw new AppError(429, 'Too many magic link requests. Please try again later.');
+        }
+
+        await tx.magicLinkRequest.create({
+          data: {
+            email: input.email,
+          },
+        });
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        (error.code === 'P2034' || error.code === 'P2002')
+      ) {
+        throw new AppError(429, 'Too many magic link requests. Please try again later.');
+      }
+      throw error;
+    }
+
+    // 3. User lookup - only send sign-in links to existing accounts
+    const user = await prisma.user.findUnique({
+      where: { email: input.email },
+    });
+
+    if (!user) {
+      // Constant-time dummy work to mitigate timing attacks
+      await bcrypt.compare(input.email, DUMMY_PASSWORD_HASH);
+      return { message: GENERIC_MAGIC_LINK_REQUEST_MESSAGE };
+    }
+
+    // 4. Generate secure token for existing user
+    const rawToken = createMagicLinkToken();
+    const tokenHash = hashMagicLinkToken(rawToken);
+    const expiresAt = new Date(Date.now() + MAGIC_LINK_TOKEN_TTL_MS);
+
+    const tokenRecord = await prisma.magicLinkToken.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        expiresAt,
+      },
+    });
+
+    try {
+      await emailService.sendMagicLinkEmail({
+        to: user.email,
+        token: rawToken,
+        clientBaseUrl,
+      });
+    } catch (error) {
+      // Clean up unused token so no orphaned, unreceived token lingers in DB
+      await prisma.magicLinkToken.delete({ where: { id: tokenRecord.id } }).catch(() => {});
+
+      // Alert internal monitoring
+      console.error(
+        `[AuthService] Magic link email dispatch failed for user ${user.id}:`,
+        error
+      );
+
+      // Return neutral conditional response to prevent external account enumeration
+      return { message: GENERIC_MAGIC_LINK_REQUEST_MESSAGE };
+    }
+
+    return { message: GENERIC_MAGIC_LINK_REQUEST_MESSAGE };
+  },
+
+  async confirmMagicLink(
+    input: MagicLinkConfirmInput
+  ): Promise<AuthResult> {
+    const tokenHash = hashMagicLinkToken(input.token);
+
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const tokenRecord = await tx.magicLinkToken.findUnique({
+          where: { tokenHash },
+        });
+
+        if (!tokenRecord) {
+          throw new AppError(400, 'Invalid or expired magic link token');
+        }
+
+        if (tokenRecord.usedAt) {
+          throw new AppError(400, 'Magic link token has already been used');
+        }
+
+        const now = new Date();
+        if (tokenRecord.expiresAt <= now) {
+          throw new AppError(400, 'Magic link token has expired');
+        }
+
+        const claim = await tx.magicLinkToken.updateMany({
+          where: {
+            id: tokenRecord.id,
+            usedAt: null,
+          },
+          data: {
+            usedAt: now,
+          },
+        });
+
+        if (claim.count !== 1) {
+          throw new AppError(400, 'Magic link token has already been used');
+        }
+
+        const user = await tx.user.findUnique({
+          where: { id: tokenRecord.userId },
+          select: safeUserSelect,
+        });
+
+        if (!user) {
+          throw new AppError(401, 'User account no longer exists');
+        }
+
+        // Create a new session for the authenticated user
+        const refreshToken = createRefreshToken();
+        const familyId = createFamilyId();
+        const expiresAt = new Date(
+          now.getTime() + env.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000
+        );
+
+        await tx.authSession.create({
+          data: {
+            userId: user.id,
+            tokenHash: hashRefreshToken(refreshToken),
+            familyId,
+            expiresAt,
+          },
+        });
+
+        return {
+          user,
+          accessToken: createAccessToken(user.id),
+          refreshToken,
+        };
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2034'
+      ) {
+        throw new AppError(400, 'Magic link token has already been used');
       }
       throw error;
     }

@@ -35,7 +35,17 @@ export const passwordResetConfirmSchema = z.object({
   password: passwordSchema,
 });
 
+export const magicLinkRequestSchema = z.object({
+  email: emailSchema,
+});
+
+export const magicLinkConfirmSchema = z.object({
+  token: z.string().trim().min(1, 'Magic link token is required'),
+});
+
 export type RegisterInput = z.infer<typeof registerSchema>;
 export type LoginInput = z.infer<typeof loginSchema>;
 export type PasswordResetRequestInput = z.infer<typeof passwordResetRequestSchema>;
 export type PasswordResetConfirmInput = z.infer<typeof passwordResetConfirmSchema>;
+export type MagicLinkRequestInput = z.infer<typeof magicLinkRequestSchema>;
+export type MagicLinkConfirmInput = z.infer<typeof magicLinkConfirmSchema>;

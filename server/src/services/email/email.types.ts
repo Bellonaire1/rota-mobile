@@ -22,3 +22,9 @@ export interface PasswordResetEmailOptions {
   resetToken: string;
   clientBaseUrl?: string;
 }
+
+export interface MagicLinkEmailOptions {
+  to: string;
+  token: string;
+  clientBaseUrl?: string;
+}

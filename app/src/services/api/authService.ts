@@ -29,6 +29,18 @@ export interface PasswordResetConfirmResponse {
   message: string;
 }
 
+export interface MagicLinkRequestInput {
+  email: string;
+}
+
+export interface MagicLinkRequestResponse {
+  message: string;
+}
+
+export interface MagicLinkConfirmInput {
+  token: string;
+}
+
 export const authService = {
   register(input: RegisterInput): Promise<AuthResult> {
     return apiClient.post<AuthResult>('/auth/register', input, { skipAuth: true });
@@ -85,6 +97,38 @@ export const authService = {
   confirmPasswordReset(input: PasswordResetConfirmInput): Promise<PasswordResetConfirmResponse> {
     return apiClient.post<PasswordResetConfirmResponse>(
       '/auth/password-reset/confirm',
+      input,
+      { skipAuth: true, allowRefresh: false }
+    );
+  },
+
+  /**
+   * Request passwordless magic link email.
+   * HTTP Method: POST
+   * Path: /auth/magic-link/request
+   * Purpose: Sends a passwordless sign-in email with secure token to the user if an account exists.
+   * Authentication: Public (skipAuth=true, allowRefresh=false)
+   * Request Body: { email: string }
+   */
+  requestMagicLink(input: MagicLinkRequestInput): Promise<MagicLinkRequestResponse> {
+    return apiClient.post<MagicLinkRequestResponse>(
+      '/auth/magic-link/request',
+      input,
+      { skipAuth: true, allowRefresh: false }
+    );
+  },
+
+  /**
+   * Confirm magic link sign-in with token.
+   * HTTP Method: POST
+   * Path: /auth/magic-link/confirm
+   * Purpose: Validates and atomically consumes a magic-link token, issuing a new session and JWT token pair.
+   * Authentication: Public (skipAuth=true, allowRefresh=false)
+   * Request Body: { token: string }
+   */
+  confirmMagicLink(input: MagicLinkConfirmInput): Promise<AuthResult> {
+    return apiClient.post<AuthResult>(
+      '/auth/magic-link/confirm',
       input,
       { skipAuth: true, allowRefresh: false }
     );

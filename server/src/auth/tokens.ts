@@ -16,6 +16,12 @@ export const createPasswordResetToken = (): string =>
 export const hashPasswordResetToken = (token: string): string =>
   createHash('sha256').update(token).digest('hex');
 
+export const createMagicLinkToken = (): string =>
+  randomBytes(32).toString('hex');
+
+export const hashMagicLinkToken = (token: string): string =>
+  createHash('sha256').update(token).digest('hex');
+
 export const createRefreshToken = (): string =>
   randomBytes(48).toString('base64url');
 
