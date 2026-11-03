@@ -1,4 +1,4 @@
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -58,20 +58,42 @@ export default function SwapRequestScreen() {
   const [pagination, setPagination] = useState({ page: 1, totalPages: 1 });
   const pageRef = useRef(1);
 
+  const currentTeamIdRef = useRef<string | null>(selectedTeam?.id ?? null);
+  const requestGenerationRef = useRef(0);
+
+  // Team-switching safety: clear stale shifts and reset selections immediately when selectedTeam changes
+  useEffect(() => {
+    currentTeamIdRef.current = selectedTeam?.id ?? null;
+    requestGenerationRef.current += 1;
+    setShifts([]);
+    setSelectedSourceId(params.sourceShiftId || '');
+    setSelectedTargetId('');
+    setPagination({ page: 1, totalPages: 1 });
+    pageRef.current = 1;
+    setError(null);
+  }, [params.sourceShiftId, selectedTeam?.id]);
+
   const loadShifts = useCallback(
     async (reset = true) => {
-      if (!selectedTeam) return;
+      const teamId = selectedTeam?.id;
+      if (!teamId) return;
+      const generation = requestGenerationRef.current;
+
       if (reset) setLoading(true);
       else setLoadingMore(true);
       setError(null);
 
       try {
         const page = reset ? 1 : pageRef.current + 1;
-        const response = await shiftService.list(selectedTeam.id, {
+        const response = await shiftService.list(teamId, {
           page,
           limit: 30,
           status: 'SCHEDULED',
         });
+
+        if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
+          return;
+        }
 
         setShifts((current) =>
           reset ? response.shifts : [...current, ...response.shifts]
@@ -82,23 +104,32 @@ export default function SwapRequestScreen() {
           totalPages: response.pagination.totalPages,
         });
       } catch (err) {
-        setError(
-          err instanceof ApiError
-            ? err.message
-            : 'Unable to load scheduled shifts.'
-        );
+        if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+          setError(
+            err instanceof ApiError
+              ? err.message
+              : 'Unable to load scheduled shifts.'
+          );
+        }
       } finally {
-        setLoading(false);
-        setRefreshing(false);
-        setLoadingMore(false);
+        if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+          setLoading(false);
+          setRefreshing(false);
+          setLoadingMore(false);
+        }
       }
     },
-    [selectedTeam]
+    [selectedTeam?.id]
   );
 
-  useEffect(() => {
-    loadShifts(true);
-  }, [loadShifts]);
+  // Focus refresh: reload shifts whenever screen regains focus
+  useFocusEffect(
+    useCallback(() => {
+      const teamId = selectedTeam?.id;
+      if (!teamId) return;
+      loadShifts(true);
+    }, [loadShifts, selectedTeam?.id])
+  );
 
   // Own scheduled shifts
   const myShifts = useMemo(
@@ -173,11 +204,11 @@ export default function SwapRequestScreen() {
         [
           {
             text: 'View Swaps',
-            onPress: () => router.replace('/(app)/shift-swaps' as any),
+            onPress: () => router.replace('/(app)/shift-swaps'),
           },
           {
             text: 'Back to Schedule',
-            onPress: () => router.replace('/(app)' as any),
+            onPress: () => router.replace('/(app)'),
           },
         ]
       );

@@ -1,4 +1,4 @@
-import { Redirect, useRouter } from 'expo-router';
+import { Redirect, useFocusEffect, useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -121,39 +121,69 @@ export default function DashboardScreen() {
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
-  const [pendingSwaps, setPendingSwaps] = useState<ShiftSwap[]>([]);
+  const [pendingSwapCount, setPendingSwapCount] = useState(0);
+  const [activeSwapShiftIds, setActiveSwapShiftIds] = useState<Set<string>>(new Set());
+
+  const currentTeamIdRef = useRef<string | null>(selectedTeam?.id ?? null);
+  const requestGenerationRef = useRef(0);
 
   const canManage = role === 'OWNER' || role === 'MANAGER';
   const hasMore = pagination.page < pagination.totalPages;
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time';
 
+  // Team-switching safety: clear stale team data immediately when selectedTeam changes
+  useEffect(() => {
+    currentTeamIdRef.current = selectedTeam?.id ?? null;
+    requestGenerationRef.current += 1;
+    setShifts([]);
+    setPendingSwapCount(0);
+    setActiveSwapShiftIds(new Set());
+    setMembers([]);
+    setRole(null);
+    setPagination({ page: 1, totalPages: 1 });
+    pageRef.current = 1;
+    setError(null);
+    setMemberError(null);
+  }, [selectedTeam?.id]);
+
   const loadPendingSwaps = useCallback(async () => {
-    if (!selectedTeam) return;
+    const teamId = selectedTeam?.id;
+    if (!teamId) return;
+    const generation = requestGenerationRef.current;
+
     try {
-      const response = await shiftSwapService.list(selectedTeam.id, { limit: 100 });
-      setPendingSwaps(
-        response.shiftSwaps.filter(
-          (s) => s.status === 'PENDING_PEER' || s.status === 'PENDING_MANAGER'
-        )
-      );
+      // Query backend status-filtered endpoints to get exact totals and active swap IDs
+      const [peerRes, mgrRes] = await Promise.all([
+        shiftSwapService.list(teamId, { status: 'PENDING_PEER', limit: 100 }),
+        shiftSwapService.list(teamId, { status: 'PENDING_MANAGER', limit: 100 }),
+      ]);
+
+      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
+        return;
+      }
+
+      setPendingSwapCount(peerRes.pagination.total + mgrRes.pagination.total);
+
+      const ids = new Set<string>();
+      peerRes.shiftSwaps.forEach((s) => {
+        ids.add(s.sourceShiftId);
+        ids.add(s.targetShiftId);
+      });
+      mgrRes.shiftSwaps.forEach((s) => {
+        ids.add(s.sourceShiftId);
+        ids.add(s.targetShiftId);
+      });
+      setActiveSwapShiftIds(ids);
     } catch {
       // Non-blocking for shift schedule
     }
-  }, [selectedTeam]);
-
-  const activeSwapShiftIds = useMemo(() => {
-    const ids = new Set<string>();
-    pendingSwaps.forEach((s) => {
-      ids.add(s.sourceShiftId);
-      ids.add(s.targetShiftId);
-    });
-    return ids;
-  }, [pendingSwaps]);
-
-  const pendingSwapCount = pendingSwaps.length;
+  }, [selectedTeam?.id]);
 
   const loadShifts = useCallback(async (reset = true) => {
-    if (!selectedTeam) return;
+    const teamId = selectedTeam?.id;
+    if (!teamId) return;
+    const generation = requestGenerationRef.current;
+
     if (filterDate && !dateFromInput(filterDate)) {
       setError('Use a valid filter date in YYYY-MM-DD format.');
       return;
@@ -161,45 +191,77 @@ export default function DashboardScreen() {
     if (reset) setLoading(true);
     else setLoadingMore(true);
     setError(null);
+
     try {
       const page = reset ? 1 : pageRef.current + 1;
       const fromDate = filterDate ? dateFromInput(filterDate) : null;
       const toDate = fromDate ? new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate() + 1) : null;
-      const response = await shiftService.list(selectedTeam.id, {
+      const response = await shiftService.list(teamId, {
         page,
         limit: 20,
         status: statusFilter === 'ALL' ? undefined : statusFilter,
         from: fromDate ? localOffsetIso(fromDate) : undefined,
         to: toDate ? localOffsetIso(toDate) : undefined,
       });
+
+      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
+        return;
+      }
+
       setShifts((current) => reset ? response.shifts : [...current, ...response.shifts]);
       pageRef.current = response.pagination.page;
       setPagination({ page: response.pagination.page, totalPages: response.pagination.totalPages });
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Unable to load the schedule.');
+      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+        setError(requestError instanceof ApiError ? requestError.message : 'Unable to load the schedule.');
+      }
     } finally {
-      setLoading(false);
-      setRefreshing(false);
-      setLoadingMore(false);
+      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+        setLoading(false);
+        setRefreshing(false);
+        setLoadingMore(false);
+      }
     }
-  }, [filterDate, selectedTeam, statusFilter]);
+  }, [filterDate, selectedTeam?.id, statusFilter]);
 
   const loadMembers = useCallback(async () => {
-    if (!selectedTeam || !user) return;
+    const teamId = selectedTeam?.id;
+    const userId = user?.id;
+    if (!teamId || !userId) return;
+    const generation = requestGenerationRef.current;
     setMemberError(null);
-    try {
-      const currentMembers = await teamService.listAllMembers(selectedTeam.id);
-      setMembers(currentMembers);
-      setRole(currentMembers.find((member) => member.userId === user.id)?.role ?? null);
-    } catch (requestError) {
-      setMemberError(requestError instanceof ApiError ? requestError.message : 'Unable to load team members.');
-      setRole(null);
-    }
-  }, [selectedTeam, user]);
 
-  useEffect(() => { loadShifts(true); }, [loadShifts]);
-  useEffect(() => { loadMembers(); }, [loadMembers]);
-  useEffect(() => { loadPendingSwaps(); }, [loadPendingSwaps]);
+    try {
+      const currentMembers = await teamService.listAllMembers(teamId);
+      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
+        return;
+      }
+      setMembers(currentMembers);
+      setRole(currentMembers.find((member) => member.userId === userId)?.role ?? null);
+    } catch (requestError) {
+      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+        setMemberError(requestError instanceof ApiError ? requestError.message : 'Unable to load team members.');
+        setRole(null);
+      }
+    }
+  }, [selectedTeam?.id, user?.id]);
+
+  // Focus refresh: reload schedule, swaps, and member role whenever screen regains focus
+  useFocusEffect(
+    useCallback(() => {
+      let isMounted = true;
+      const teamId = selectedTeam?.id;
+      if (!teamId) return;
+
+      loadShifts(true);
+      loadPendingSwaps();
+      loadMembers();
+
+      return () => {
+        isMounted = false;
+      };
+    }, [loadShifts, loadPendingSwaps, loadMembers, selectedTeam?.id])
+  );
 
   const openCreate = () => {
     setEditingShift(null);
@@ -301,7 +363,16 @@ export default function DashboardScreen() {
     <ScrollView
       style={styles.screen}
       contentContainerStyle={styles.content}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadShifts(true); }} tintColor={colors.primary} />}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={async () => {
+            setRefreshing(true);
+            await Promise.all([loadShifts(true), loadPendingSwaps(), loadMembers()]);
+          }}
+          tintColor={colors.primary}
+        />
+      }
     >
       <BrandHeader badge="WORKSPACE" title={selectedTeam.name} subtitle={`Schedule · ${role ? role.toLowerCase() : 'team member'}`} />
       <View style={styles.headerRow}>
@@ -315,7 +386,7 @@ export default function DashboardScreen() {
         <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/members')} style={styles.membersLink}>
           <Text style={styles.membersLinkText}>View team members →</Text>
         </Pressable>
-        <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/shift-swaps' as any)} style={styles.swapsLink}>
+        <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/shift-swaps')} style={styles.swapsLink}>
           <Text style={styles.swapsLinkText}>Shift swaps {pendingSwapCount > 0 ? `(${pendingSwapCount})` : ''} →</Text>
         </Pressable>
       </View>
@@ -377,7 +448,7 @@ export default function DashboardScreen() {
                       variant="secondary"
                       onPress={() =>
                         router.push({
-                          pathname: '/(app)/swap-request' as any,
+                          pathname: '/(app)/swap-request',
                           params: { sourceShiftId: shift.id },
                         })
                       }

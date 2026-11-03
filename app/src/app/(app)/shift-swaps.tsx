@@ -1,4 +1,4 @@
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -30,6 +30,7 @@ import {
 } from '@/types/api';
 
 type TabType = 'INCOMING' | 'MY_REQUESTS' | 'MANAGER_REVIEW' | 'HISTORY';
+type HistoryFilter = 'ALL' | 'APPROVED' | 'REJECTED' | 'DECLINED' | 'CANCELLED';
 
 const shiftDisplay = (shift: ShiftSwapShiftSummary) => {
   const start = new Date(shift.startsAt);
@@ -92,8 +93,14 @@ export default function ShiftSwapsScreen() {
   const { user, selectedTeam } = useAuth();
 
   const [activeTab, setActiveTab] = useState<TabType>('INCOMING');
+  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('ALL');
   const [swaps, setSwaps] = useState<ShiftSwap[]>([]);
   const [role, setRole] = useState<TeamRole | null>(null);
+  const [tabCounts, setTabCounts] = useState({
+    incoming: 0,
+    myRequests: 0,
+    managerReview: 0,
+  });
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -101,6 +108,9 @@ export default function ShiftSwapsScreen() {
   const [error, setError] = useState<string | null>(null);
   const [pagination, setPagination] = useState({ page: 1, totalPages: 1 });
   const pageRef = useRef(1);
+
+  const currentTeamIdRef = useRef<string | null>(selectedTeam?.id ?? null);
+  const requestGenerationRef = useRef(0);
 
   // Reject Modal state
   const [rejectModalVisible, setRejectModalVisible] = useState(false);
@@ -111,103 +121,185 @@ export default function ShiftSwapsScreen() {
 
   const canManage = role === 'OWNER' || role === 'MANAGER';
 
-  // Load team role
+  // Team-switching safety: clear stale state immediately when selectedTeam changes
   useEffect(() => {
-    if (!selectedTeam || !user) return;
-    teamService
-      .listAllMembers(selectedTeam.id)
-      .then((members) => {
-        const myMember = members.find((m) => m.userId === user.id);
-        setRole(myMember?.role || null);
-      })
-      .catch(() => setRole(null));
-  }, [selectedTeam, user]);
+    currentTeamIdRef.current = selectedTeam?.id ?? null;
+    requestGenerationRef.current += 1;
+    setSwaps([]);
+    setRole(null);
+    setTabCounts({ incoming: 0, myRequests: 0, managerReview: 0 });
+    setPagination({ page: 1, totalPages: 1 });
+    pageRef.current = 1;
+    setError(null);
+  }, [selectedTeam?.id]);
 
+  const loadRole = useCallback(async () => {
+    const teamId = selectedTeam?.id;
+    const userId = user?.id;
+    if (!teamId || !userId) return;
+    const generation = requestGenerationRef.current;
+    try {
+      const members = await teamService.listAllMembers(teamId);
+      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
+      const myMember = members.find((m) => m.userId === userId);
+      setRole(myMember?.role || null);
+    } catch {
+      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+        setRole(null);
+      }
+    }
+  }, [selectedTeam?.id, user?.id]);
+
+  // Load exact tab badge counts from backend
+  const loadCounts = useCallback(async () => {
+    const teamId = selectedTeam?.id;
+    const userId = user?.id;
+    if (!teamId || !userId) return;
+    const generation = requestGenerationRef.current;
+
+    try {
+      const [peerRes, mgrRes] = await Promise.all([
+        shiftSwapService.list(teamId, { status: 'PENDING_PEER', limit: 100 }),
+        shiftSwapService.list(teamId, { status: 'PENDING_MANAGER', limit: 100 }),
+      ]);
+      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
+        return;
+      }
+
+      const incoming = peerRes.shiftSwaps.filter((s) => s.receivingUserId === userId).length;
+      const myPeer = peerRes.shiftSwaps.filter((s) => s.requestingUserId === userId).length;
+      const myMgr = mgrRes.shiftSwaps.filter((s) => s.requestingUserId === userId).length;
+      const myRequests = myPeer + myMgr;
+      const managerReview = mgrRes.pagination.total;
+
+      setTabCounts({ incoming, myRequests, managerReview });
+    } catch {
+      // Non-blocking
+    }
+  }, [selectedTeam?.id, user?.id]);
+
+  // Load swaps with server-side status filtering based on active tab
   const loadSwaps = useCallback(
     async (reset = true) => {
-      if (!selectedTeam) return;
-      if (reset) setLoading(true);
-      else setLoadingMore(true);
+      const teamId = selectedTeam?.id;
+      const userId = user?.id;
+      if (!teamId) return;
+      const generation = requestGenerationRef.current;
+
+      if (reset) {
+        setLoading(true);
+        pageRef.current = 1;
+      } else {
+        setLoadingMore(true);
+      }
       setError(null);
 
       try {
         const page = reset ? 1 : pageRef.current + 1;
-        const response = await shiftSwapService.list(selectedTeam.id, {
-          page,
-          limit: 30,
-        });
 
-        setSwaps((current) =>
-          reset ? response.shiftSwaps : [...current, ...response.shiftSwaps]
-        );
-        pageRef.current = response.pagination.page;
-        setPagination({
-          page: response.pagination.page,
-          totalPages: response.pagination.totalPages,
-        });
+        if (activeTab === 'MANAGER_REVIEW') {
+          const response = await shiftSwapService.list(teamId, {
+            page,
+            limit: 20,
+            status: 'PENDING_MANAGER',
+          });
+          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
+
+          setSwaps((current) => (reset ? response.shiftSwaps : [...current, ...response.shiftSwaps]));
+          pageRef.current = response.pagination.page;
+          setPagination({
+            page: response.pagination.page,
+            totalPages: response.pagination.totalPages,
+          });
+        } else if (activeTab === 'INCOMING') {
+          const response = await shiftSwapService.list(teamId, {
+            page,
+            limit: 30,
+            status: 'PENDING_PEER',
+          });
+          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
+
+          const incomingOnly = response.shiftSwaps.filter((s) => s.receivingUserId === userId);
+          setSwaps((current) => (reset ? incomingOnly : [...current, ...incomingOnly]));
+          pageRef.current = response.pagination.page;
+          setPagination({
+            page: response.pagination.page,
+            totalPages: response.pagination.totalPages,
+          });
+        } else if (activeTab === 'MY_REQUESTS') {
+          const [peerRes, mgrRes] = await Promise.all([
+            shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_PEER' }),
+            shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_MANAGER' }),
+          ]);
+          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
+
+          const myActive = [...peerRes.shiftSwaps, ...mgrRes.shiftSwaps].filter(
+            (s) => s.requestingUserId === userId
+          );
+          setSwaps((current) => (reset ? myActive : [...current, ...myActive]));
+          const maxTotalPages = Math.max(peerRes.pagination.totalPages, mgrRes.pagination.totalPages);
+          pageRef.current = page;
+          setPagination({
+            page,
+            totalPages: maxTotalPages,
+          });
+        } else {
+          // HISTORY tab
+          const statusParam = historyFilter === 'ALL' ? undefined : historyFilter;
+          const response = await shiftSwapService.list(teamId, {
+            page,
+            limit: 30,
+            status: statusParam,
+          });
+          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
+
+          const historyOnly =
+            historyFilter === 'ALL'
+              ? response.shiftSwaps.filter(
+                  (s) => !['PENDING_PEER', 'PENDING_MANAGER'].includes(s.status)
+                )
+              : response.shiftSwaps;
+
+          setSwaps((current) => (reset ? historyOnly : [...current, ...historyOnly]));
+          pageRef.current = response.pagination.page;
+          setPagination({
+            page: response.pagination.page,
+            totalPages: response.pagination.totalPages,
+          });
+        }
       } catch (err) {
-        setError(
-          err instanceof ApiError ? err.message : 'Unable to load shift swaps.'
-        );
+        if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+          setError(err instanceof ApiError ? err.message : 'Unable to load shift swaps.');
+        }
       } finally {
-        setLoading(false);
-        setRefreshing(false);
-        setLoadingMore(false);
+        if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
+          setLoading(false);
+          setRefreshing(false);
+          setLoadingMore(false);
+        }
       }
     },
-    [selectedTeam]
+    [activeTab, historyFilter, selectedTeam?.id, user?.id]
   );
 
+  // Reload swaps when activeTab or historyFilter changes
   useEffect(() => {
     loadSwaps(true);
   }, [loadSwaps]);
 
-  // Categorize swaps into tabs
-  const incomingSwaps = useMemo(
-    () =>
-      swaps.filter(
-        (s) => s.receivingUserId === user?.id && s.status === 'PENDING_PEER'
-      ),
-    [swaps, user]
+  // Focus refresh: reload role, counts, and active tab swaps on screen focus
+  useFocusEffect(
+    useCallback(() => {
+      const teamId = selectedTeam?.id;
+      if (!teamId) return;
+
+      loadRole();
+      loadCounts();
+      loadSwaps(true);
+    }, [loadRole, loadCounts, loadSwaps, selectedTeam?.id])
   );
 
-  const myRequests = useMemo(
-    () =>
-      swaps.filter(
-        (s) =>
-          s.requestingUserId === user?.id &&
-          (s.status === 'PENDING_PEER' || s.status === 'PENDING_MANAGER')
-      ),
-    [swaps, user]
-  );
-
-  const managerReviewSwaps = useMemo(
-    () => swaps.filter((s) => s.status === 'PENDING_MANAGER'),
-    [swaps]
-  );
-
-  const historySwaps = useMemo(
-    () =>
-      swaps.filter((s) =>
-        ['APPROVED', 'REJECTED', 'DECLINED', 'CANCELLED'].includes(s.status)
-      ),
-    [swaps]
-  );
-
-  const displayedSwaps = useMemo(() => {
-    switch (activeTab) {
-      case 'INCOMING':
-        return incomingSwaps;
-      case 'MY_REQUESTS':
-        return myRequests;
-      case 'MANAGER_REVIEW':
-        return managerReviewSwaps;
-      case 'HISTORY':
-        return historySwaps;
-      default:
-        return [];
-    }
-  }, [activeTab, incomingSwaps, myRequests, managerReviewSwaps, historySwaps]);
+  const displayedSwaps = swaps;
 
   // Peer Response handler (Accept / Decline)
   const handlePeerResponse = (swap: ShiftSwap, action: 'accept' | 'decline') => {
@@ -229,7 +321,7 @@ export default function ShiftSwapsScreen() {
           setError(null);
           try {
             await shiftSwapService.respond(selectedTeam.id, swap.id, { action });
-            await loadSwaps(true);
+            await Promise.all([loadSwaps(true), loadCounts()]);
           } catch (err) {
             const msg =
               err instanceof ApiError && err.statusCode === 409
@@ -238,7 +330,7 @@ export default function ShiftSwapsScreen() {
                 ? err.message
                 : 'Failed to respond to swap proposal.';
             setError(msg);
-            await loadSwaps(true);
+            await Promise.all([loadSwaps(true), loadCounts()]);
           } finally {
             setActionLoadingId(null);
           }
@@ -269,7 +361,7 @@ export default function ShiftSwapsScreen() {
                 'Swap Approved',
                 'The shift assignments have been updated in the schedule.'
               );
-              await loadSwaps(true);
+              await Promise.all([loadSwaps(true), loadCounts()]);
             } catch (err) {
               const msg =
                 err instanceof ApiError && err.statusCode === 409
@@ -278,7 +370,7 @@ export default function ShiftSwapsScreen() {
                   ? err.message
                   : 'Failed to approve swap.';
               setError(msg);
-              await loadSwaps(true);
+              await Promise.all([loadSwaps(true), loadCounts()]);
             } finally {
               setActionLoadingId(null);
             }
@@ -309,7 +401,7 @@ export default function ShiftSwapsScreen() {
         reason: rejectReason.trim() || undefined,
       });
       setRejectModalVisible(false);
-      await loadSwaps(true);
+      await Promise.all([loadSwaps(true), loadCounts()]);
     } catch (err) {
       setRejectError(
         err instanceof ApiError ? err.message : 'Failed to reject swap.'
@@ -336,7 +428,7 @@ export default function ShiftSwapsScreen() {
             setError(null);
             try {
               await shiftSwapService.cancel(selectedTeam.id, swap.id);
-              await loadSwaps(true);
+              await Promise.all([loadSwaps(true), loadCounts()]);
             } catch (err) {
               const msg =
                 err instanceof ApiError && err.statusCode === 409
@@ -345,7 +437,7 @@ export default function ShiftSwapsScreen() {
                   ? err.message
                   : 'Failed to cancel swap request.';
               setError(msg);
-              await loadSwaps(true);
+              await Promise.all([loadSwaps(true), loadCounts()]);
             } finally {
               setActionLoadingId(null);
             }
@@ -364,9 +456,9 @@ export default function ShiftSwapsScreen() {
       refreshControl={
         <RefreshControl
           refreshing={refreshing}
-          onRefresh={() => {
+          onRefresh={async () => {
             setRefreshing(true);
-            loadSwaps(true);
+            await Promise.all([loadSwaps(true), loadCounts(), loadRole()]);
           }}
           tintColor={colors.primary}
         />
@@ -389,7 +481,7 @@ export default function ShiftSwapsScreen() {
         <ActionButton
           size="small"
           label="+ Propose swap"
-          onPress={() => router.push('/(app)/swap-request' as any)}
+          onPress={() => router.push('/(app)/swap-request')}
           variant="secondary"
         />
       </View>
@@ -408,7 +500,7 @@ export default function ShiftSwapsScreen() {
               activeTab === 'INCOMING' && styles.tabTextActive,
             ]}
           >
-            Incoming {incomingSwaps.length > 0 ? `(${incomingSwaps.length})` : ''}
+            Incoming {tabCounts.incoming > 0 ? `(${tabCounts.incoming})` : ''}
           </Text>
         </Pressable>
 
@@ -424,7 +516,7 @@ export default function ShiftSwapsScreen() {
               activeTab === 'MY_REQUESTS' && styles.tabTextActive,
             ]}
           >
-            My Requests {myRequests.length > 0 ? `(${myRequests.length})` : ''}
+            My Requests {tabCounts.myRequests > 0 ? `(${tabCounts.myRequests})` : ''}
           </Text>
         </Pressable>
 
@@ -444,7 +536,7 @@ export default function ShiftSwapsScreen() {
                 activeTab === 'MANAGER_REVIEW' && styles.tabTextActive,
               ]}
             >
-              Review {managerReviewSwaps.length > 0 ? `(${managerReviewSwaps.length})` : ''}
+              Review {tabCounts.managerReview > 0 ? `(${tabCounts.managerReview})` : ''}
             </Text>
           </Pressable>
         ) : null}
@@ -466,6 +558,41 @@ export default function ShiftSwapsScreen() {
         </Pressable>
       </View>
 
+      {/* History Sub-Filter Chips */}
+      {activeTab === 'HISTORY' ? (
+        <View style={styles.historyFilterRow}>
+          {(['ALL', 'APPROVED', 'REJECTED', 'DECLINED', 'CANCELLED'] as HistoryFilter[]).map((hf) => (
+            <Pressable
+              key={hf}
+              accessibilityRole="button"
+              accessibilityState={{ selected: historyFilter === hf }}
+              onPress={() => setHistoryFilter(hf)}
+              style={[
+                styles.historyFilterChip,
+                historyFilter === hf && styles.historyFilterChipActive,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.historyFilterText,
+                  historyFilter === hf && styles.historyFilterTextActive,
+                ]}
+              >
+                {hf === 'ALL'
+                  ? 'All'
+                  : hf === 'APPROVED'
+                  ? 'Approved'
+                  : hf === 'REJECTED'
+                  ? 'Rejected'
+                  : hf === 'DECLINED'
+                  ? 'Declined'
+                  : 'Cancelled'}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
+
       {error ? <Text style={styles.errorBanner}>{error}</Text> : null}
 
       {/* Swaps List */}
@@ -485,7 +612,7 @@ export default function ShiftSwapsScreen() {
           </Text>
           <ActionButton
             label="Propose a shift swap"
-            onPress={() => router.push('/(app)/swap-request' as any)}
+            onPress={() => router.push('/(app)/swap-request')}
             variant="secondary"
           />
         </View>
@@ -733,6 +860,32 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   tabTextActive: { color: '#FFFFFF' },
+  historyFilterRow: {
+    flexDirection: 'row',
+    gap: spacing.xs,
+    marginBottom: spacing.md,
+  },
+  historyFilterChip: {
+    flex: 1,
+    borderRadius: 8,
+    paddingVertical: spacing.xs,
+    alignItems: 'center',
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  historyFilterChipActive: {
+    backgroundColor: colors.primary,
+    borderColor: colors.primary,
+  },
+  historyFilterText: {
+    color: colors.textSecondary,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  historyFilterTextActive: {
+    color: '#FFFFFF',
+  },
   errorBanner: {
     color: colors.error,
     backgroundColor: '#FEF2F2',
