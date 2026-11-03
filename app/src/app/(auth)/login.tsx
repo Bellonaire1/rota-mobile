@@ -44,6 +44,17 @@ export default function LoginScreen() {
           <View style={styles.form}>
             <FormField label="Email" value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" autoComplete="email" placeholder="you@example.com" />
             <FormField label="Password" value={password} onChangeText={setPassword} secureTextEntry autoComplete="password" placeholder="Your password" />
+            <View style={styles.forgotRow}>
+              <Pressable
+                onPress={() => router.push('/(auth)/forgot-password')}
+                accessibilityRole="button"
+                accessibilityLabel="Forgot password?"
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                style={styles.forgotButton}
+              >
+                <Text style={styles.forgotLink}>Forgot password?</Text>
+              </Pressable>
+            </View>
             {error ? <Text style={styles.error}>{error}</Text> : null}
             <ActionButton label="Sign in" onPress={submit} loading={loading} />
           </View>
@@ -65,6 +76,9 @@ const styles = StyleSheet.create({
   title: { color: colors.text, fontSize: typography.sizes.xl, fontWeight: '800', marginTop: spacing.sm },
   subtitle: { color: colors.textSecondary, fontSize: typography.sizes.sm, lineHeight: 21, marginTop: spacing.xs },
   form: { marginTop: spacing.xl },
+  forgotRow: { alignItems: 'flex-end', marginBottom: spacing.sm },
+  forgotButton: { minHeight: 44, justifyContent: 'center' },
+  forgotLink: { color: colors.primary, fontSize: typography.sizes.sm, fontWeight: '700' },
   error: { color: colors.error, fontSize: typography.sizes.sm, marginBottom: spacing.md },
   switchRow: { flexDirection: 'row', justifyContent: 'center', gap: spacing.xs, marginTop: spacing.lg },
   switchText: { color: colors.textSecondary, fontSize: typography.sizes.sm },
