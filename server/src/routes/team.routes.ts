@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { shiftController } from '../controllers/shift.controller';
+import { shiftSwapController } from '../controllers/shift-swap.controller';
 import { teamController } from '../controllers/team.controller';
 import { billingController } from '../controllers/billing.controller';
 import { authenticate } from '../middleware/authenticate';
@@ -24,6 +25,14 @@ import {
   shiftTargetParamsSchema,
   updateShiftSchema,
 } from '../schemas/shift.schema';
+import {
+  createShiftSwapSchema,
+  respondShiftSwapSchema,
+  reviewShiftSwapSchema,
+  shiftSwapListQuerySchema,
+  shiftSwapParamsSchema,
+  shiftSwapTargetParamsSchema,
+} from '../schemas/shift-swap.schema';
 
 const router = Router();
 
@@ -77,6 +86,36 @@ router.post(
   validateRequest({ params: shiftTargetParamsSchema, body: cancelShiftSchema }),
   requireTeamPermission(Permission.MANAGE_OPERATIONAL_WORK),
   shiftController.cancel
+);
+router.post(
+  '/:teamId/shift-swaps',
+  validateRequest({ params: shiftSwapParamsSchema, body: createShiftSwapSchema }),
+  requireTeamMembership,
+  shiftSwapController.create
+);
+router.get(
+  '/:teamId/shift-swaps',
+  validateRequest({ params: shiftSwapParamsSchema, query: shiftSwapListQuerySchema }),
+  requireTeamMembership,
+  shiftSwapController.list
+);
+router.post(
+  '/:teamId/shift-swaps/:swapId/respond',
+  validateRequest({ params: shiftSwapTargetParamsSchema, body: respondShiftSwapSchema }),
+  requireTeamMembership,
+  shiftSwapController.respond
+);
+router.post(
+  '/:teamId/shift-swaps/:swapId/review',
+  validateRequest({ params: shiftSwapTargetParamsSchema, body: reviewShiftSwapSchema }),
+  requireTeamPermission(Permission.MANAGE_OPERATIONAL_WORK),
+  shiftSwapController.review
+);
+router.post(
+  '/:teamId/shift-swaps/:swapId/cancel',
+  validateRequest({ params: shiftSwapTargetParamsSchema }),
+  requireTeamMembership,
+  shiftSwapController.cancel
 );
 router.get(
   '/:teamId/billing',

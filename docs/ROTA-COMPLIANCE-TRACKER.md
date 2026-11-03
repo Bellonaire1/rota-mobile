@@ -5,9 +5,9 @@
 > **Repository:** `C:\Users\USER\rota-mobile`<br>
 > **Last Updated:** November 2026<br>
 > **Audit Status:** Rigorous Independent Verification & Baseline Commit (Task R01.5)<br>
-> **Compulsory Acceptance Requirements (99 total):** 22 DONE | 5 UNVERIFIED | 30 PARTIAL | 42 PENDING<br>
+> **Compulsory Acceptance Requirements (99 total):** 22 DONE | 5 UNVERIFIED | 32 PARTIAL | 40 PENDING<br>
 > **Optional Post-Graduation Milestones (1 total):** 0 DONE | 0 UNVERIFIED | 0 PARTIAL | 1 PENDING<br>
-> **Grand Total Tracked Items:** 100 Subrequirements (22 DONE, 5 UNVERIFIED, 30 PARTIAL, 43 PENDING)
+> **Grand Total Tracked Items:** 100 Subrequirements (22 DONE, 5 UNVERIFIED, 32 PARTIAL, 41 PENDING)
 
 ---
 
@@ -110,8 +110,8 @@ Before evaluating the individual requirements, the following ten technical discr
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
 | **R04.1** | Manager/Owner shift creation, scheduling, date filtering, and reassignment. | YES | YES | YES | YES | **DONE** | [shift.service.ts](../server/src/services/shift.service.ts), [shift.integration.test.ts](../server/src/teams/shift.integration.test.ts) | None. Direct test execution proof: `shift.integration.test.ts` (test 7) verifies shift creation, date range filtering (`from`/`to`), reassignment with conflict detection, and non-member rejection. |
 | **R04.2** | Shift cancellation audit metadata and RBAC: Shift cancellation records auditable actor (`cancelledByUserId`), timestamp (`cancelledAt`), optimistic concurrency check (`updatedAt`), and enforces manager/owner RBAC permissions (no cancellation reason field required by brief). | YES | YES | YES | YES | **DONE** | [shift.service.ts](../server/src/services/shift.service.ts), [shift.integration.test.ts](../server/src/teams/shift.integration.test.ts) | None. Direct test execution proof: `shift.integration.test.ts` (test 8) verifies `cancelledByUserId`, `cancelledAt` persistence, owner/manager cancellation RBAC, staff 403 denial, optimistic concurrency, and stale-update rejection (409). |
-| **R04.3** | Staff peer-to-peer shift swap request submission workflow. | NO | NO | NO | NO | **PENDING** | [schema.prisma](../server/prisma/schema.prisma) | Gap: No `ShiftSwapRequest` table, route, or UI screen exists. |
-| **R04.4** | Manager review, conflict detection, approval, and rejection workflow for shift swap requests. | NO | NO | NO | NO | **PENDING** | [shift.controller.ts](../server/src/controllers/shift.controller.ts) | Gap: Manager swap approval and conflict detection unbuilt. |
+| **R04.3** | Staff peer-to-peer shift swap request submission workflow. | YES | YES | NO | YES | **PARTIAL** | [shift-swap.service.ts](../server/src/services/shift-swap.service.ts), [shift-swap.integration.test.ts](../server/src/teams/shift-swap.integration.test.ts) | Backend API endpoints (`POST /shift-swaps`, `GET /shift-swaps`, `POST /:swapId/respond`, `POST /:swapId/cancel`), Prisma models, and atomic serializable concurrency tests verified. Gap: Mobile peer swap request submission and recipient response screens remaining. |
+| **R04.4** | Manager review, conflict detection, approval, and rejection workflow for shift swap requests. | YES | YES | NO | YES | **PARTIAL** | [shift-swap.service.ts](../server/src/services/shift-swap.service.ts), [shift-swap.integration.test.ts](../server/src/teams/shift-swap.integration.test.ts) | Manager review endpoint (`POST /:swapId/review`), schedule overlap detection, atomic shift exchange, serializable concurrency control, and audit metadata verified in `shift-swap.integration.test.ts`. Gap: Mobile manager review/approval UI and live deployment remaining. |
 
 ---
 
@@ -355,7 +355,7 @@ To graduate successfully, the remaining gaps must be resolved in the following p
    - **R12.2:** Build and execute real two-database PostgreSQL sharding simulation script.
 3. **Missing Compulsory Mobile & Feature Workstreams:**
    - **R15.1:** Configure and build functional Expo Android development build (`expo-dev-client`).
-   - **R04.3 & R04.4:** Staff shift swap request models, routes, and manager approval UI.
+   - **R04.3 & R04.4:** Staff shift swap mobile screens (peer swap request submission, peer response, and manager approval/review UI; backend and integration tests completed).
    - **R02.3 & R02.7:** Live email delivery verification and standalone APK device test for Magic Link and Password Reset (backend/mobile code and mock integration tests completed).
    - **R03.3 & R03.4:** Team invitation emails/tokens and deep link routing.
    - **R08.1 – R08.7:** Push notifications, token registration, retry worker, and quiet hours delay queuing.
