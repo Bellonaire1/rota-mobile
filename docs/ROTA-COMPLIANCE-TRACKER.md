@@ -5,9 +5,9 @@
 > **Repository:** `C:\Users\USER\rota-mobile`<br>
 > **Last Updated:** November 2026<br>
 > **Audit Status:** Rigorous Independent Verification & Baseline Commit (Task R01.5)<br>
-> **Compulsory Acceptance Requirements (99 total):** 14 DONE | 12 UNVERIFIED | 29 PARTIAL | 44 PENDING<br>
+> **Compulsory Acceptance Requirements (99 total):** 18 DONE | 9 UNVERIFIED | 28 PARTIAL | 44 PENDING<br>
 > **Optional Post-Graduation Milestones (1 total):** 0 DONE | 0 UNVERIFIED | 0 PARTIAL | 1 PENDING<br>
-> **Grand Total Tracked Items:** 100 Subrequirements (14 DONE, 12 UNVERIFIED, 29 PARTIAL, 45 PENDING)
+> **Grand Total Tracked Items:** 100 Subrequirements (18 DONE, 9 UNVERIFIED, 28 PARTIAL, 45 PENDING)
 
 ---
 
@@ -96,11 +96,11 @@ Before evaluating the individual requirements, the following ten technical discr
 
 | ID | Exact Acceptance Criterion | Impl | Test | Dep | Evid | Status | Evidence Link / File | Gap & Next Action |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
-| **R03.1** | Multi-tenant data isolation: Every team query strictly validates `TeamMembership` and scopes by `teamId`. Missing team membership returns HTTP 404 (preventing tenant enumeration); insufficient permissions returns HTTP 403. | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [teamAuthorization.ts](../server/src/middleware/teamAuthorization.ts) | Middleware returns 404 for missing membership and 403 for permission denial, but database integration tests were skipped. |
+| **R03.1** | Multi-tenant data isolation: Every team query strictly validates `TeamMembership` and scopes by `teamId`. Missing team membership returns HTTP 404 (preventing tenant enumeration); insufficient permissions returns HTTP 403. | YES | YES | YES | YES | **DONE** | [teamAuthorization.ts](../server/src/middleware/teamAuthorization.ts), [team.integration.test.ts](../server/src/teams/team.integration.test.ts) | None. Direct test execution proof: `team.integration.test.ts` (test 5) and `membership.integration.test.ts` (test 3) verify 404 on missing/foreign teams, 403 on permission denial, and cross-team listing isolation. |
 | **R03.2** | Centralized Role-Based Access Control matrix (`OWNER`, `MANAGER`, `STAFF`) scoped to `TeamMembership`. | YES | YES | YES | YES | **DONE** | [permissions.ts](../server/src/rbac/permissions.ts), [permissions.test.ts](../server/src/rbac/permissions.test.ts) | None. Direct test execution proof: 7 passing unit tests in `permissions.test.ts`. |
 | **R03.3** | Team member invitations via email and secure invite links. | NO | NO | NO | NO | **PENDING** | [team.routes.ts](../server/src/routes/team.routes.ts) | Gap: Team members are added directly by User ID. Invitation tokens and email invites unbuilt. |
 | **R03.4** | Deep link routing into the mobile application to accept team invitations directly. | NO | NO | NO | NO | **PENDING** | [app _layout.tsx](../app/src/app/_layout.tsx) | Gap: Deep link invitation handler unbuilt. |
-| **R03.5** | Automated authorization denial test proof: Negative test suite asserting staff role cannot create, edit, or cancel shifts (HTTP 403), cannot access billing endpoints (HTTP 403), and cannot read or write data of a foreign team (HTTP 404/403). | PARTIAL | PARTIAL | YES | PARTIAL | **PARTIAL** | [permissions.test.ts](../server/src/rbac/permissions.test.ts) | Unit tests prove permission matrix denial, but route-level integration tests covering cross-team tenant denial were skipped. |
+| **R03.5** | Automated authorization denial test proof: Negative test suite asserting staff role cannot create, edit, or cancel shifts (HTTP 403), cannot access billing endpoints (HTTP 403), and cannot read or write data of a foreign team (HTTP 404/403). | YES | YES | YES | YES | **DONE** | [shift.integration.test.ts](../server/src/teams/shift.integration.test.ts), [permissions.test.ts](../server/src/rbac/permissions.test.ts) | None. Direct test execution proof: `shift.integration.test.ts` (test 6) asserts staff 403 on shift create/update/cancel, 403 on billing/checkout, and 404 on foreign-team read/write across all operational endpoints. |
 
 ---
 
@@ -108,8 +108,8 @@ Before evaluating the individual requirements, the following ten technical discr
 
 | ID | Exact Acceptance Criterion | Impl | Test | Dep | Evid | Status | Evidence Link / File | Gap & Next Action |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
-| **R04.1** | Manager/Owner shift creation, scheduling, date filtering, and reassignment. | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [shift.controller.ts](../server/src/controllers/shift.controller.ts) | Implemented in service/controller, but `shift.integration.test.ts` was skipped; lacks executed test evidence. |
-| **R04.2** | Shift cancellation audit metadata and RBAC: Shift cancellation records auditable actor (`cancelledByUserId`), timestamp (`cancelledAt`), optimistic concurrency check (`updatedAt`), and enforces manager/owner RBAC permissions (no cancellation reason field required by brief). | YES | PARTIAL | YES | PARTIAL | **UNVERIFIED** | [shift.service.ts](../server/src/services/shift.service.ts), [schema.prisma](../server/prisma/schema.prisma) | Cancellation audit metadata and RBAC check are implemented in `shift.service.ts`, but integration tests were skipped. |
+| **R04.1** | Manager/Owner shift creation, scheduling, date filtering, and reassignment. | YES | YES | YES | YES | **DONE** | [shift.service.ts](../server/src/services/shift.service.ts), [shift.integration.test.ts](../server/src/teams/shift.integration.test.ts) | None. Direct test execution proof: `shift.integration.test.ts` (test 7) verifies shift creation, date range filtering (`from`/`to`), reassignment with conflict detection, and non-member rejection. |
+| **R04.2** | Shift cancellation audit metadata and RBAC: Shift cancellation records auditable actor (`cancelledByUserId`), timestamp (`cancelledAt`), optimistic concurrency check (`updatedAt`), and enforces manager/owner RBAC permissions (no cancellation reason field required by brief). | YES | YES | YES | YES | **DONE** | [shift.service.ts](../server/src/services/shift.service.ts), [shift.integration.test.ts](../server/src/teams/shift.integration.test.ts) | None. Direct test execution proof: `shift.integration.test.ts` (test 8) verifies `cancelledByUserId`, `cancelledAt` persistence, owner/manager cancellation RBAC, staff 403 denial, optimistic concurrency, and stale-update rejection (409). |
 | **R04.3** | Staff peer-to-peer shift swap request submission workflow. | NO | NO | NO | NO | **PENDING** | [schema.prisma](../server/prisma/schema.prisma) | Gap: No `ShiftSwapRequest` table, route, or UI screen exists. |
 | **R04.4** | Manager review, conflict detection, approval, and rejection workflow for shift swap requests. | NO | NO | NO | NO | **PENDING** | [shift.controller.ts](../server/src/controllers/shift.controller.ts) | Gap: Manager swap approval and conflict detection unbuilt. |
 

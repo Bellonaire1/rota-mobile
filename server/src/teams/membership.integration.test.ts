@@ -4,6 +4,7 @@ import { AddressInfo } from 'node:net';
 import { after, before, describe, it } from 'node:test';
 import { app } from '../app';
 import { prisma } from '../database/prisma';
+import { authIntegrationSkipReason } from '../auth/auth-test-safety';
 
 interface AuthResponse {
   user?: { id: string };
@@ -66,20 +67,36 @@ const addMember = (teamId: string, auth: AuthResponse, userId: string, role?: st
     ...(role === undefined ? {} : { role }),
   });
 
-describe('team membership API', () => {
+const skipReason = authIntegrationSkipReason();
+
+describe('team membership API', { concurrency: false, skip: skipReason }, () => {
   before(async () => {
+    if (skipReason) return;
+    const safetyCheck = authIntegrationSkipReason();
+    if (safetyCheck) {
+      throw new Error(`Safety guard rejected database connection: ${safetyCheck}`);
+    }
     server = app.listen(0);
     await new Promise<void>((resolve) => server.once('listening', resolve));
     baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/v1`;
   });
 
   after(async () => {
-    await new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve()))
-    );
-    await prisma.team.deleteMany({ where: { id: { in: createdTeamIds } } });
-    await prisma.authSession.deleteMany({ where: { userId: { in: createdUserIds } } });
-    await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } });
+    if (skipReason) return;
+    if (server) {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+    if (createdTeamIds.length > 0) {
+      await prisma.teamMembership.deleteMany({ where: { teamId: { in: createdTeamIds } } }).catch(() => {});
+      await prisma.shift.deleteMany({ where: { teamId: { in: createdTeamIds } } }).catch(() => {});
+      await prisma.team.deleteMany({ where: { id: { in: createdTeamIds } } }).catch(() => {});
+    }
+    if (createdUserIds.length > 0) {
+      await prisma.authSession.deleteMany({ where: { userId: { in: createdUserIds } } }).catch(() => {});
+      await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } }).catch(() => {});
+    }
     await prisma.$disconnect();
   });
 
