@@ -20,8 +20,9 @@ import { colors, spacing, typography } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
 import { shiftService } from '@/services/api/shiftService';
+import { shiftSwapService } from '@/services/api/shiftSwapService';
 import { teamService } from '@/services/api/teamService';
-import { Shift, ShiftStatus, TeamMember, TeamRole } from '@/types/api';
+import { Shift, ShiftStatus, ShiftSwap, TeamMember, TeamRole } from '@/types/api';
 
 type StatusFilter = 'ALL' | ShiftStatus;
 
@@ -120,10 +121,36 @@ export default function DashboardScreen() {
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [pendingSwaps, setPendingSwaps] = useState<ShiftSwap[]>([]);
 
   const canManage = role === 'OWNER' || role === 'MANAGER';
   const hasMore = pagination.page < pagination.totalPages;
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time';
+
+  const loadPendingSwaps = useCallback(async () => {
+    if (!selectedTeam) return;
+    try {
+      const response = await shiftSwapService.list(selectedTeam.id, { limit: 100 });
+      setPendingSwaps(
+        response.shiftSwaps.filter(
+          (s) => s.status === 'PENDING_PEER' || s.status === 'PENDING_MANAGER'
+        )
+      );
+    } catch {
+      // Non-blocking for shift schedule
+    }
+  }, [selectedTeam]);
+
+  const activeSwapShiftIds = useMemo(() => {
+    const ids = new Set<string>();
+    pendingSwaps.forEach((s) => {
+      ids.add(s.sourceShiftId);
+      ids.add(s.targetShiftId);
+    });
+    return ids;
+  }, [pendingSwaps]);
+
+  const pendingSwapCount = pendingSwaps.length;
 
   const loadShifts = useCallback(async (reset = true) => {
     if (!selectedTeam) return;
@@ -172,6 +199,7 @@ export default function DashboardScreen() {
 
   useEffect(() => { loadShifts(true); }, [loadShifts]);
   useEffect(() => { loadMembers(); }, [loadMembers]);
+  useEffect(() => { loadPendingSwaps(); }, [loadPendingSwaps]);
 
   const openCreate = () => {
     setEditingShift(null);
@@ -283,9 +311,14 @@ export default function DashboardScreen() {
         </View>
         {canManage ? <ActionButton size="small" label="Add shift" onPress={openCreate} /> : null}
       </View>
-      <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/members')} style={styles.membersLink}>
-        <Text style={styles.membersLinkText}>View team members →</Text>
-      </Pressable>
+      <View style={styles.navLinksRow}>
+        <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/members')} style={styles.membersLink}>
+          <Text style={styles.membersLinkText}>View team members →</Text>
+        </Pressable>
+        <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/shift-swaps' as any)} style={styles.swapsLink}>
+          <Text style={styles.swapsLinkText}>Shift swaps {pendingSwapCount > 0 ? `(${pendingSwapCount})` : ''} →</Text>
+        </Pressable>
+      </View>
 
       <View style={styles.filterCard}>
         <Text style={styles.filterTitle}>Find shifts</Text>
@@ -324,10 +357,32 @@ export default function DashboardScreen() {
                 <Text style={[styles.status, shift.status === 'CANCELLED' && styles.cancelledStatus]}>{shift.status === 'SCHEDULED' ? 'Scheduled' : 'Cancelled'}</Text>
               </View>
               <Text style={styles.assignee}>Assigned to {shift.assignedTo.name || shift.assignedTo.email}</Text>
-              {canManage && shift.status === 'SCHEDULED' ? (
+              {activeSwapShiftIds.has(shift.id) ? (
+                <View style={styles.swapPendingBadge}>
+                  <Text style={styles.swapPendingBadgeText}>SWAP PENDING</Text>
+                </View>
+              ) : null}
+              {shift.status === 'SCHEDULED' ? (
                 <View style={styles.shiftActions}>
-                  <ActionButton size="small" label="Edit" onPress={() => openEdit(shift)} variant="secondary" />
-                  <ActionButton size="small" label={cancellingId === shift.id ? 'Cancelling...' : 'Cancel'} onPress={() => cancelShift(shift)} variant="quiet" loading={cancellingId === shift.id} />
+                  {canManage ? (
+                    <>
+                      <ActionButton size="small" label="Edit" onPress={() => openEdit(shift)} variant="secondary" />
+                      <ActionButton size="small" label={cancellingId === shift.id ? 'Cancelling...' : 'Cancel'} onPress={() => cancelShift(shift)} variant="quiet" loading={cancellingId === shift.id} />
+                    </>
+                  ) : null}
+                  {shift.assignedToUserId === user?.id ? (
+                    <ActionButton
+                      size="small"
+                      label="Request swap"
+                      variant="secondary"
+                      onPress={() =>
+                        router.push({
+                          pathname: '/(app)/swap-request' as any,
+                          params: { sourceShiftId: shift.id },
+                        })
+                      }
+                    />
+                  ) : null}
                 </View>
               ) : null}
             </View>
@@ -386,8 +441,11 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
   headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: spacing.md },
-  membersLink: { alignSelf: 'flex-start', marginBottom: spacing.md },
+  navLinksRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md },
+  membersLink: { alignSelf: 'flex-start' },
   membersLinkText: { color: colors.primary, fontSize: typography.sizes.sm, fontWeight: '700' },
+  swapsLink: { alignSelf: 'flex-start' },
+  swapsLinkText: { color: colors.accent, fontSize: typography.sizes.sm, fontWeight: '700' },
   eyebrow: { color: colors.accent, fontSize: typography.sizes.xs, fontWeight: '800', letterSpacing: 1.2 },
   title: { color: colors.text, fontSize: typography.sizes.xxl, fontWeight: '800', marginTop: spacing.xs },
   filterCard: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 20, padding: spacing.md, marginBottom: spacing.md },
@@ -407,6 +465,20 @@ const styles = StyleSheet.create({
   shiftDate: { color: colors.primary, fontSize: typography.sizes.sm, fontWeight: '700', marginTop: spacing.xs },
   status: { color: colors.success, fontSize: typography.sizes.xs, fontWeight: '800', textTransform: 'uppercase' },
   cancelledStatus: { color: colors.textSecondary },
+  swapPendingBadge: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#FEF3C7',
+    borderRadius: 6,
+    paddingHorizontal: spacing.xs,
+    paddingVertical: 2,
+    marginTop: spacing.xs,
+  },
+  swapPendingBadgeText: {
+    color: '#92400E',
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+  },
   assignee: { color: colors.textSecondary, fontSize: typography.sizes.sm, marginTop: spacing.md },
   shiftActions: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginTop: spacing.sm },
   loader: { marginVertical: spacing.xl },

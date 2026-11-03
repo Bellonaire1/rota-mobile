@@ -105,3 +105,59 @@ export interface ShiftsResponse {
 export interface ShiftResponse {
   shift: Shift;
 }
+
+export type ShiftSwapStatus =
+  | 'PENDING_PEER'
+  | 'PENDING_MANAGER'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'DECLINED'
+  | 'CANCELLED';
+
+export interface ShiftSwapShiftSummary {
+  id: string;
+  title: string;
+  startsAt: string;
+  endsAt: string;
+  status: ShiftStatus;
+  assignedToUserId: string;
+  assignedTo: Pick<User, 'id' | 'email' | 'name'>;
+}
+
+export interface ShiftSwapUserSummary {
+  id: string;
+  email: string;
+  name: string | null;
+}
+
+export interface ShiftSwap {
+  id: string;
+  teamId: string;
+  sourceShiftId: string;
+  targetShiftId: string;
+  requestingUserId: string;
+  receivingUserId: string;
+  sourceShiftUpdatedAt: string;
+  targetShiftUpdatedAt: string;
+  status: ShiftSwapStatus;
+  peerRespondedAt: string | null;
+  reviewedByUserId: string | null;
+  reviewedAt: string | null;
+  rejectionReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+  sourceShift: ShiftSwapShiftSummary;
+  targetShift: ShiftSwapShiftSummary;
+  requestingUser: ShiftSwapUserSummary;
+  receivingUser: ShiftSwapUserSummary;
+  reviewedByUser: ShiftSwapUserSummary | null;
+}
+
+export interface ShiftSwapResponse {
+  shiftSwap: ShiftSwap;
+}
+
+export interface ShiftSwapsResponse {
+  shiftSwaps: ShiftSwap[];
+  pagination: Pagination;
+}
