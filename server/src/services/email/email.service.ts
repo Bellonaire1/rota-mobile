@@ -4,6 +4,7 @@ import {
   MagicLinkEmailOptions,
   PasswordResetEmailOptions,
   SendEmailResult,
+  TeamInvitationEmailOptions,
 } from './email.types';
 import { MockEmailProvider } from './mock.provider';
 import { ResendEmailProvider } from './resend.provider';
@@ -177,6 +178,86 @@ export class EmailService {
     return this.provider.send({
       to: options.to,
       subject: 'Sign in to Rota',
+      text,
+      html,
+    });
+  }
+
+  async sendTeamInvitationEmail(options: TeamInvitationEmailOptions): Promise<SendEmailResult> {
+    const baseUrl =
+      options.clientBaseUrl ??
+      process.env.APP_BASE_URL ??
+      'https://app.rota.example.com';
+
+    try {
+      new URL(baseUrl);
+    } catch {
+      throw new Error(`Invalid invitation base URL: ${baseUrl}`);
+    }
+
+    const cleanBaseUrl = baseUrl.replace(/\/+$/, '');
+    const webInviteUrl = `${cleanBaseUrl}/invite?token=${encodeURIComponent(options.token)}`;
+    const appDeepLink = `rota://invite?token=${encodeURIComponent(options.token)}`;
+
+    const inviterText = options.inviterName
+      ? `${options.inviterName} has invited you`
+      : "You've been invited";
+    const expirationText = '7 days';
+
+    const text = [
+      'Hello,',
+      '',
+      `${inviterText} to join "${options.teamName}" on Rota as a ${options.role}.`,
+      '',
+      'To accept your invitation, open the link below on your mobile device or browser:',
+      webInviteUrl,
+      '',
+      'If you have the Rota mobile app installed, you can use this deep link:',
+      appDeepLink,
+      '',
+      'Or enter this invitation code in the app:',
+      options.token,
+      '',
+      `This invitation will expire in ${expirationText}.`,
+      '',
+      'If you do not yet have a Rota account, please register using this email address before accepting the invitation.',
+      '',
+      'The Rota Team',
+    ].join('\n');
+
+    const html = `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+        <h2 style="color: #111827; margin-bottom: 16px;">You're invited to join ${options.teamName} on Rota</h2>
+        <p style="color: #374151; font-size: 16px; line-height: 1.5;">
+          ${inviterText} to join <strong>${options.teamName}</strong> as a <strong>${options.role}</strong>.
+        </p>
+        <div style="margin: 32px 0;">
+          <a href="${webInviteUrl}" style="background-color: #2563eb; color: #ffffff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; display: inline-block;">
+            Accept Invitation
+          </a>
+        </div>
+        <p style="color: #4b5563; font-size: 14px;">
+          Or enter this invitation token directly in the mobile app:
+        </p>
+        <code style="display: inline-block; background-color: #f3f4f6; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 14px; word-break: break-all;">
+          ${options.token}
+        </code>
+        <p style="color: #4b5563; font-size: 14px; margin-top: 16px;">
+          Mobile deep link: <a href="${appDeepLink}" style="color: #2563eb;">${appDeepLink}</a>
+        </p>
+        <p style="color: #6b7280; font-size: 13px; margin-top: 24px;">
+          Note: If you do not yet have a Rota account, please register with this email address (${options.to}) first, then accept the invitation.
+        </p>
+        <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 32px 0;" />
+        <p style="color: #9ca3af; font-size: 12px;">
+          This invitation will expire in ${expirationText}. If you were not expecting this invitation, you can safely ignore this email.
+        </p>
+      </div>
+    `.trim();
+
+    return this.provider.send({
+      to: options.to,
+      subject: `Invitation to join ${options.teamName} on Rota`,
       text,
       html,
     });

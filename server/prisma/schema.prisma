@@ -130,6 +130,8 @@ model User {
   reviewedShiftSwaps   ShiftSwapRequest[] @relation("ReviewedUserSwaps")
   billingIdempotencyKeys BillingIdempotencyKey[]
   actorActivityEvents  ActivityEvent[]    @relation("ActorActivityEvents")
+  sentTeamInvitations     TeamInvitation[] @relation("InvitedByUser")
+  acceptedTeamInvitations TeamInvitation[] @relation("AcceptedByUser")
 }
 
 model AuthSession {
@@ -208,6 +210,7 @@ model Team {
   billingIdempotencyKeys BillingIdempotencyKey[]
   billingLedgerTransactions BillingLedgerTransaction[]
   activityEvents    ActivityEvent[]
+  invitations       TeamInvitation[]
 
   @@index([createdByUserId])
 }
@@ -530,4 +533,26 @@ model BillingLedgerEntry {
 
   @@index([transactionId])
   @@index([accountCode, createdAt])
+}
+
+model TeamInvitation {
+  id               String    @id @default(uuid())
+  teamId           String
+  invitedEmail     String
+  role             TeamRole
+  tokenHash        String    @unique
+  invitedByUserId  String
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  acceptedAt       DateTime?
+  revokedAt        DateTime?
+  acceptedByUserId String?
+
+  team       Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  invitedBy  User  @relation("InvitedByUser", fields: [invitedByUserId], references: [id], onDelete: Restrict)
+  acceptedBy User? @relation("AcceptedByUser", fields: [acceptedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([teamId, invitedEmail])
+  @@index([expiresAt])
+  @@index([tokenHash])
 }

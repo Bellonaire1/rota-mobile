@@ -3,6 +3,7 @@ import { shiftController } from '../controllers/shift.controller';
 import { shiftSwapController } from '../controllers/shift-swap.controller';
 import { activityController } from '../controllers/activity.controller';
 import { teamController } from '../controllers/team.controller';
+import { teamInvitationController } from '../controllers/team-invitation.controller';
 import { billingController } from '../controllers/billing.controller';
 import { authenticate } from '../middleware/authenticate';
 import { requireTeamMembership, requireTeamPermission } from '../middleware/teamAuthorization';
@@ -38,6 +39,11 @@ import {
   activityFeedParamsSchema,
   activityFeedQuerySchema,
 } from '../schemas/activity.schema';
+import {
+  createInvitationSchema,
+  teamInvitationParamsSchema,
+  teamInvitationTargetParamsSchema,
+} from '../schemas/team-invitation.schema';
 
 const router = Router();
 
@@ -67,6 +73,24 @@ router.delete(
   validateRequest({ params: teamMemberTargetParamsSchema }),
   requireTeamPermission(Permission.MANAGE_TEAM),
   teamController.removeMember
+);
+router.post(
+  '/:teamId/invitations',
+  validateRequest({ params: teamInvitationParamsSchema, body: createInvitationSchema }),
+  requireTeamPermission(Permission.MANAGE_TEAM),
+  teamInvitationController.create
+);
+router.get(
+  '/:teamId/invitations',
+  validateRequest({ params: teamInvitationParamsSchema }),
+  requireTeamPermission(Permission.MANAGE_TEAM),
+  teamInvitationController.list
+);
+router.post(
+  '/:teamId/invitations/:invitationId/revoke',
+  validateRequest({ params: teamInvitationTargetParamsSchema }),
+  requireTeamPermission(Permission.MANAGE_TEAM),
+  teamInvitationController.revoke
 );
 router.get(
   '/:teamId/shifts',

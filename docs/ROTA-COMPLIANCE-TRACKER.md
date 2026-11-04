@@ -5,9 +5,9 @@
 > **Repository:** `C:\Users\USER\rota-mobile`<br>
 > **Last Updated:** November 2026<br>
 > **Audit Status:** Rigorous Independent Verification & Baseline Commit (Task R01.5)<br>
-> **Compulsory Acceptance Requirements (99 total):** 25 DONE | 5 UNVERIFIED | 36 PARTIAL | 33 PENDING<br>
+> **Compulsory Acceptance Requirements (99 total):** 25 DONE | 5 UNVERIFIED | 37 PARTIAL | 32 PENDING<br>
 > **Optional Post-Graduation Milestones (1 total):** 0 DONE | 0 UNVERIFIED | 0 PARTIAL | 1 PENDING<br>
-> **Grand Total Tracked Items:** 100 Subrequirements (25 DONE, 5 UNVERIFIED, 36 PARTIAL, 34 PENDING)
+> **Grand Total Tracked Items:** 100 Subrequirements (25 DONE, 5 UNVERIFIED, 37 PARTIAL, 33 PENDING)
 
 ---
 
@@ -98,7 +98,7 @@ Before evaluating the individual requirements, the following ten technical discr
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
 | **R03.1** | Multi-tenant data isolation: Every team query strictly validates `TeamMembership` and scopes by `teamId`. Missing team membership returns HTTP 404 (preventing tenant enumeration); insufficient permissions returns HTTP 403. | YES | YES | YES | YES | **DONE** | [teamAuthorization.ts](../server/src/middleware/teamAuthorization.ts), [team.integration.test.ts](../server/src/teams/team.integration.test.ts) | None. Direct test execution proof: `team.integration.test.ts` (test 5) and `membership.integration.test.ts` (test 3) verify 404 on missing/foreign teams, 403 on permission denial, and cross-team listing isolation. |
 | **R03.2** | Centralized Role-Based Access Control matrix (`OWNER`, `MANAGER`, `STAFF`) scoped to `TeamMembership`. | YES | YES | YES | YES | **DONE** | [permissions.ts](../server/src/rbac/permissions.ts), [permissions.test.ts](../server/src/rbac/permissions.test.ts) | None. Direct test execution proof: 7 passing unit tests in `permissions.test.ts`. |
-| **R03.3** | Team member invitations via email and secure invite links. | NO | NO | NO | NO | **PENDING** | [team.routes.ts](../server/src/routes/team.routes.ts) | Gap: Team members are added directly by User ID. Invitation tokens and email invites unbuilt. |
+| **R03.3** | Team member invitations via email and secure invite links. | YES | YES | NO | YES | **PARTIAL** | [team-invitation.service.ts](../server/src/services/team-invitation.service.ts), [invitation.integration.test.ts](../server/src/teams/invitation.integration.test.ts), [team-invitations-backend-evidence.md](./evidence/team-invitations-backend-evidence.md) | Backend implementation complete: Prisma `TeamInvitation` model with partial unique index, cryptographically secure 256-bit token generation (SHA-256 hash storage), constant-time comparison, transactional serializable acceptance with row locking, subscription seat entitlement re-verification, anti-enumeration (404/403), audit logging (`MEMBER_ADDED`), and 20 passing integration tests against disposable Neon DB in `invitation.integration.test.ts`. Gap: Mobile deep-link acceptance UI (R03.4) and production deployment remaining. |
 | **R03.4** | Deep link routing into the mobile application to accept team invitations directly. | NO | NO | NO | NO | **PENDING** | [app _layout.tsx](../app/src/app/_layout.tsx) | Gap: Deep link invitation handler unbuilt. |
 | **R03.5** | Automated authorization denial test proof: Negative test suite asserting staff role cannot create, edit, or cancel shifts (HTTP 403), cannot access billing endpoints (HTTP 403), and cannot read or write data of a foreign team (HTTP 404/403). | YES | YES | YES | YES | **DONE** | [shift.integration.test.ts](../server/src/teams/shift.integration.test.ts), [permissions.test.ts](../server/src/rbac/permissions.test.ts) | None. Direct test execution proof: `shift.integration.test.ts` (test 6) asserts staff 403 on shift create/update/cancel, 403 on billing/checkout, and 404 on foreign-team read/write across all operational endpoints. |
 
@@ -357,7 +357,7 @@ To graduate successfully, the remaining gaps must be resolved in the following p
    - **R15.1:** Configure and build functional Expo Android development build (`expo-dev-client`).
    - **R04.3 & R04.4:** Staff shift swap mobile screens hardened and verified (peer proposal, peer response, manager review/approval UI, team-switching isolation, focus refresh; local Android / physical device execution not yet run, NOT VERIFIED on physical device).
    - **R02.3 & R02.7:** Live email delivery verification and standalone APK device test for Magic Link and Password Reset (backend/mobile code and mock integration tests completed).
-   - **R03.3 & R03.4:** Team invitation emails/tokens and deep link routing.
+   - **R03.3 & R03.4:** Team invitation backend implemented and verified (R03.3 PARTIAL); mobile deep link invitation acceptance screen (R03.4) remaining.
    - **R08.1 – R08.7:** Push notifications, token registration, retry worker, and quiet hours delay queuing.
 4. **High-Volume Feed & Scalability Proofs:**
    - **R05.1 – R05.7:** Activity feed schema, composite [timestamp, id] cursor pagination, 10k seed script, EXPLAIN ANALYZE index proof, and mobile FlatList infinite scroll/refresh feed implemented and verified (physical device testing and Vercel deployment remaining).

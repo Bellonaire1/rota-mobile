@@ -28,3 +28,13 @@ export interface MagicLinkEmailOptions {
   token: string;
   clientBaseUrl?: string;
 }
+
+export interface TeamInvitationEmailOptions {
+  to: string;
+  teamName: string;
+  inviterName?: string | null;
+  role: 'STAFF' | 'MANAGER';
+  token: string;
+  expiresAt: Date;
+  clientBaseUrl?: string;
+}
