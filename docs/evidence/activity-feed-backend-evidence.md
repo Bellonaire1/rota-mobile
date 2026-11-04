@@ -280,9 +280,18 @@ Execution of the full test harness against the live disposable database:
 
 ---
 
-## 9. Targeted Activity Feed Security & State Hardening (Task R05C Regression Proof)
+## 9. Targeted Activity Feed Security & State Hardening (Task R05C/R05D Regression Proof)
 
-### 9.1 Defect 1: Cross-Team Activity Exposure & State Isolation
+### 9.1 Disposable Database Safety Preflight & Process Isolation
+Prior to initializing the Prisma client or connecting to any database, `server/src/activity-regression-proof.ts` enforces a synchronous fail-closed safety preflight:
+1. **Isolated Test Environment Loading:** Loads strictly `server/.env.auth-test.local` and explicitly neutralizes `dotenv.config()` so that `server/.env` can never be read or used as a fallback.
+2. **Environment Variable Enforcement:** Enforces `NODE_ENV=test` and `AUTH_TEST_DATABASE=disposable`.
+3. **Safety Guard Preflight:** Invokes `authIntegrationSkipReason(process.env)` and fails closed on any invariant violation.
+4. **Endpoint Whitelist Verification:** Validates that `DATABASE_URL` and `DIRECT_URL` resolve strictly to the approved disposable Neon endpoint `ep-small-dawn-za43lp0z.c-2.eu-west-2.aws.neon.tech` (project `calm-bird-93784411`, database `neondb`).
+5. **Rejection of Protected Databases:** Strictly rejects the live demo host (`ep-falling-pine-za5gn3mb.c-2.eu-west-2.aws.neon.tech`) and persistent testing host (`ep-proud-shadow-za95zphb.c-2.eu-west-2.aws.neon.tech`).
+6. **Lazy Module Import:** Database-dependent modules (`@prisma/client`, `./database/prisma`, and `./services/activity.service`) are dynamically imported only after all preflight assertions succeed.
+
+### 9.2 Defect 1: Cross-Team Activity Exposure & State Isolation
 - **Confirmed Defect:** The team selection `useEffect` invoked `loadInitialFeed(selectedTeam.id)` upon team switching, but did not synchronously clear the existing `events` array. During the asynchronous fetch window, on render before the effect fired, or if the new team request failed (e.g. 403 or network failure), events from Team A remained visible under Team B's heading.
 - **Root Cause:** Shared mutable array state (`useState<ActivityEvent[]>([])`) decoupled from team identity, rendering without verifying that rendered items belonged to the currently active `selectedTeam.id`.
 - **Architectural Fix:**
@@ -299,48 +308,57 @@ Execution of the full test harness against the live disposable database:
      This guarantees that even on the exact frame `selectedTeam` changes (before `useEffect` fires), `visibleEvents` instantly returns `[]`.
   3. **Synchronous State Reset on Switch:** The team change effect immediately resets `feedState` to `{ teamId: currentTeamId, events: [] }`, clears `seenEventIdsRef`, and sets `nextCursorRef.current = null`.
   4. **Stale Inflight Discard:** Both `loadInitialFeed` and `handleRefresh` check `teamIdRef.current !== teamId` and `gen !== requestGenerationRef.current` prior to state commit and in `catch` blocks, dropping stale responses.
-- **Verification:** Cases A, B, C, D, and E verified with 0 failures.
+- **Verification:** Cases A, B, C, D, and E verified (simulation-level logical checks).
 
-### 9.2 Defect 2: Focus-Refresh Identity Instability
+### 9.3 Defect 2: Focus-Refresh Identity Instability
 - **Confirmed Defect:** `handleRefresh` included `events.length` in its `useCallback` dependency array. Whenever infinite scrolling appended new pages, `handleRefresh` changed function identity, causing `useFocusEffect` to re-bind and re-execute while remaining on the screen.
 - **Root Cause:** Error presentation logic checked `events.length === 0` to distinguish full-screen errors from non-fatal pagination banners, inadvertently coupling the refresh callback to list length.
 - **Architectural Fix:**
   1. Decoupled `handleRefresh` from `events.length`. Its dependency array is strictly `[selectedTeam?.id]`.
   2. Maintained event count in a stable ref (`eventsCountRef.current`) updated during state updates.
   3. `useFocusEffect` dependencies (`[selectedTeam?.id, handleRefresh]`) are now completely stable, refreshing when returning to the screen without triggering on pagination.
-- **Verification:** Cases F, G, and H verified with 0 failures.
+- **Verification:** Cases F, G, and H verified (simulation-level logical checks).
 
-### 9.3 Defect 3: Deep Nested Metadata Sanitization
+### 9.4 Defect 3: Deep Nested Metadata Sanitization
 - **Confirmed Defect:** `sanitizeMetadata()` in `server/src/services/activity.service.ts` inspected only top-level keys. Sensitive values nested in objects (e.g. `{ user: { passwordHash: "..." } }`) or arrays (e.g. `{ tokens: [{ token: "..." }] }`) passed into PostgreSQL unsanitized.
 - **Root Cause:** Single-level iteration via `for (const [key, val] of Object.entries(metadata))` without recursion into objects or arrays.
 - **Architectural Fix:**
   1. Implemented deep recursive sanitization in `sanitizeValue()` traversing objects and arrays to arbitrary depths.
   2. Case-insensitive key stripping matching normalized forms (`key.toLowerCase().replace(/[-_]/g, '')`), cleanly catching camelCase, snake_case, and kebab-case variants: `password`, `passwordHash`, `password_hash`, `token`, `refreshToken`, `refresh_token`, `accessToken`, `access_token`, `secret`, `jwt`, `authorization`, `creditCard`, `credit_card`, `cvv`, `apiKey`, `api_key`.
   3. Pure function preserving input immutability, safe handling of `Date` instances, primitives, `null`, and safe arrays.
-- **Verification:** Cases I, J, K, L, M, and N verified with 0 failures, including direct inspection of PostgreSQL persistence in the live disposable Neon database.
+- **Verification:** Cases I, J, K, L, M verified via direct unit assertions, and Case N verified via live fail-closed PostgreSQL persistence in an isolated fixture.
 
-### 9.4 Automated Regression Proof Results (14 / 14 Passed)
+### 9.5 Test Classification Disclosure & Non-Exaggeration Notice
+- **Mobile Cases (A–H):** These tests are **simulation-level logical checks** executed in a Node.js test runner verifying state isolation selectors, concurrency locks, stale response discard guards, and hook dependency stability. They are **NOT** mounted React Native UI component tests and are **NOT** physical Android device tests. Physical Android UI execution remains **NOT VERIFIED** (emulator unavailable locally; requires physical device testing).
+- **Unit Cases (I–M):** Pure function unit tests verifying recursive metadata sanitization, normalized casing, and input immutability.
+- **Database Case (N):** Executed against the authorized disposable Neon PostgreSQL database. Utilizes a dedicated isolated test fixture (`fixtureUserId` and `fixtureTeamId`) to prevent touching existing team records, and safely removes the fixture in a `finally` block. Fails closed: if the database connection cannot be established or assertion fails, Case N fails and the runner exits non-zero.
+
+### 9.6 Automated Regression Proof Results (Categorized Summary)
 
 Execution command:
 ```powershell
-cd server; npx tsx -r dotenv/config src/activity-regression-proof.ts dotenv_config_path=.env.auth-test.local
+cd server; npx tsx src/activity-regression-proof.ts
 ```
 
 | Case | Category | Exact Verification Condition | Result | Status |
 | :---: | :---: | :--- | :---: | :---: |
-| **A** | Mobile | Team-switch immediate isolation: Team A events never render under Team B heading | Verified | **PASS** |
-| **B** | Mobile | Render-time isolation guard: Component state rejects rendering mismatched team items | Verified | **PASS** |
-| **C** | Mobile | Failed load isolation: Failed Team B request shows error card and never exposes Team A events | Verified | **PASS** |
-| **D** | Mobile | Stale inflight response discard: Team A responses resolving after team switch are dropped | Verified | **PASS** |
-| **E** | Mobile | Team switch pagination reset: Cursor, hasMore, and deduplication set reset on team switch | Verified | **PASS** |
-| **F** | Mobile | Focus refresh stability: handleRefresh decoupled from events.length, preventing focus loops | Verified | **PASS** |
-| **G** | Mobile | Debounced onEndReached lock: isFetchingMoreRef prevents duplicate parallel page fetches | Verified | **PASS** |
-| **H** | Mobile | Refresh error preserves items: Pull-to-refresh failure preserves list and displays banner | Verified | **PASS** |
-| **I** | Backend | Metadata sanitization (top-level): All 17 sensitive key variants stripped at top level | Verified | **PASS** |
-| **J** | Backend | Metadata sanitization (nested): Sensitive keys stripped at arbitrary nested object depths | Verified | **PASS** |
-| **K** | Backend | Metadata sanitization (arrays): Objects in arrays recursively sanitized | Verified | **PASS** |
-| **L** | Backend | Metadata sanitization (safe fields): All shift dates, IDs, roles, numbers preserved intact | Verified | **PASS** |
-| **M** | Backend | Metadata sanitization (immutability): Input metadata objects strictly not mutated in place | Verified | **PASS** |
-| **N** | Backend | Database persistence verification: Live PostgreSQL record confirmed free of sensitive keys | Verified | **PASS** |
+| **A** | Simulation | Team-switch immediate isolation: Team A events never render under Team B heading | Verified | **PASS** |
+| **B** | Simulation | Render-time isolation guard: Component state rejects rendering mismatched team items | Verified | **PASS** |
+| **C** | Simulation | Failed load isolation: Failed Team B request shows error card and never exposes Team A events | Verified | **PASS** |
+| **D** | Simulation | Stale inflight response discard: Team A responses resolving after team switch are dropped | Verified | **PASS** |
+| **E** | Simulation | Team switch pagination reset: Cursor, hasMore, and deduplication set reset on team switch | Verified | **PASS** |
+| **F** | Simulation | Focus refresh stability: handleRefresh decoupled from events.length, preventing focus loops | Verified | **PASS** |
+| **G** | Simulation | Debounced onEndReached lock: isFetchingMoreRef prevents duplicate parallel page fetches | Verified | **PASS** |
+| **H** | Simulation | Refresh error preserves items: Pull-to-refresh failure preserves list and displays banner | Verified | **PASS** |
+| **I** | Unit | Metadata sanitization (top-level): All 17 sensitive key variants stripped at top level | Verified | **PASS** |
+| **J** | Unit | Metadata sanitization (nested): Sensitive keys stripped at arbitrary nested object depths | Verified | **PASS** |
+| **K** | Unit | Metadata sanitization (arrays): Objects in arrays recursively sanitized | Verified | **PASS** |
+| **L** | Unit | Metadata sanitization (safe fields): All shift dates, IDs, roles, numbers preserved intact | Verified | **PASS** |
+| **M** | Unit | Metadata sanitization (immutability): Input metadata objects strictly not mutated in place | Verified | **PASS** |
+| **N** | Database | Database persistence verification: Live PostgreSQL record confirmed free of sensitive keys in isolated fixture (fail-closed) | Verified | **PASS** |
 
-**Summary:** 14 passed, 0 failed, 0 skipped. All 14 regression proofs passed with 100% success.
+**Categorized Verification Breakdown:**
+- **Simulation-Level Mobile State Checks (Cases A–H):** 8 Passed, 0 Failed, 0 Skipped
+- **Direct Metadata Sanitization Unit Assertions (Cases I–M):** 5 Passed, 0 Failed, 0 Skipped
+- **Actual Database Persistence Checks (Case N):** 1 Passed, 0 Failed, 0 Skipped
+- **Total Test Results:** 14 Passed, 0 Failed, 0 Skipped (100% Success)
