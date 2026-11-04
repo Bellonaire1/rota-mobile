@@ -1,5 +1,5 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -19,6 +19,10 @@ import { ApiError } from '@/services/api/apiClient';
 import { teamInvitationService } from '@/services/api/teamInvitationService';
 import { teamService } from '@/services/api/teamService';
 import { pendingInvitationStorage } from '@/services/pendingInvitation';
+import {
+  InvitationAcceptanceCoordinator,
+  PreviewGenerationTracker,
+} from '@/services/invitationWorkflow';
 import { InvitationPreview, Team } from '@/types/api';
 
 const TOKEN_REGEX = /^[a-f0-9]{64}$/i;
@@ -41,40 +45,78 @@ export default function InviteScreen() {
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [accepting, setAccepting] = useState(false);
-  const [acceptSuccess, setAcceptSuccess] = useState(false);
   const [inputError, setInputError] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [acceptedTeamId, setAcceptedTeamId] = useState<string | null>(null);
 
-  // Sync param changes if user opens link with a new token
+  // Workflow coordinators
+  const previewTrackerRef = useRef(new PreviewGenerationTracker());
+  const coordinatorRef = useRef(new InvitationAcceptanceCoordinator<Team>());
+
+  // Sync param changes when user opens link with a new token
   useEffect(() => {
     if (params.token) {
       const trimmed = String(params.token).trim();
       setTokenInput(trimmed);
       if (TOKEN_REGEX.test(trimmed)) {
+        // Invalidate old preview immediately on new token
+        previewTrackerRef.current.invalidate();
+        coordinatorRef.current.reset();
+        setAcceptedTeamId(null);
+        setSyncError(null);
+        setPreview(null);
+        setPreviewError(null);
         setActiveToken(trimmed);
         setInputError(null);
+        if (!user && !authLoading) {
+          pendingInvitationStorage.savePendingToken(trimmed);
+        }
       } else {
+        previewTrackerRef.current.invalidate();
         setActiveToken(null);
+        setPreview(null);
         setInputError('Invitation code must be a 64-character hexadecimal token.');
       }
     }
-  }, [params.token]);
+  }, [params.token, user, authLoading]);
 
-  // When activeToken changes and user is unauthenticated, preserve token in storage
+  // Invalidate in-flight preview and clear state when active user changes
+  const prevUserIdRef = useRef<string | undefined>(user?.id);
   useEffect(() => {
-    if (activeToken && !user && !authLoading) {
-      pendingInvitationStorage.savePendingToken(activeToken);
+    if (prevUserIdRef.current !== user?.id) {
+      prevUserIdRef.current = user?.id;
+      previewTrackerRef.current.invalidate();
+      coordinatorRef.current.reset();
+      setAcceptedTeamId(null);
+      setSyncError(null);
+      setPreview(null);
+      setPreviewError(null);
     }
-  }, [activeToken, user, authLoading]);
+  }, [user?.id]);
 
   // Fetch preview when authenticated and activeToken is present
   const fetchPreview = useCallback(async (tokenToPreview: string) => {
+    const tracker = previewTrackerRef.current;
+    const generation = tracker.startRequest(tokenToPreview, user?.id);
+
     setLoadingPreview(true);
     setPreviewError(null);
     setPreview(null);
+
     try {
       const data = await teamInvitationService.preview(tokenToPreview);
+
+      // Discard stale response if token or user changed during request
+      if (!tracker.isCurrent(generation, tokenToPreview, user?.id)) {
+        return;
+      }
       setPreview(data);
     } catch (err) {
+      // Discard stale error if request is outdated
+      if (!tracker.isCurrent(generation, tokenToPreview, user?.id)) {
+        return;
+      }
+
       if (err instanceof ApiError) {
         if (err.statusCode === 404) {
           setPreviewError('This invitation could not be found or the code is invalid.');
@@ -99,18 +141,20 @@ export default function InviteScreen() {
         setPreviewError('Network error. Please check your internet connection.');
       }
     } finally {
-      setLoadingPreview(false);
+      if (tracker.isCurrent(generation, tokenToPreview, user?.id)) {
+        setLoadingPreview(false);
+      }
     }
-  }, []);
+  }, [user?.id]);
 
   useEffect(() => {
-    if (activeToken && user && !authLoading) {
+    if (activeToken && user && !authLoading && !acceptedTeamId) {
       fetchPreview(activeToken);
     }
-  }, [activeToken, user, authLoading, fetchPreview]);
+  }, [activeToken, user, authLoading, acceptedTeamId, fetchPreview]);
 
   // Handle manual code entry
-  const handleLookupManualToken = () => {
+  const handleLookupManualToken = async () => {
     const trimmed = tokenInput.trim();
     if (!trimmed) {
       setInputError('Please enter an invitation code.');
@@ -121,71 +165,127 @@ export default function InviteScreen() {
       return;
     }
     setInputError(null);
-    setActiveToken(trimmed);
-  };
-
-  // Handle accepting the invitation
-  const handleAccept = async () => {
-    if (!activeToken || !user) return;
-    setAccepting(true);
+    previewTrackerRef.current.invalidate();
+    coordinatorRef.current.reset();
+    setAcceptedTeamId(null);
+    setSyncError(null);
+    setPreview(null);
     setPreviewError(null);
-    try {
-      const result = await teamInvitationService.accept(activeToken);
-      setAcceptSuccess(true);
-      await pendingInvitationStorage.clearPendingToken();
+    setActiveToken(trimmed);
 
-      // Refresh user's teams and select the newly joined team
-      try {
-        const { teams } = await teamService.list();
-        const joinedTeam = teams.find((t) => t.id === result.team.id) ?? {
-          id: result.team.id,
-          name: result.team.name,
-          createdByUserId: '',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-        await selectTeam(joinedTeam);
-      } catch {
-        // Fallback team selection
-        await selectTeam({
-          id: result.team.id,
-          name: result.team.name,
-          createdByUserId: '',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        });
-      }
-
-      // Navigate to app workspace
-      router.replace('/(app)');
-    } catch (err) {
-      if (err instanceof ApiError) {
-        if (err.statusCode === 409) {
-          if (err.message?.includes('already a member')) {
-            setPreviewError('You are already a member of this team.');
-          } else {
-            setPreviewError(err.message || 'This invitation has already been accepted or is no longer valid.');
-          }
-        } else if (err.statusCode === 403) {
-          setPreviewError(
-            err.message || 'Authenticated email does not match invitation recipient.'
-          );
-        } else {
-          setPreviewError(err.message || 'Failed to accept invitation. Please try again.');
-        }
-      } else {
-        setPreviewError('Failed to accept invitation. Please check your connection.');
-      }
-    } finally {
-      setAccepting(false);
+    if (!user && !authLoading) {
+      await pendingInvitationStorage.savePendingToken(trimmed);
     }
   };
 
-  const handleSignOutToSwitch = async () => {
+  // Explicit cancellation: clears persisted pending token
+  const handleEnterDifferentCode = async () => {
+    await pendingInvitationStorage.cancelInvitation();
+    previewTrackerRef.current.invalidate();
+    coordinatorRef.current.reset();
+    setAcceptedTeamId(null);
+    setSyncError(null);
+    setActiveToken(null);
+    setTokenInput('');
+    setPreview(null);
+    setPreviewError(null);
+    setInputError(null);
+  };
+
+  const handleDismiss = async () => {
+    await pendingInvitationStorage.cancelInvitation();
+    previewTrackerRef.current.invalidate();
+    coordinatorRef.current.reset();
+    router.replace('/(app)/select-team');
+  };
+
+  const handleBackToTeams = async () => {
+    await pendingInvitationStorage.cancelInvitation();
+    previewTrackerRef.current.invalidate();
+    coordinatorRef.current.reset();
+    router.replace('/(app)/select-team');
+  };
+
+  const handleBackToSignIn = async () => {
+    await pendingInvitationStorage.cancelInvitation();
+    previewTrackerRef.current.invalidate();
+    coordinatorRef.current.reset();
+    router.replace('/(auth)/login');
+  };
+
+  // Safe unauthenticated navigation: awaits token write before navigating to avoid race
+  const handleNavigateToAuth = async (
+    target: '/(auth)/login' | '/(auth)/register' | '/(auth)/magic-link'
+  ) => {
     if (activeToken) {
       await pendingInvitationStorage.savePendingToken(activeToken);
     }
+    router.push(target);
+  };
+
+  // Safe switch account: explicitly preserves token before sign out
+  const handleSignOutToSwitch = async () => {
+    if (activeToken) {
+      await pendingInvitationStorage.switchAccount(activeToken);
+    }
+    previewTrackerRef.current.invalidate();
+    coordinatorRef.current.reset();
     await signOut();
+  };
+
+  // Handle accepting the invitation with strict team sync and zero fabrication
+  const handleAccept = async () => {
+    if (!activeToken || !user || accepting) return;
+    setAccepting(true);
+    setPreviewError(null);
+    setSyncError(null);
+
+    const coordinator = coordinatorRef.current;
+    const result = await coordinator.acceptAndSync({
+      token: activeToken,
+      acceptFn: (tok) => teamInvitationService.accept(tok),
+      listTeamsFn: () => teamService.list(),
+      selectTeamFn: (t) => selectTeam(t),
+      getTeamId: (t) => t.id,
+      onComplete: () => {
+        router.replace('/(app)');
+      },
+    });
+
+    if (result.accepted) {
+      setAcceptedTeamId(coordinator.getAcceptedTeamId());
+      // Token was consumed on server; clear pending storage
+      await pendingInvitationStorage.clearPendingToken();
+    }
+
+    if (result.syncFailed) {
+      setSyncError(result.error || 'Failed to synchronize team list.');
+    } else if (!result.success && result.error) {
+      setPreviewError(result.error);
+    }
+    setAccepting(false);
+  };
+
+  // Retry post-acceptance team sync without repeating the accept API call
+  const handleRetrySync = async () => {
+    if (!acceptedTeamId || accepting) return;
+    setAccepting(true);
+    setSyncError(null);
+
+    const coordinator = coordinatorRef.current;
+    const result = await coordinator.retrySync({
+      listTeamsFn: () => teamService.list(),
+      selectTeamFn: (t) => selectTeam(t),
+      getTeamId: (t) => t.id,
+      onComplete: () => {
+        router.replace('/(app)');
+      },
+    });
+
+    if (!result.success) {
+      setSyncError(result.error || 'Team synchronization failed. Please try again.');
+    }
+    setAccepting(false);
   };
 
   const isEmailMismatch =
@@ -203,6 +303,31 @@ export default function InviteScreen() {
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color={colors.primary} />
             <Text style={styles.loadingText}>Checking session...</Text>
+          </View>
+        ) : syncError && acceptedTeamId ? (
+          /* Post-Acceptance Team Sync Failure State (Zero Fabrication) */
+          <View style={styles.card}>
+            <Text style={styles.eyebrowSuccess}>INVITATION ACCEPTED</Text>
+            <Text style={styles.title}>Team synchronization needed</Text>
+            <Text style={styles.subtitle}>
+              Your membership was created successfully, but your team list could not be synchronized right now.
+            </Text>
+
+            <Text style={styles.warningBox}>{syncError}</Text>
+
+            <View style={styles.form}>
+              <ActionButton
+                label={accepting ? 'Synchronizing...' : 'Retry team sync'}
+                onPress={handleRetrySync}
+                loading={accepting}
+              />
+              <ActionButton
+                label="Go to my teams"
+                variant="secondary"
+                onPress={handleBackToTeams}
+                disabled={accepting}
+              />
+            </View>
           </View>
         ) : !activeToken ? (
           /* Manual Code Entry Form */
@@ -237,7 +362,7 @@ export default function InviteScreen() {
                 <ActionButton
                   label="Back to teams"
                   variant="quiet"
-                  onPress={() => router.replace('/(app)/select-team')}
+                  onPress={handleBackToTeams}
                 />
               </View>
             ) : (
@@ -245,7 +370,7 @@ export default function InviteScreen() {
                 <ActionButton
                   label="Back to sign in"
                   variant="quiet"
-                  onPress={() => router.replace('/(auth)/login')}
+                  onPress={handleBackToSignIn}
                 />
               </View>
             )}
@@ -269,27 +394,22 @@ export default function InviteScreen() {
             <View style={styles.form}>
               <ActionButton
                 label="Sign In"
-                onPress={() => router.push('/(auth)/login')}
+                onPress={() => handleNavigateToAuth('/(auth)/login')}
               />
               <ActionButton
                 label="Create Account"
                 variant="secondary"
-                onPress={() => router.push('/(auth)/register')}
+                onPress={() => handleNavigateToAuth('/(auth)/register')}
               />
               <ActionButton
                 label="Sign In with Email Link"
                 variant="quiet"
-                onPress={() => router.push('/(auth)/magic-link')}
+                onPress={() => handleNavigateToAuth('/(auth)/magic-link')}
               />
             </View>
 
             <View style={styles.switchRow}>
-              <Pressable
-                onPress={() => {
-                  setActiveToken(null);
-                  setTokenInput('');
-                }}
-              >
+              <Pressable onPress={handleEnterDifferentCode}>
                 <Text style={styles.link}>Enter a different code</Text>
               </Pressable>
             </View>
@@ -316,21 +436,17 @@ export default function InviteScreen() {
               <ActionButton
                 label="Enter a different code"
                 variant="quiet"
-                onPress={() => {
-                  setActiveToken(null);
-                  setTokenInput('');
-                  setPreviewError(null);
-                }}
+                onPress={handleEnterDifferentCode}
               />
               <ActionButton
                 label="Go to my teams"
                 variant="quiet"
-                onPress={() => router.replace('/(app)/select-team')}
+                onPress={handleBackToTeams}
               />
             </View>
           </View>
         ) : preview ? (
-          /* Authenticated — Invitation Preview Screen */
+          /* Authenticated — Fresh Invitation Preview Screen */
           <View style={styles.card}>
             <Text style={styles.eyebrow}>TEAM INVITATION</Text>
             <Text style={styles.title}>{preview.teamName}</Text>
@@ -391,12 +507,12 @@ export default function InviteScreen() {
                   label={accepting ? 'Joining...' : `Join ${preview.teamName}`}
                   onPress={handleAccept}
                   loading={accepting}
-                  disabled={acceptSuccess}
+                  disabled={accepting}
                 />
                 <ActionButton
                   label="Dismiss"
                   variant="quiet"
-                  onPress={() => router.replace('/(app)/select-team')}
+                  onPress={handleDismiss}
                   disabled={accepting}
                 />
               </View>
@@ -441,6 +557,12 @@ const styles = StyleSheet.create({
   },
   eyebrow: {
     color: colors.primaryLight,
+    fontSize: typography.sizes.xs,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+  },
+  eyebrowSuccess: {
+    color: colors.success,
     fontSize: typography.sizes.xs,
     fontWeight: '800',
     letterSpacing: 1.2,
@@ -555,6 +677,17 @@ const styles = StyleSheet.create({
   },
   bold: {
     fontWeight: '800',
+  },
+  warningBox: {
+    backgroundColor: '#FFFBEB',
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+    borderRadius: 12,
+    color: '#92400E',
+    fontSize: typography.sizes.sm,
+    lineHeight: 20,
+    padding: spacing.md,
+    marginTop: spacing.md,
   },
   errorBox: {
     backgroundColor: '#FEF2F2',
