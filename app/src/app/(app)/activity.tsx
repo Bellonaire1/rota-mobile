@@ -311,7 +311,16 @@ export default function ActivityScreen() {
   const router = useRouter();
   const { user, selectedTeam } = useAuth();
 
-  const [events, setEvents] = useState<ActivityEvent[]>([]);
+  // Feed state is keyed by teamId to ensure complete state isolation across teams.
+  // Team A events can never render under Team B's heading under any lifecycle timing.
+  const [feedState, setFeedState] = useState<{
+    teamId: string | null;
+    events: ActivityEvent[];
+  }>({
+    teamId: selectedTeam?.id || null,
+    events: [],
+  });
+
   const [isLoadingInitial, setIsLoadingInitial] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isFetchingMore, setIsFetchingMore] = useState(false);
@@ -328,6 +337,7 @@ export default function ActivityScreen() {
   const requestGenerationRef = useRef(0);
   const teamIdRef = useRef<string | null>(selectedTeam?.id || null);
   const seenEventIdsRef = useRef<Set<string>>(new Set());
+  const eventsCountRef = useRef(0);
   const isMountedRef = useRef(true);
 
   // Sync teamIdRef
@@ -341,6 +351,18 @@ export default function ActivityScreen() {
       isMountedRef.current = false;
     };
   }, []);
+
+  /**
+   * Visible events derived strictly from current selectedTeam:
+   * If selectedTeam changes, visibleEvents immediately returns []
+   * before any effect runs, during loading, or if the request fails.
+   */
+  const visibleEvents = useMemo(() => {
+    if (!selectedTeam?.id || feedState.teamId !== selectedTeam.id) {
+      return [];
+    }
+    return feedState.events;
+  }, [selectedTeam?.id, feedState]);
 
   /**
    * Translates errors into actionable user-facing messages.
@@ -376,6 +398,12 @@ export default function ActivityScreen() {
     setError(null);
     setPaginationError(null);
 
+    // Reset pagination tracking immediately for this team
+    seenEventIdsRef.current.clear();
+    nextCursorRef.current = null;
+    hasMoreRef.current = false;
+    setHasMore(false);
+
     try {
       const response = await activityService.getTeamActivity(teamId, { limit: PAGE_SIZE });
 
@@ -396,12 +424,13 @@ export default function ActivityScreen() {
       }
 
       seenEventIdsRef.current = idSet;
-      setEvents(deduped);
+      eventsCountRef.current = deduped.length;
+      setFeedState({ teamId, events: deduped });
       nextCursorRef.current = response.pagination?.nextCursor || null;
       hasMoreRef.current = Boolean(response.pagination?.hasMore);
       setHasMore(Boolean(response.pagination?.hasMore));
     } catch (err) {
-      if (gen !== requestGenerationRef.current || !isMountedRef.current) return;
+      if (gen !== requestGenerationRef.current || teamIdRef.current !== teamId || !isMountedRef.current) return;
       setError(formatErrorMessage(err));
     } finally {
       if (gen === requestGenerationRef.current && isMountedRef.current) {
@@ -414,20 +443,21 @@ export default function ActivityScreen() {
   /**
    * Refreshes the feed via native pull-to-refresh.
    * Clears existing cursor, resets hasMore, and restarts pagination from page 1.
+   * NOTE: Decoupled from events.length to ensure stable identity for useFocusEffect.
    */
   const handleRefresh = useCallback(async () => {
-    if (!selectedTeam?.id || isRefreshingRef.current) return;
+    const currentTeamId = selectedTeam?.id;
+    if (!currentTeamId || isRefreshingRef.current) return;
 
-    const teamId = selectedTeam.id;
     const gen = ++requestGenerationRef.current;
     isRefreshingRef.current = true;
     setIsRefreshing(true);
     setPaginationError(null);
 
     try {
-      const response = await activityService.getTeamActivity(teamId, { limit: PAGE_SIZE });
+      const response = await activityService.getTeamActivity(currentTeamId, { limit: PAGE_SIZE });
 
-      if (gen !== requestGenerationRef.current || teamIdRef.current !== teamId || !isMountedRef.current) {
+      if (gen !== requestGenerationRef.current || teamIdRef.current !== currentTeamId || !isMountedRef.current) {
         return;
       }
 
@@ -443,15 +473,16 @@ export default function ActivityScreen() {
       }
 
       seenEventIdsRef.current = idSet;
-      setEvents(deduped);
+      eventsCountRef.current = deduped.length;
+      setFeedState({ teamId: currentTeamId, events: deduped });
       nextCursorRef.current = response.pagination?.nextCursor || null;
       hasMoreRef.current = Boolean(response.pagination?.hasMore);
       setHasMore(Boolean(response.pagination?.hasMore));
       setError(null);
     } catch (err) {
-      if (gen !== requestGenerationRef.current || !isMountedRef.current) return;
-      // If we already have items rendered, preserve them and show pagination error
-      if (events.length === 0) {
+      if (gen !== requestGenerationRef.current || teamIdRef.current !== currentTeamId || !isMountedRef.current) return;
+      // If we already have items rendered, preserve them and show pagination error banner
+      if (eventsCountRef.current === 0) {
         setError(formatErrorMessage(err));
       } else {
         setPaginationError(formatErrorMessage(err));
@@ -462,7 +493,7 @@ export default function ActivityScreen() {
         setIsRefreshing(false);
       }
     }
-  }, [selectedTeam?.id, events.length]);
+  }, [selectedTeam?.id]);
 
   /**
    * Fetches the next page of activity events using keyset cursor pagination.
@@ -507,12 +538,17 @@ export default function ActivityScreen() {
         }
       }
 
-      setEvents((prev) => [...prev, ...newItems]);
+      setFeedState((prev) => {
+        if (prev.teamId !== currentTeamId) return prev;
+        const updated = [...prev.events, ...newItems];
+        eventsCountRef.current = updated.length;
+        return { teamId: currentTeamId, events: updated };
+      });
       nextCursorRef.current = response.pagination?.nextCursor || null;
       hasMoreRef.current = Boolean(response.pagination?.hasMore);
       setHasMore(Boolean(response.pagination?.hasMore));
     } catch (err) {
-      if (gen !== requestGenerationRef.current || !isMountedRef.current) return;
+      if (gen !== requestGenerationRef.current || teamIdRef.current !== currentTeamId || !isMountedRef.current) return;
       setPaginationError('Failed to load older activity. Tap to retry.');
     } finally {
       if (gen === requestGenerationRef.current && isMountedRef.current) {
@@ -524,17 +560,33 @@ export default function ActivityScreen() {
 
   // Team switching: reset feed immediately and trigger reload for new team
   useEffect(() => {
-    if (!selectedTeam?.id) {
-      setEvents([]);
+    const currentTeamId = selectedTeam?.id;
+    teamIdRef.current = currentTeamId || null;
+
+    if (!currentTeamId) {
+      setFeedState({ teamId: null, events: [] });
+      eventsCountRef.current = 0;
       seenEventIdsRef.current.clear();
       nextCursorRef.current = null;
       hasMoreRef.current = false;
       setHasMore(false);
+      setError(null);
+      setPaginationError(null);
       setIsLoadingInitial(false);
       return;
     }
 
-    loadInitialFeed(selectedTeam.id);
+    // Synchronously clear feed state for the previous team and clear errors
+    setFeedState({ teamId: currentTeamId, events: [] });
+    eventsCountRef.current = 0;
+    seenEventIdsRef.current.clear();
+    nextCursorRef.current = null;
+    hasMoreRef.current = false;
+    setHasMore(false);
+    setError(null);
+    setPaginationError(null);
+
+    loadInitialFeed(currentTeamId);
   }, [selectedTeam?.id, loadInitialFeed]);
 
   // Focus effect: Refresh when returning to screen, avoiding duplicate loops
@@ -568,7 +620,7 @@ export default function ActivityScreen() {
             onPress={() => router.back()}
             style={styles.backButton}
           >
-            <Text style={styles.backButtonText}>\u2190 Back to Schedule</Text>
+            <Text style={styles.backButtonText}>← Back to Schedule</Text>
           </Pressable>
         </View>
 
@@ -590,16 +642,6 @@ export default function ActivityScreen() {
 
   // Empty state handling
   const ListEmpty = useMemo(() => {
-    if (isLoadingInitial) {
-      return (
-        <View style={styles.stateCard}>
-          <ActivityIndicator size="large" color={colors.primary} />
-          <Text style={styles.stateTitle}>Loading activity feed...</Text>
-          <Text style={styles.stateSubtitle}>Retrieving team audit logs</Text>
-        </View>
-      );
-    }
-
     if (error) {
       return (
         <View style={[styles.stateCard, styles.errorCard]}>
@@ -616,6 +658,16 @@ export default function ActivityScreen() {
       );
     }
 
+    if (isLoadingInitial || (selectedTeam?.id && feedState.teamId !== selectedTeam.id)) {
+      return (
+        <View style={styles.stateCard}>
+          <ActivityIndicator size="large" color={colors.primary} />
+          <Text style={styles.stateTitle}>Loading activity feed...</Text>
+          <Text style={styles.stateSubtitle}>Retrieving team audit logs</Text>
+        </View>
+      );
+    }
+
     return (
       <View style={styles.stateCard}>
         <Text style={styles.stateTitle}>No Activity Yet</Text>
@@ -624,7 +676,7 @@ export default function ActivityScreen() {
         </Text>
       </View>
     );
-  }, [isLoadingInitial, error, selectedTeam?.id, loadInitialFeed]);
+  }, [isLoadingInitial, error, selectedTeam?.id, feedState.teamId, loadInitialFeed]);
 
   // Footer state handling
   const ListFooter = useMemo(() => {
@@ -642,28 +694,28 @@ export default function ActivityScreen() {
         <View style={styles.footerContainer}>
           <Text style={styles.paginationErrorText}>{paginationError}</Text>
           <Pressable accessibilityRole="button" onPress={handleLoadMore} style={styles.retryLink}>
-            <Text style={styles.retryLinkText}>Tap to Retry \u21BB</Text>
+            <Text style={styles.retryLinkText}>Tap to Retry ↻</Text>
           </Pressable>
         </View>
       );
     }
 
-    if (!hasMore && events.length > 0) {
+    if (!hasMore && visibleEvents.length > 0) {
       return (
         <View style={styles.footerContainer}>
-          <Text style={styles.endOfFeedText}>\u2014 End of activity history \u2014</Text>
+          <Text style={styles.endOfFeedText}>— End of activity history —</Text>
           <Text style={styles.endOfFeedSubtext}>All events have been loaded</Text>
         </View>
       );
     }
 
     return <View style={styles.footerSpacer} />;
-  }, [isFetchingMore, paginationError, hasMore, events.length, handleLoadMore]);
+  }, [isFetchingMore, paginationError, hasMore, visibleEvents.length, handleLoadMore]);
 
   return (
     <View style={styles.container}>
       <FlatList
-        data={events}
+        data={visibleEvents}
         keyExtractor={keyExtractor}
         renderItem={renderItem}
         ListHeaderComponent={ListHeader}

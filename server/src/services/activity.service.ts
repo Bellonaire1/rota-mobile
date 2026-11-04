@@ -51,13 +51,47 @@ const SENSITIVE_KEYS = new Set([
   'apikey',
 ]);
 
+function isSensitiveKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  if (SENSITIVE_KEYS.has(lower)) return true;
+  const stripped = lower.replace(/[-_]/g, '');
+  return SENSITIVE_KEYS.has(stripped);
+}
+
+function sanitizeValue(value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value !== 'object') {
+    return typeof value === 'function' ? undefined : value;
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => typeof item !== 'function')
+      .map((item) => sanitizeValue(item));
+  }
+  const cleanObj: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (isSensitiveKey(k)) {
+      continue;
+    }
+    if (v !== undefined && typeof v !== 'function') {
+      cleanObj[k] = sanitizeValue(v);
+    }
+  }
+  return cleanObj;
+}
+
 export function sanitizeMetadata(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
-  if (!metadata || typeof metadata !== 'object') return {};
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return {};
   const sanitized: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(metadata)) {
-    if (SENSITIVE_KEYS.has(key.toLowerCase())) continue;
+    if (isSensitiveKey(key)) continue;
     if (val !== undefined && typeof val !== 'function') {
-      sanitized[key] = val;
+      sanitized[key] = sanitizeValue(val);
     }
   }
   return sanitized;

@@ -276,3 +276,71 @@ Execution of the full test harness against the live disposable database:
 - **R05.7 — Composite Index Impact Benchmarks:** **DONE** (Empirical before/after query plans demonstrate composite index provides 44.5x acceleration on initial queries; `Dep: N/A`).
 - **R05.5 — Mobile Activity Feed Screen:** **PARTIAL** (Mobile FlatList infinite scroll feed with distinct loading, empty, error, and end-of-list states, human-readable formatting across 12 event types, and typed dashboard navigation link completed; physical device test and live Vercel deployment remaining).
 - **R05.6 — Mobile Feed Real-Time / Polling Refresh:** **PARTIAL** (Native RefreshControl pull-to-refresh, in-flight request lock, Set-based UUID deduplication, request-generation cancellation, and FlatList architectural justification documented and verified; physical device test and live Vercel deployment remaining).
+
+
+---
+
+## 9. Targeted Activity Feed Security & State Hardening (Task R05C Regression Proof)
+
+### 9.1 Defect 1: Cross-Team Activity Exposure & State Isolation
+- **Confirmed Defect:** The team selection `useEffect` invoked `loadInitialFeed(selectedTeam.id)` upon team switching, but did not synchronously clear the existing `events` array. During the asynchronous fetch window, on render before the effect fired, or if the new team request failed (e.g. 403 or network failure), events from Team A remained visible under Team B's heading.
+- **Root Cause:** Shared mutable array state (`useState<ActivityEvent[]>([])`) decoupled from team identity, rendering without verifying that rendered items belonged to the currently active `selectedTeam.id`.
+- **Architectural Fix:**
+  1. **Team-Keyed State Ownership:** Refactored state to `feedState: { teamId: string | null; events: ActivityEvent[] }`, explicitly linking feed items to their origin team.
+  2. **Render-Time Isolation Guard:** Derived `visibleEvents` via `useMemo`:
+     ```typescript
+     const visibleEvents = useMemo(() => {
+       if (!selectedTeam?.id || feedState.teamId !== selectedTeam.id) {
+         return [];
+       }
+       return feedState.events;
+     }, [selectedTeam?.id, feedState]);
+     ```
+     This guarantees that even on the exact frame `selectedTeam` changes (before `useEffect` fires), `visibleEvents` instantly returns `[]`.
+  3. **Synchronous State Reset on Switch:** The team change effect immediately resets `feedState` to `{ teamId: currentTeamId, events: [] }`, clears `seenEventIdsRef`, and sets `nextCursorRef.current = null`.
+  4. **Stale Inflight Discard:** Both `loadInitialFeed` and `handleRefresh` check `teamIdRef.current !== teamId` and `gen !== requestGenerationRef.current` prior to state commit and in `catch` blocks, dropping stale responses.
+- **Verification:** Cases A, B, C, D, and E verified with 0 failures.
+
+### 9.2 Defect 2: Focus-Refresh Identity Instability
+- **Confirmed Defect:** `handleRefresh` included `events.length` in its `useCallback` dependency array. Whenever infinite scrolling appended new pages, `handleRefresh` changed function identity, causing `useFocusEffect` to re-bind and re-execute while remaining on the screen.
+- **Root Cause:** Error presentation logic checked `events.length === 0` to distinguish full-screen errors from non-fatal pagination banners, inadvertently coupling the refresh callback to list length.
+- **Architectural Fix:**
+  1. Decoupled `handleRefresh` from `events.length`. Its dependency array is strictly `[selectedTeam?.id]`.
+  2. Maintained event count in a stable ref (`eventsCountRef.current`) updated during state updates.
+  3. `useFocusEffect` dependencies (`[selectedTeam?.id, handleRefresh]`) are now completely stable, refreshing when returning to the screen without triggering on pagination.
+- **Verification:** Cases F, G, and H verified with 0 failures.
+
+### 9.3 Defect 3: Deep Nested Metadata Sanitization
+- **Confirmed Defect:** `sanitizeMetadata()` in `server/src/services/activity.service.ts` inspected only top-level keys. Sensitive values nested in objects (e.g. `{ user: { passwordHash: "..." } }`) or arrays (e.g. `{ tokens: [{ token: "..." }] }`) passed into PostgreSQL unsanitized.
+- **Root Cause:** Single-level iteration via `for (const [key, val] of Object.entries(metadata))` without recursion into objects or arrays.
+- **Architectural Fix:**
+  1. Implemented deep recursive sanitization in `sanitizeValue()` traversing objects and arrays to arbitrary depths.
+  2. Case-insensitive key stripping matching normalized forms (`key.toLowerCase().replace(/[-_]/g, '')`), cleanly catching camelCase, snake_case, and kebab-case variants: `password`, `passwordHash`, `password_hash`, `token`, `refreshToken`, `refresh_token`, `accessToken`, `access_token`, `secret`, `jwt`, `authorization`, `creditCard`, `credit_card`, `cvv`, `apiKey`, `api_key`.
+  3. Pure function preserving input immutability, safe handling of `Date` instances, primitives, `null`, and safe arrays.
+- **Verification:** Cases I, J, K, L, M, and N verified with 0 failures, including direct inspection of PostgreSQL persistence in the live disposable Neon database.
+
+### 9.4 Automated Regression Proof Results (14 / 14 Passed)
+
+Execution command:
+```powershell
+cd server; npx tsx -r dotenv/config src/activity-regression-proof.ts dotenv_config_path=.env.auth-test.local
+```
+
+| Case | Category | Exact Verification Condition | Result | Status |
+| :---: | :---: | :--- | :---: | :---: |
+| **A** | Mobile | Team-switch immediate isolation: Team A events never render under Team B heading | Verified | **PASS** |
+| **B** | Mobile | Render-time isolation guard: Component state rejects rendering mismatched team items | Verified | **PASS** |
+| **C** | Mobile | Failed load isolation: Failed Team B request shows error card and never exposes Team A events | Verified | **PASS** |
+| **D** | Mobile | Stale inflight response discard: Team A responses resolving after team switch are dropped | Verified | **PASS** |
+| **E** | Mobile | Team switch pagination reset: Cursor, hasMore, and deduplication set reset on team switch | Verified | **PASS** |
+| **F** | Mobile | Focus refresh stability: handleRefresh decoupled from events.length, preventing focus loops | Verified | **PASS** |
+| **G** | Mobile | Debounced onEndReached lock: isFetchingMoreRef prevents duplicate parallel page fetches | Verified | **PASS** |
+| **H** | Mobile | Refresh error preserves items: Pull-to-refresh failure preserves list and displays banner | Verified | **PASS** |
+| **I** | Backend | Metadata sanitization (top-level): All 17 sensitive key variants stripped at top level | Verified | **PASS** |
+| **J** | Backend | Metadata sanitization (nested): Sensitive keys stripped at arbitrary nested object depths | Verified | **PASS** |
+| **K** | Backend | Metadata sanitization (arrays): Objects in arrays recursively sanitized | Verified | **PASS** |
+| **L** | Backend | Metadata sanitization (safe fields): All shift dates, IDs, roles, numbers preserved intact | Verified | **PASS** |
+| **M** | Backend | Metadata sanitization (immutability): Input metadata objects strictly not mutated in place | Verified | **PASS** |
+| **N** | Backend | Database persistence verification: Live PostgreSQL record confirmed free of sensitive keys | Verified | **PASS** |
+
+**Summary:** 14 passed, 0 failed, 0 skipped. All 14 regression proofs passed with 100% success.
