@@ -5,9 +5,9 @@
 > **Repository:** `C:\Users\USER\rota-mobile`<br>
 > **Last Updated:** November 2026<br>
 > **Audit Status:** Rigorous Independent Verification & Baseline Commit (Task R01.5)<br>
-> **Compulsory Acceptance Requirements (99 total):** 25 DONE | 5 UNVERIFIED | 34 PARTIAL | 35 PENDING<br>
+> **Compulsory Acceptance Requirements (99 total):** 25 DONE | 5 UNVERIFIED | 36 PARTIAL | 33 PENDING<br>
 > **Optional Post-Graduation Milestones (1 total):** 0 DONE | 0 UNVERIFIED | 0 PARTIAL | 1 PENDING<br>
-> **Grand Total Tracked Items:** 100 Subrequirements (25 DONE, 5 UNVERIFIED, 34 PARTIAL, 36 PENDING)
+> **Grand Total Tracked Items:** 100 Subrequirements (25 DONE, 5 UNVERIFIED, 36 PARTIAL, 34 PENDING)
 
 ---
 
@@ -123,8 +123,8 @@ Before evaluating the individual requirements, the following ten technical discr
 | **R05.2** | Keyset / cursor pagination using composite [timestamp, id] cursor and supporting composite index. | YES | YES | NO | YES | **PARTIAL** | [activity.service.ts](../server/src/services/activity.service.ts), [activity.controller.ts](../server/src/controllers/activity.controller.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | Keyset cursor pagination with (createdAt DESC, id DESC) ordering, opaque base64url cursor, HTTP 400 validation, and composite index verified on disposable database. Gap: Production deployment to live Vercel demonstration backend remaining. |
 | **R05.3** | Synthetic database seed populating 10,000+ realistic activity feed records for performance testing. | YES | YES | N/A | YES | **DONE** | [seed-activity-fixtures.ts](../server/src/benchmarks/seed-activity-fixtures.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Synthetic database seeder generates 10,000 realistic activity records distributed across 12 event types in 11.62s using chunked transactions against disposable Neon DB. |
 | **R05.4** | Empirical query optimization evidence: Before and after `EXPLAIN ANALYZE` benchmarks for cursor vs offset pagination. | YES | YES | N/A | YES | **DONE** | [benchmark-activity-query.ts](../server/src/benchmarks/benchmark-activity-query.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Empirical `EXPLAIN (ANALYZE, BUFFERS)` benchmarks on 10,000 records demonstrate Keyset pagination (1.637 ms) is 3.53x faster than Offset pagination (5.772 ms) at deep offset 9,000 with constant-time seek. |
-| **R05.5** | Mobile client infinite scroll feed with distinct loading, empty, error, and end-of-list states. | NO | NO | NO | NO | **PENDING** | [app index.tsx](../app/src/app/(app)/index.tsx) | Gap: Activity feed mobile UI pending Stage B. |
-| **R05.6** | Mobile feed UI performance & reliability: Native pull-to-refresh (`RefreshControl`), in-flight duplicate request debouncing/prevention, and documented architectural justification for `FlatList` vs alternatives. | NO | NO | NO | NO | **PENDING** | [app index.tsx](../app/src/app/(app)/index.tsx) | Gap: Pull-to-refresh and request debouncing pending Stage B mobile UI. |
+| **R05.5** | Mobile client infinite scroll feed with distinct loading, empty, error, and end-of-list states. | YES | YES | NO | YES | **PARTIAL** | [activity.tsx](../app/src/app/(app)/activity.tsx), [activityService.ts](../app/src/services/api/activityService.ts) | Mobile infinite scroll feed with FlatList onEndReached, distinct loading, empty, error, and end-of-list states, human-readable formatting across 12 event types, and typed navigation link verified via TypeScript compiler. Gap: Physical Android device test not executed (NOT VERIFIED on physical device; emulator unavailable locally); production deployment to Vercel remaining. |
+| **R05.6** | Mobile feed UI performance & reliability: Native pull-to-refresh (RefreshControl), in-flight duplicate request debouncing/prevention, and documented architectural justification for FlatList vs alternatives. | YES | YES | NO | YES | **PARTIAL** | [activity.tsx](../app/src/app/(app)/activity.tsx) | Native RefreshControl pull-to-refresh, in-flight request lock (isFetchingMoreRef), Set-based UUID deduplication, request-generation cancellation, and architectural justification for FlatList documented and verified with TypeScript. Gap: Physical device execution remaining (NOT VERIFIED on physical device; emulator unavailable locally); production deployment to Vercel remaining. |
 | **R05.7** | Database indexing verification: Composite B-tree index [teamId, createdAt DESC, id DESC] benchmarked with EXPLAIN ANALYZE before and after index application on 10,000 records. | YES | YES | N/A | YES | **DONE** | [schema.prisma](../server/prisma/schema.prisma), [benchmark-activity-query.ts](../server/src/benchmarks/benchmark-activity-query.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Empirical before/after EXPLAIN ANALYZE comparison on 10,000 records proves composite B-tree index (teamId, createdAt DESC, id DESC) provides 44.5x acceleration on initial queries (0.051 ms vs 2.272 ms) by eliminating Seq Scan and in-memory quicksort. |
 
 ---
@@ -360,7 +360,7 @@ To graduate successfully, the remaining gaps must be resolved in the following p
    - **R03.3 & R03.4:** Team invitation emails/tokens and deep link routing.
    - **R08.1 – R08.7:** Push notifications, token registration, retry worker, and quiet hours delay queuing.
 4. **High-Volume Feed & Scalability Proofs:**
-   - **R05.1 – R05.4, R05.7:** Activity feed schema, composite `[timestamp, id]` cursor pagination, 10k seed script, and `EXPLAIN ANALYZE` before/after index proof verified. Mobile UI (R05.5, R05.6) pending Stage B.
+   - **R05.1 – R05.7:** Activity feed schema, composite [timestamp, id] cursor pagination, 10k seed script, EXPLAIN ANALYZE index proof, and mobile FlatList infinite scroll/refresh feed implemented and verified (physical device testing and Vercel deployment remaining).
    - **R13.2 – R13.4:** `EXPLAIN ANALYZE` query plans and k6 200 VU load test execution.
 5. **Client State Modernization:**
    - **R06.1 – R06.5:** Install TanStack Query, define query key factories, implement optimistic updates with automatic rollback, and configure offline cache.

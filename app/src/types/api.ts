@@ -161,3 +161,51 @@ export interface ShiftSwapsResponse {
   shiftSwaps: ShiftSwap[];
   pagination: Pagination;
 }
+
+export type ActivityEventType =
+  | 'SHIFT_CREATED'
+  | 'SHIFT_UPDATED'
+  | 'SHIFT_CANCELLED'
+  | 'MEMBER_ADDED'
+  | 'MEMBER_ROLE_CHANGED'
+  | 'MEMBER_REMOVED'
+  | 'SWAP_REQUESTED'
+  | 'SWAP_PEER_ACCEPTED'
+  | 'SWAP_PEER_DECLINED'
+  | 'SWAP_APPROVED'
+  | 'SWAP_REJECTED'
+  | 'SWAP_CANCELLED';
+
+export interface ActivityActorSummary {
+  id: string;
+  name: string | null;
+  email: string;
+}
+
+export interface ActivityEvent {
+  id: string;
+  teamId: string;
+  actorUserId: string | null;
+  type: ActivityEventType;
+  entityType: string;
+  entityId: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+  actor: ActivityActorSummary | null;
+}
+
+export interface ActivityCursorPagination {
+  limit: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+}
+
+export interface ActivityFeedResponse {
+  events: ActivityEvent[];
+  pagination: ActivityCursorPagination;
+}
+
+export interface ActivityFeedQuery {
+  limit?: number;
+  cursor?: string;
+}

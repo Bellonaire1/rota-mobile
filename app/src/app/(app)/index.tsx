@@ -384,10 +384,13 @@ export default function DashboardScreen() {
       </View>
       <View style={styles.navLinksRow}>
         <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/members')} style={styles.membersLink}>
-          <Text style={styles.membersLinkText}>View team members →</Text>
+          <Text style={styles.membersLinkText}>Members →</Text>
         </Pressable>
         <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/shift-swaps')} style={styles.swapsLink}>
-          <Text style={styles.swapsLinkText}>Shift swaps {pendingSwapCount > 0 ? `(${pendingSwapCount})` : ''} →</Text>
+          <Text style={styles.swapsLinkText}>Swaps {pendingSwapCount > 0 ? `(${pendingSwapCount})` : ''} →</Text>
+        </Pressable>
+        <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/activity')} style={styles.activityLink}>
+          <Text style={styles.activityLinkText}>Activity →</Text>
         </Pressable>
       </View>
 
@@ -512,11 +515,13 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
   headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: spacing.md },
-  navLinksRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md },
+  navLinksRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md, flexWrap: 'wrap', gap: spacing.xs },
   membersLink: { alignSelf: 'flex-start' },
   membersLinkText: { color: colors.primary, fontSize: typography.sizes.sm, fontWeight: '700' },
   swapsLink: { alignSelf: 'flex-start' },
   swapsLinkText: { color: colors.accent, fontSize: typography.sizes.sm, fontWeight: '700' },
+  activityLink: { alignSelf: 'flex-start' },
+  activityLinkText: { color: '#6366F1', fontSize: typography.sizes.sm, fontWeight: '700' },
   eyebrow: { color: colors.accent, fontSize: typography.sizes.xs, fontWeight: '800', letterSpacing: 1.2 },
   title: { color: colors.text, fontSize: typography.sizes.xxl, fontWeight: '800', marginTop: spacing.xs },
   filterCard: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 20, padding: spacing.md, marginBottom: spacing.md },

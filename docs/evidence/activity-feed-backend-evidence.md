@@ -274,5 +274,5 @@ Execution of the full test harness against the live disposable database:
 - **R05.3 — 10,000-Record Synthetic Seeder:** **DONE** (Synthetic seeder script provisions 10,000 realistic events across 12 types in 11.62s on disposable database; `Dep: N/A`).
 - **R05.4 — EXPLAIN ANALYZE Keyset vs Offset Benchmarks:** **DONE** (Empirical query plans demonstrate Keyset seek is 3.53x faster than Offset scan at depth 9,000; `Dep: N/A`).
 - **R05.7 — Composite Index Impact Benchmarks:** **DONE** (Empirical before/after query plans demonstrate composite index provides 44.5x acceleration on initial queries; `Dep: N/A`).
-- **R05.5 — Mobile Activity Feed Screen:** **PENDING** (Stage B Mobile UI).
-- **R05.6 — Mobile Feed Real-Time / Polling Refresh:** **PENDING** (Stage B Mobile UI).
+- **R05.5 — Mobile Activity Feed Screen:** **PARTIAL** (Mobile FlatList infinite scroll feed with distinct loading, empty, error, and end-of-list states, human-readable formatting across 12 event types, and typed dashboard navigation link completed; physical device test and live Vercel deployment remaining).
+- **R05.6 — Mobile Feed Real-Time / Polling Refresh:** **PARTIAL** (Native RefreshControl pull-to-refresh, in-flight request lock, Set-based UUID deduplication, request-generation cancellation, and FlatList architectural justification documented and verified; physical device test and live Vercel deployment remaining).
