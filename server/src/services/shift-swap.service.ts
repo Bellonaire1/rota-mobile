@@ -1,4 +1,4 @@
-import { Prisma, ShiftStatus, ShiftSwapStatus, TeamRole } from '@prisma/client';
+import { ActivityEventType, Prisma, ShiftStatus, ShiftSwapStatus, TeamRole } from '@prisma/client';
 import { prisma } from '../database/prisma';
 import { runSerializable } from '../database/transactions';
 import { AppError } from '../errors/AppError';
@@ -13,6 +13,7 @@ import {
   assertOperationalMutationEntitlement,
   resolveSubscriptionEntitlement,
 } from './subscription-entitlement.service';
+import { activityService } from './activity.service';
 
 const shiftSwapSelect = {
   id: true,
@@ -120,7 +121,7 @@ export const shiftSwapService = {
       }
 
       // 4. Create the shift swap request
-      return transaction.shiftSwapRequest.create({
+      const createdSwap = await transaction.shiftSwapRequest.create({
         data: {
           teamId,
           sourceShiftId: sourceShift.id,
@@ -133,6 +134,21 @@ export const shiftSwapService = {
         },
         select: shiftSwapSelect,
       });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.SWAP_REQUESTED,
+        entityType: 'SHIFT_SWAP',
+        entityId: createdSwap.id,
+        metadata: {
+          sourceShiftId: createdSwap.sourceShiftId,
+          targetShiftId: createdSwap.targetShiftId,
+          receivingUserId: createdSwap.receivingUserId,
+        },
+      });
+
+      return createdSwap;
     });
   },
 
@@ -197,7 +213,7 @@ export const shiftSwapService = {
           ? ShiftSwapStatus.PENDING_MANAGER
           : ShiftSwapStatus.DECLINED;
 
-      return transaction.shiftSwapRequest.update({
+      const updatedSwap = await transaction.shiftSwapRequest.update({
         where: { id: swapId },
         data: {
           status: nextStatus,
@@ -205,6 +221,23 @@ export const shiftSwapService = {
         },
         select: shiftSwapSelect,
       });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type:
+          input.action === 'accept'
+            ? ActivityEventType.SWAP_PEER_ACCEPTED
+            : ActivityEventType.SWAP_PEER_DECLINED,
+        entityType: 'SHIFT_SWAP',
+        entityId: swapId,
+        metadata: {
+          action: input.action,
+          requestingUserId: swap.requestingUserId,
+        },
+      });
+
+      return updatedSwap;
     });
   },
 
@@ -231,7 +264,7 @@ export const shiftSwapService = {
 
       // Handle Rejection
       if (input.action === 'reject') {
-        return transaction.shiftSwapRequest.update({
+        const rejectedSwap = await transaction.shiftSwapRequest.update({
           where: { id: swapId },
           data: {
             status: ShiftSwapStatus.REJECTED,
@@ -241,6 +274,21 @@ export const shiftSwapService = {
           },
           select: shiftSwapSelect,
         });
+
+        await activityService.logEvent(transaction, {
+          teamId,
+          actorUserId: actorId,
+          type: ActivityEventType.SWAP_REJECTED,
+          entityType: 'SHIFT_SWAP',
+          entityId: swapId,
+          metadata: {
+            reason: input.reason || null,
+            requestingUserId: swap.requestingUserId,
+            receivingUserId: swap.receivingUserId,
+          },
+        });
+
+        return rejectedSwap;
       }
 
       // Handle Approval
@@ -376,6 +424,20 @@ export const shiftSwapService = {
         },
       });
 
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.SWAP_APPROVED,
+        entityType: 'SHIFT_SWAP',
+        entityId: swap.id,
+        metadata: {
+          sourceShiftId: swap.sourceShiftId,
+          targetShiftId: swap.targetShiftId,
+          requestingUserId: swap.requestingUserId,
+          receivingUserId: swap.receivingUserId,
+        },
+      });
+
       return approvedSwap;
     });
   },
@@ -401,13 +463,27 @@ export const shiftSwapService = {
         throw new AppError(409, 'Cannot cancel a resolved swap request');
       }
 
-      return transaction.shiftSwapRequest.update({
+      const cancelledSwap = await transaction.shiftSwapRequest.update({
         where: { id: swapId },
         data: {
           status: ShiftSwapStatus.CANCELLED,
         },
         select: shiftSwapSelect,
       });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.SWAP_CANCELLED,
+        entityType: 'SHIFT_SWAP',
+        entityId: swapId,
+        metadata: {
+          requestingUserId: swap.requestingUserId,
+          receivingUserId: swap.receivingUserId,
+        },
+      });
+
+      return cancelledSwap;
     });
   },
 };

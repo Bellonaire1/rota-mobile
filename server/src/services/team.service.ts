@@ -1,9 +1,10 @@
-import { ShiftStatus, TeamRole } from '@prisma/client';
+import { ActivityEventType, ShiftStatus, TeamRole } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../database/prisma';
 import { runSerializable } from '../database/transactions';
 import { AppError } from '../errors/AppError';
 import { assertMembershipSeatEntitlement, resolveSubscriptionEntitlement } from './subscription-entitlement.service';
+import { activityService } from './activity.service';
 import {
   AddTeamMemberInput,
   CreateTeamInput,
@@ -146,7 +147,7 @@ export const teamService = {
 
         const user = await transaction.user.findUnique({
           where: { id: input.userId },
-          select: { id: true },
+          select: { id: true, email: true },
         });
         if (!user) {
           throw new AppError(404, 'User not found');
@@ -161,10 +162,25 @@ export const teamService = {
         const entitlement = await resolveSubscriptionEntitlement(transaction, teamId);
         assertMembershipSeatEntitlement(entitlement, entitlement.currentBillableStaffSeats + 1);
 
-        return transaction.teamMembership.create({
+        const createdMembership = await transaction.teamMembership.create({
           data: { teamId, userId: input.userId, role: input.role },
           select: memberSelect,
         });
+
+        await activityService.logEvent(transaction, {
+          teamId,
+          actorUserId: actorId,
+          type: ActivityEventType.MEMBER_ADDED,
+          entityType: 'MEMBERSHIP',
+          entityId: createdMembership.id,
+          metadata: {
+            userId: input.userId,
+            role: input.role,
+            userEmail: user.email,
+          },
+        });
+
+        return createdMembership;
       });
     } catch (error) {
       if (
@@ -192,11 +208,26 @@ export const teamService = {
       });
       assertMemberTarget(target?.role);
 
-      return transaction.teamMembership.update({
+      const updatedMembership = await transaction.teamMembership.update({
         where: { teamId_userId: { teamId, userId: targetUserId } },
         data: { role: input.role },
         select: memberSelect,
       });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.MEMBER_ROLE_CHANGED,
+        entityType: 'MEMBERSHIP',
+        entityId: updatedMembership.id,
+        metadata: {
+          userId: targetUserId,
+          previousRole: target?.role,
+          newRole: input.role,
+        },
+      });
+
+      return updatedMembership;
     });
   },
 
@@ -225,6 +256,18 @@ export const teamService = {
 
       await transaction.teamMembership.delete({
         where: { teamId_userId: { teamId, userId: targetUserId } },
+      });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.MEMBER_REMOVED,
+        entityType: 'MEMBERSHIP',
+        entityId: targetUserId,
+        metadata: {
+          userId: targetUserId,
+          role: target?.role,
+        },
       });
     });
   },

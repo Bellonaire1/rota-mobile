@@ -33,6 +33,21 @@ enum ShiftSwapStatus {
   CANCELLED
 }
 
+enum ActivityEventType {
+  SHIFT_CREATED
+  SHIFT_UPDATED
+  SHIFT_CANCELLED
+  MEMBER_ADDED
+  MEMBER_ROLE_CHANGED
+  MEMBER_REMOVED
+  SWAP_REQUESTED
+  SWAP_PEER_ACCEPTED
+  SWAP_PEER_DECLINED
+  SWAP_APPROVED
+  SWAP_REJECTED
+  SWAP_CANCELLED
+}
+
 enum BillingPlanCode {
   STARTER
   TEAM
@@ -114,6 +129,7 @@ model User {
   receivingShiftSwaps  ShiftSwapRequest[] @relation("ReceivingUserSwaps")
   reviewedShiftSwaps   ShiftSwapRequest[] @relation("ReviewedUserSwaps")
   billingIdempotencyKeys BillingIdempotencyKey[]
+  actorActivityEvents  ActivityEvent[]    @relation("ActorActivityEvents")
 }
 
 model AuthSession {
@@ -191,6 +207,7 @@ model Team {
   billingSubscription BillingSubscription?
   billingIdempotencyKeys BillingIdempotencyKey[]
   billingLedgerTransactions BillingLedgerTransaction[]
+  activityEvents    ActivityEvent[]
 
   @@index([createdByUserId])
 }
@@ -265,6 +282,23 @@ model ShiftSwapRequest {
   @@index([receivingUserId, status])
   @@index([sourceShiftId])
   @@index([targetShiftId])
+}
+
+model ActivityEvent {
+  id          String            @id @default(uuid())
+  teamId      String
+  actorUserId String?
+  type        ActivityEventType
+  entityType  String
+  entityId    String
+  metadata    Json?             @default("{}")
+  createdAt   DateTime          @default(now())
+
+  team  Team  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  actor User? @relation("ActorActivityEvents", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([teamId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([actorUserId])
 }
 
 model BillingPlan {

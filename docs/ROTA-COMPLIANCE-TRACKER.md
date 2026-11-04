@@ -5,9 +5,9 @@
 > **Repository:** `C:\Users\USER\rota-mobile`<br>
 > **Last Updated:** November 2026<br>
 > **Audit Status:** Rigorous Independent Verification & Baseline Commit (Task R01.5)<br>
-> **Compulsory Acceptance Requirements (99 total):** 22 DONE | 5 UNVERIFIED | 32 PARTIAL | 40 PENDING<br>
+> **Compulsory Acceptance Requirements (99 total):** 27 DONE | 5 UNVERIFIED | 32 PARTIAL | 35 PENDING<br>
 > **Optional Post-Graduation Milestones (1 total):** 0 DONE | 0 UNVERIFIED | 0 PARTIAL | 1 PENDING<br>
-> **Grand Total Tracked Items:** 100 Subrequirements (22 DONE, 5 UNVERIFIED, 32 PARTIAL, 41 PENDING)
+> **Grand Total Tracked Items:** 100 Subrequirements (27 DONE, 5 UNVERIFIED, 32 PARTIAL, 36 PENDING)
 
 ---
 
@@ -119,13 +119,13 @@ Before evaluating the individual requirements, the following ten technical discr
 
 | ID | Exact Acceptance Criterion | Impl | Test | Dep | Evid | Status | Evidence Link / File | Gap & Next Action |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
-| **R05.1** | Chronological activity feed capturing team audit events (shifts, roster changes, swaps). | NO | NO | NO | NO | **PENDING** | [schema.prisma](../server/prisma/schema.prisma) | Gap: No activity feed model, audit triggers, or endpoint exist. |
-| **R05.2** | Keyset / cursor pagination using composite `[timestamp, id]` cursor and supporting composite index. | NO | NO | NO | NO | **PENDING** | [team.routes.ts](../server/src/routes/team.routes.ts) | Gap: Keyset cursor pagination unbuilt (shifts currently use offset pagination). |
-| **R05.3** | Synthetic database seed populating 10,000+ realistic activity feed records for performance testing. | NO | NO | NO | NO | **PENDING** | [seed.ts](../server/prisma/seed.ts) | Gap: Seed script only provisions basic auth fixtures; 10k seed unbuilt. |
-| **R05.4** | Empirical query optimization evidence: Before and after `EXPLAIN ANALYZE` benchmarks for cursor vs offset pagination. | NO | NO | NO | NO | **PENDING** | [load-tests README.md](../load-tests/README.md) | Gap: No `EXPLAIN ANALYZE` execution logs captured. |
-| **R05.5** | Mobile client infinite scroll feed with distinct loading, empty, error, and end-of-list states. | NO | NO | NO | NO | **PENDING** | [app index.tsx](../app/src/app/(app)/index.tsx) | Gap: Activity feed UI unbuilt. |
-| **R05.6** | Mobile feed UI performance & reliability: Native pull-to-refresh (`RefreshControl`), in-flight duplicate request debouncing/prevention, and documented architectural justification for `FlatList` vs alternatives. | NO | NO | NO | NO | **PENDING** | [app index.tsx](../app/src/app/(app)/index.tsx) | Gap: Pull-to-refresh, in-flight request debouncing, and list component justification unbuilt. |
-| **R05.7** | Database indexing verification: Composite B-tree index `[teamId, createdAt DESC, id DESC]` benchmarked with `EXPLAIN ANALYZE` before and after index application on 10,000 records. | NO | NO | NO | NO | **PENDING** | [load-tests README.md](../load-tests/README.md) | Gap: Index benchmarking unperformed. |
+| **R05.1** | Chronological activity feed capturing team audit events (shifts, roster changes, swaps). | YES | YES | YES | YES | **DONE** | [activity.service.ts](../server/src/services/activity.service.ts), [activity.integration.test.ts](../server/src/teams/activity.integration.test.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Direct test execution proof: `activity.integration.test.ts` (11/11 tests passed) verifies full event taxonomy (12 event types across shifts, roster, and swaps), atomic transaction rollback with zero speculative records, and metadata sanitization. |
+| **R05.2** | Keyset / cursor pagination using composite `[timestamp, id]` cursor and supporting composite index. | YES | YES | YES | YES | **DONE** | [activity.service.ts](../server/src/services/activity.service.ts), [activity.controller.ts](../server/src/controllers/activity.controller.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Keyset cursor pagination implemented with `(createdAt DESC, id DESC)` ordering, composite B-tree index, opaque base64url cursor, and HTTP 400 validation for malformed cursors. Verified multi-page traversal without duplicates in `activity.integration.test.ts`. |
+| **R05.3** | Synthetic database seed populating 10,000+ realistic activity feed records for performance testing. | YES | YES | N/A | YES | **DONE** | [seed-activity-fixtures.ts](../server/src/benchmarks/seed-activity-fixtures.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Synthetic database seeder generates 10,000 realistic activity records distributed across 12 event types in 11.62s using chunked transactions against disposable Neon DB. |
+| **R05.4** | Empirical query optimization evidence: Before and after `EXPLAIN ANALYZE` benchmarks for cursor vs offset pagination. | YES | YES | N/A | YES | **DONE** | [benchmark-activity-query.ts](../server/src/benchmarks/benchmark-activity-query.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Empirical `EXPLAIN (ANALYZE, BUFFERS)` benchmarks on 10,000 records demonstrate Keyset pagination (1.637 ms) is 3.53x faster than Offset pagination (5.772 ms) at deep offset 9,000 with constant-time seek. |
+| **R05.5** | Mobile client infinite scroll feed with distinct loading, empty, error, and end-of-list states. | NO | NO | NO | NO | **PENDING** | [app index.tsx](../app/src/app/(app)/index.tsx) | Gap: Activity feed mobile UI pending Stage B. |
+| **R05.6** | Mobile feed UI performance & reliability: Native pull-to-refresh (`RefreshControl`), in-flight duplicate request debouncing/prevention, and documented architectural justification for `FlatList` vs alternatives. | NO | NO | NO | NO | **PENDING** | [app index.tsx](../app/src/app/(app)/index.tsx) | Gap: Pull-to-refresh and request debouncing pending Stage B mobile UI. |
+| **R05.7** | Database indexing verification: Composite B-tree index `[teamId, createdAt DESC, id DESC]` benchmarked with `EXPLAIN ANALYZE` before and after index application on 10,000 records. | YES | YES | YES | YES | **DONE** | [schema.prisma](../server/prisma/schema.prisma), [benchmark-activity-query.ts](../server/src/benchmarks/benchmark-activity-query.ts), [activity-feed-backend-evidence.md](./evidence/activity-feed-backend-evidence.md) | None. Empirical before/after `EXPLAIN ANALYZE` comparison on 10,000 records proves composite B-tree index `(teamId, createdAt DESC, id DESC)` provides 44.5x acceleration on initial queries (0.051 ms vs 2.272 ms) by eliminating Seq Scan and in-memory quicksort. |
 
 ---
 
@@ -360,7 +360,7 @@ To graduate successfully, the remaining gaps must be resolved in the following p
    - **R03.3 & R03.4:** Team invitation emails/tokens and deep link routing.
    - **R08.1 – R08.7:** Push notifications, token registration, retry worker, and quiet hours delay queuing.
 4. **High-Volume Feed & Scalability Proofs:**
-   - **R05.1 – R05.7:** Activity feed schema, composite `[timestamp, id]` cursor pagination, 10k seed script, pull-to-refresh UI, and `EXPLAIN ANALYZE` before/after index proof.
+   - **R05.1 – R05.4, R05.7:** Activity feed schema, composite `[timestamp, id]` cursor pagination, 10k seed script, and `EXPLAIN ANALYZE` before/after index proof verified. Mobile UI (R05.5, R05.6) pending Stage B.
    - **R13.2 – R13.4:** `EXPLAIN ANALYZE` query plans and k6 200 VU load test execution.
 5. **Client State Modernization:**
    - **R06.1 – R06.5:** Install TanStack Query, define query key factories, implement optimistic updates with automatic rollback, and configure offline cache.

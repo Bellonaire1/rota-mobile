@@ -1,9 +1,10 @@
-import { Prisma, ShiftStatus, TeamRole } from '@prisma/client';
+import { ActivityEventType, Prisma, ShiftStatus, TeamRole } from '@prisma/client';
 import { prisma } from '../database/prisma';
 import { runSerializable } from '../database/transactions';
 import { AppError } from '../errors/AppError';
 import { Permission, hasPermission } from '../rbac/permissions';
 import { assertOperationalMutationEntitlement, resolveSubscriptionEntitlement } from './subscription-entitlement.service';
+import { activityService } from './activity.service';
 import {
   CancelShiftInput,
   CreateShiftInput,
@@ -109,7 +110,7 @@ export const shiftService = {
       await assertAssignee(transaction, teamId, input.assignedToUserId);
       await assertNoOverlap(transaction, input.assignedToUserId, input.startsAt, input.endsAt);
 
-      return transaction.shift.create({
+      const createdShift = await transaction.shift.create({
         data: {
           teamId,
           assignedToUserId: input.assignedToUserId,
@@ -120,6 +121,22 @@ export const shiftService = {
         },
         select: shiftSelect,
       });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.SHIFT_CREATED,
+        entityType: 'SHIFT',
+        entityId: createdShift.id,
+        metadata: {
+          title: createdShift.title,
+          assignedToUserId: createdShift.assignedToUserId,
+          startsAt: createdShift.startsAt.toISOString(),
+          endsAt: createdShift.endsAt.toISOString(),
+        },
+      });
+
+      return createdShift;
     });
   },
 
@@ -207,7 +224,24 @@ export const shiftService = {
         throw new AppError(409, 'Shift has changed; reload before retrying');
       }
 
-      return transaction.shift.findUniqueOrThrow({ where: { id: shiftId }, select: shiftSelect });
+      const updatedShift = await transaction.shift.findUniqueOrThrow({ where: { id: shiftId }, select: shiftSelect });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.SHIFT_UPDATED,
+        entityType: 'SHIFT',
+        entityId: shiftId,
+        metadata: {
+          title: updatedShift.title,
+          assignedToUserId: updatedShift.assignedToUserId,
+          previousAssignedToUserId: shift.assignedToUserId !== assignedToUserId ? shift.assignedToUserId : undefined,
+          startsAt: updatedShift.startsAt.toISOString(),
+          endsAt: updatedShift.endsAt.toISOString(),
+        },
+      });
+
+      return updatedShift;
     });
   },
 
@@ -240,7 +274,22 @@ export const shiftService = {
         throw new AppError(409, 'Shift has changed; reload before retrying');
       }
 
-      return transaction.shift.findUniqueOrThrow({ where: { id: shiftId }, select: shiftSelect });
+      const cancelledShift = await transaction.shift.findUniqueOrThrow({ where: { id: shiftId }, select: shiftSelect });
+
+      await activityService.logEvent(transaction, {
+        teamId,
+        actorUserId: actorId,
+        type: ActivityEventType.SHIFT_CANCELLED,
+        entityType: 'SHIFT',
+        entityId: shiftId,
+        metadata: {
+          title: cancelledShift.title,
+          assignedToUserId: cancelledShift.assignedToUserId,
+          cancelledAt: cancelledShift.cancelledAt?.toISOString(),
+        },
+      });
+
+      return cancelledShift;
     });
   },
 };

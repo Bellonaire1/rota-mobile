@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { shiftController } from '../controllers/shift.controller';
 import { shiftSwapController } from '../controllers/shift-swap.controller';
+import { activityController } from '../controllers/activity.controller';
 import { teamController } from '../controllers/team.controller';
 import { billingController } from '../controllers/billing.controller';
 import { authenticate } from '../middleware/authenticate';
@@ -33,6 +34,10 @@ import {
   shiftSwapParamsSchema,
   shiftSwapTargetParamsSchema,
 } from '../schemas/shift-swap.schema';
+import {
+  activityFeedParamsSchema,
+  activityFeedQuerySchema,
+} from '../schemas/activity.schema';
 
 const router = Router();
 
@@ -116,6 +121,12 @@ router.post(
   validateRequest({ params: shiftSwapTargetParamsSchema }),
   requireTeamMembership,
   shiftSwapController.cancel
+);
+router.get(
+  '/:teamId/activity',
+  validateRequest({ params: activityFeedParamsSchema, query: activityFeedQuerySchema }),
+  requireTeamMembership,
+  activityController.list
 );
 router.get(
   '/:teamId/billing',
