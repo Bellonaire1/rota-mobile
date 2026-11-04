@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { ActivityEventType, TeamRole } from '@prisma/client';
+import { ActivityEventType, Prisma, TeamRole } from '@prisma/client';
 import { prisma } from '../database/prisma';
 import { runSerializable } from '../database/transactions';
 import { AppError } from '../errors/AppError';
@@ -71,7 +71,8 @@ export const teamInvitationService = {
   /**
    * Team OWNER invites a person by email.
    * Enforces OWNER authorization, validates seat entitlements, checks duplicate active invites,
-   * enforces persistent rate limits, delivers email, and stores only the SHA-256 token hash.
+   * enforces persistent rate limits atomically with database row locking, delivers email,
+   * and stores only the SHA-256 token hash.
    */
   async create(
     teamId: string,
@@ -82,76 +83,10 @@ export const teamInvitationService = {
 
     const normalizedEmail = input.email.trim().toLowerCase();
 
-    // 1. Enforce persistent rate limit on invitation creations
-    const windowStart = new Date(Date.now() - RATE_LIMIT_WINDOW_MS);
-    const recentCount = await prisma.teamInvitation.count({
-      where: {
-        teamId,
-        createdAt: { gte: windowStart },
-      },
-    });
-
-    if (recentCount >= MAX_INVITATIONS_PER_WINDOW) {
-      throw new AppError(429, 'Too many invitations created recently. Please try again later.');
-    }
-
-    // 2. Reject existing team members
-    const existingMember = await prisma.teamMembership.findFirst({
-      where: {
-        teamId,
-        user: { email: { equals: normalizedEmail, mode: 'insensitive' } },
-      },
-      select: { id: true },
-    });
-
-    if (existingMember) {
-      throw new AppError(409, 'User is already a member of this team');
-    }
-
-    // 3. Reject duplicate active (unaccepted, unrevoked, unexpired) invitations
-    const now = new Date();
-    const activeInvite = await prisma.teamInvitation.findFirst({
-      where: {
-        teamId,
-        invitedEmail: normalizedEmail,
-        acceptedAt: null,
-        revokedAt: null,
-        expiresAt: { gt: now },
-      },
-      select: { id: true },
-    });
-
-    if (activeInvite) {
-      throw new AppError(409, 'An active invitation already exists for this email address');
-    }
-
-    // 4. Check seat entitlement
-    const entitlement = await resolveSubscriptionEntitlement(prisma, teamId);
-    assertMembershipSeatEntitlement(entitlement, entitlement.currentBillableStaffSeats + 1);
-
-    // 5. Verify email provider is ready
+    // Verify email delivery is available before executing transaction
     await emailService.verifyDeliveryAvailable();
 
-    // 6. Clean up any expired pending invitations for this (teamId, email) to satisfy unique partial index
-    await prisma.teamInvitation.updateMany({
-      where: {
-        teamId,
-        invitedEmail: normalizedEmail,
-        acceptedAt: null,
-        revokedAt: null,
-        expiresAt: { lte: now },
-      },
-      data: {
-        revokedAt: now,
-      },
-    });
-
-    // 7. Generate cryptographically secure random token (256 bits entropy)
-    const rawToken = crypto.randomBytes(32).toString('hex');
-    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-    const expiresAt = new Date(Date.now() + INVITATION_TTL_MS);
-
-    // 8. Fetch team and inviter metadata for email message
+    // Fetch team and inviter metadata for email message
     const team = await prisma.team.findUnique({
       where: { id: teamId },
       select: { name: true },
@@ -161,19 +96,112 @@ export const teamInvitationService = {
       select: { name: true, email: true },
     });
 
-    // 9. Persist invitation record
-    const invitation = await prisma.teamInvitation.create({
-      data: {
-        teamId,
-        invitedEmail: normalizedEmail,
-        role: input.role,
-        tokenHash,
-        invitedByUserId: actorUserId,
-        expiresAt,
-      },
-    });
+    // Generate cryptographically secure random token (256 bits entropy)
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const expiresAt = new Date(Date.now() + INVITATION_TTL_MS);
 
-    // 10. Deliver email via EmailService. If delivery fails, roll back persisted record immediately.
+    // Atomically execute rate-limiting, membership checks, entitlement assertion, and creation
+    let invitation;
+    try {
+      invitation = await prisma.$transaction(
+        async (tx) => {
+          // 1. Lock Team row to serialize concurrent invitation operations and rate limiting for this team
+          await tx.$queryRaw`SELECT "id" FROM "Team" WHERE "id" = ${teamId} FOR UPDATE`;
+
+          // 2. Enforce persistent rate limit atomically on invitation creations
+          const windowStart = new Date(Date.now() - RATE_LIMIT_WINDOW_MS);
+          const recentCount = await tx.teamInvitation.count({
+            where: {
+              teamId,
+              createdAt: { gte: windowStart },
+            },
+          });
+
+          if (recentCount >= MAX_INVITATIONS_PER_WINDOW) {
+            throw new AppError(429, 'Too many invitations created recently. Please try again later.');
+          }
+
+          // 3. Reject existing team members
+          const existingMember = await tx.teamMembership.findFirst({
+            where: {
+              teamId,
+              user: { email: { equals: normalizedEmail, mode: 'insensitive' } },
+            },
+            select: { id: true },
+          });
+
+          if (existingMember) {
+            throw new AppError(409, 'User is already a member of this team');
+          }
+
+          // 4. Reject duplicate active (unaccepted, unrevoked, unexpired) invitations
+          const now = new Date();
+          const activeInvite = await tx.teamInvitation.findFirst({
+            where: {
+              teamId,
+              invitedEmail: normalizedEmail,
+              acceptedAt: null,
+              revokedAt: null,
+              expiresAt: { gt: now },
+            },
+            select: { id: true },
+          });
+
+          if (activeInvite) {
+            throw new AppError(409, 'An active invitation already exists for this email address');
+          }
+
+          // 5. Check seat entitlement
+          const entitlement = await resolveSubscriptionEntitlement(tx, teamId);
+          assertMembershipSeatEntitlement(entitlement, entitlement.currentBillableStaffSeats + 1);
+
+          // 6. Clean up any expired pending invitations for this (teamId, email) to satisfy unique partial index
+          await tx.teamInvitation.updateMany({
+            where: {
+              teamId,
+              invitedEmail: normalizedEmail,
+              acceptedAt: null,
+              revokedAt: null,
+              expiresAt: { lte: now },
+            },
+            data: {
+              revokedAt: now,
+            },
+          });
+
+          // 7. Persist invitation record
+          return await tx.teamInvitation.create({
+            data: {
+              teamId,
+              invitedEmail: normalizedEmail,
+              role: input.role,
+              tokenHash,
+              invitedByUserId: actorUserId,
+              expiresAt,
+            },
+          });
+        },
+        {
+          isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+          timeout: 30000,
+          maxWait: 20000,
+        }
+      );
+    } catch (error: any) {
+      if (
+        error?.code === 'P2002' ||
+        error?.message?.includes('Unique constraint failed') ||
+        error?.message?.includes('TeamInvitation_active_team_email_idx')
+      ) {
+        throw new AppError(409, 'An active invitation already exists for this email address');
+      }
+      throw error;
+    }
+
+    // 8. Deliver email via EmailService.
+    // If delivery fails, revoke the invitation so it cannot be used or accepted,
+    // but DO NOT delete the row so that the invitation attempt is counted against the rate limit.
     try {
       await emailService.sendTeamInvitationEmail({
         to: normalizedEmail,
@@ -182,9 +210,15 @@ export const teamInvitationService = {
         role: input.role,
         token: rawToken,
         expiresAt,
+        clientBaseUrl: input.clientBaseUrl,
       });
     } catch (err: any) {
-      await prisma.teamInvitation.delete({ where: { id: invitation.id } }).catch(() => {});
+      await prisma.teamInvitation
+        .update({
+          where: { id: invitation.id },
+          data: { revokedAt: new Date() },
+        })
+        .catch(() => {});
       throw new AppError(
         500,
         `Failed to deliver invitation email: ${err?.message || 'Email delivery error'}`
