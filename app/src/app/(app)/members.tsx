@@ -9,7 +9,8 @@ import { colors, spacing, typography } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
 import { teamService } from '@/services/api/teamService';
-import { TeamMember, TeamRole } from '@/types/api';
+import { teamInvitationService } from '@/services/api/teamInvitationService';
+import { TeamInvitation, TeamMember, TeamRole } from '@/types/api';
 
 type ManagedRole = Exclude<TeamRole, 'OWNER'>;
 
@@ -32,8 +33,30 @@ export default function MembersScreen() {
   const [busyMemberId, setBusyMemberId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
+  const [invitations, setInvitations] = useState<TeamInvitation[]>([]);
+  const [loadingInvitations, setLoadingInvitations] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteRole, setInviteRole] = useState<ManagedRole>('STAFF');
+  const [sendingInvite, setSendingInvite] = useState(false);
+  const [inviteError, setInviteError] = useState<string | null>(null);
+  const [inviteSuccess, setInviteSuccess] = useState<string | null>(null);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
+
   const isOwner = role === 'OWNER';
   const hasMore = pagination.page < pagination.totalPages;
+
+  const loadInvitations = useCallback(async () => {
+    if (!selectedTeam) return;
+    setLoadingInvitations(true);
+    try {
+      const list = await teamInvitationService.list(selectedTeam.id);
+      setInvitations(list);
+    } catch {
+      // Ignored if non-owner or network error
+    } finally {
+      setLoadingInvitations(false);
+    }
+  }, [selectedTeam]);
 
   const loadMembers = useCallback(async (reset = true) => {
     if (!selectedTeam || !user) return;
@@ -65,6 +88,71 @@ export default function MembersScreen() {
   }, [selectedTeam, user]);
 
   useEffect(() => { loadMembers(true); }, [loadMembers]);
+
+  useEffect(() => {
+    if (isOwner) {
+      loadInvitations();
+    }
+  }, [isOwner, loadInvitations]);
+
+  const sendInvitation = async () => {
+    const email = inviteEmail.trim().toLowerCase();
+    if (!selectedTeam) return;
+    if (!email || !email.includes('@')) {
+      setInviteError('Enter a valid email address.');
+      return;
+    }
+    setSendingInvite(true);
+    setInviteError(null);
+    setInviteSuccess(null);
+    try {
+      await teamInvitationService.create(selectedTeam.id, {
+        email,
+        role: inviteRole,
+      });
+      setInviteEmail('');
+      setInviteSuccess(`Invitation sent to ${email}`);
+      await loadInvitations();
+    } catch (requestError) {
+      setInviteError(
+        requestError instanceof ApiError
+          ? requestError.message
+          : 'Unable to send invitation.'
+      );
+    } finally {
+      setSendingInvite(false);
+    }
+  };
+
+  const revokeInvitation = (invitation: TeamInvitation) => {
+    if (!selectedTeam) return;
+    Alert.alert(
+      'Revoke invitation?',
+      `Revoke invitation for ${invitation.invitedEmail}?`,
+      [
+        { text: 'Keep invitation', style: 'cancel' },
+        {
+          text: 'Revoke',
+          style: 'destructive',
+          onPress: async () => {
+            setRevokingId(invitation.id);
+            try {
+              await teamInvitationService.revoke(selectedTeam.id, invitation.id);
+              await loadInvitations();
+            } catch (requestError) {
+              setError(
+                requestError instanceof ApiError
+                  ? requestError.message
+                  : 'Unable to revoke invitation.'
+              );
+            } finally {
+              setRevokingId(null);
+            }
+          },
+        },
+      ]
+    );
+  };
 
   const addMember = async () => {
     const userId = userIdInput.trim();
@@ -141,7 +229,7 @@ export default function MembersScreen() {
     <ScrollView
       style={styles.screen}
       contentContainerStyle={styles.content}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadMembers(true); }} tintColor={colors.primary} />}
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadMembers(true); if (isOwner) loadInvitations(); }} tintColor={colors.primary} />}
     >
       <BrandHeader badge="MEMBERS" title={selectedTeam.name} subtitle="Team members" />
       <View style={styles.navigationRow}>
@@ -158,20 +246,94 @@ export default function MembersScreen() {
       </View>
 
       {isOwner ? (
-        <View style={styles.manageCard}>
-          <Text style={styles.sectionTitle}>Add an existing user</Text>
-          <Text style={styles.muted}>Enter the full UUID of a registered Rota user. New owners cannot be assigned here.</Text>
-          <FormField label="Registered user ID" value={userIdInput} onChangeText={setUserIdInput} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autoCapitalize="none" autoCorrect={false} />
-          <Text style={styles.formLabel}>Role</Text>
-          <View style={styles.roleRow}>
-            {(['STAFF', 'MANAGER'] as ManagedRole[]).map((candidate) => (
-              <Pressable key={candidate} accessibilityRole="radio" accessibilityState={{ checked: newRole === candidate }} onPress={() => setNewRole(candidate)} style={[styles.roleOption, newRole === candidate && styles.roleSelected]}>
-                <Text style={[styles.roleOptionText, newRole === candidate && styles.roleSelectedText]}>{candidate}</Text>
-              </Pressable>
-            ))}
+        <>
+          <View style={styles.manageCard}>
+            <Text style={styles.sectionTitle}>Invite by email</Text>
+            <Text style={styles.muted}>
+              Send a secure one-time invitation link and code. The recipient can accept on mobile or register.
+            </Text>
+            <FormField
+              label="Recipient email"
+              value={inviteEmail}
+              onChangeText={(text) => {
+                setInviteEmail(text);
+                if (inviteError) setInviteError(null);
+                if (inviteSuccess) setInviteSuccess(null);
+              }}
+              placeholder="colleague@example.com"
+              keyboardType="email-address"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text style={styles.formLabel}>Role</Text>
+            <View style={styles.roleRow}>
+              {(['STAFF', 'MANAGER'] as ManagedRole[]).map((candidate) => (
+                <Pressable
+                  key={candidate}
+                  accessibilityRole="radio"
+                  accessibilityState={{ checked: inviteRole === candidate }}
+                  onPress={() => setInviteRole(candidate)}
+                  style={[styles.roleOption, inviteRole === candidate && styles.roleSelected]}
+                >
+                  <Text style={[styles.roleOptionText, inviteRole === candidate && styles.roleSelectedText]}>
+                    {candidate}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            {inviteError ? <Text style={styles.error}>{inviteError}</Text> : null}
+            {inviteSuccess ? <Text style={styles.success}>{inviteSuccess}</Text> : null}
+            <ActionButton
+              label="Send invitation"
+              onPress={sendInvitation}
+              loading={sendingInvite}
+            />
           </View>
-          <ActionButton label="Add registered user" onPress={addMember} loading={adding} />
-        </View>
+
+          {invitations.filter((i) => i.status === 'PENDING').length > 0 ? (
+            <View style={styles.manageCard}>
+              <Text style={styles.sectionTitle}>Pending invitations</Text>
+              <Text style={styles.muted}>
+                Active invitations awaiting acceptance.
+              </Text>
+              {invitations
+                .filter((i) => i.status === 'PENDING')
+                .map((inv) => (
+                  <View key={inv.id} style={styles.invitationRow}>
+                    <View style={styles.invitationInfo}>
+                      <Text style={styles.invitationEmail}>{inv.invitedEmail}</Text>
+                      <Text style={styles.invitationMeta}>
+                        {inv.role} · Expires {new Date(inv.expiresAt).toLocaleDateString()}
+                      </Text>
+                    </View>
+                    <ActionButton
+                      size="small"
+                      label={revokingId === inv.id ? 'Revoking...' : 'Revoke'}
+                      variant="quiet"
+                      loading={revokingId === inv.id}
+                      disabled={revokingId !== null}
+                      onPress={() => revokeInvitation(inv)}
+                    />
+                  </View>
+                ))}
+            </View>
+          ) : null}
+
+          <View style={styles.manageCard}>
+            <Text style={styles.sectionTitle}>Add an existing user</Text>
+            <Text style={styles.muted}>Enter the full UUID of a registered Rota user. New owners cannot be assigned here.</Text>
+            <FormField label="Registered user ID" value={userIdInput} onChangeText={setUserIdInput} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autoCapitalize="none" autoCorrect={false} />
+            <Text style={styles.formLabel}>Role</Text>
+            <View style={styles.roleRow}>
+              {(['STAFF', 'MANAGER'] as ManagedRole[]).map((candidate) => (
+                <Pressable key={candidate} accessibilityRole="radio" accessibilityState={{ checked: newRole === candidate }} onPress={() => setNewRole(candidate)} style={[styles.roleOption, newRole === candidate && styles.roleSelected]}>
+                  <Text style={[styles.roleOptionText, newRole === candidate && styles.roleSelectedText]}>{candidate}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <ActionButton label="Add registered user" onPress={addMember} loading={adding} />
+          </View>
+        </>
       ) : null}
 
       <View style={styles.listHeader}>
@@ -246,5 +408,10 @@ const styles = StyleSheet.create({
   emptyCard: { backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 18, padding: spacing.lg, marginBottom: spacing.md },
   emptyTitle: { color: colors.text, fontSize: typography.sizes.lg, fontWeight: '800' },
   error: { color: colors.error, fontSize: typography.sizes.sm, lineHeight: 20, marginBottom: spacing.md },
+  success: { color: colors.success, fontSize: typography.sizes.sm, lineHeight: 20, marginBottom: spacing.md },
+  invitationRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: spacing.sm, borderTopWidth: 1, borderTopColor: colors.border },
+  invitationInfo: { flex: 1 },
+  invitationEmail: { color: colors.text, fontSize: typography.sizes.sm, fontWeight: '700' },
+  invitationMeta: { color: colors.textSecondary, fontSize: typography.sizes.xs, marginTop: 2 },
   bottomActions: { marginTop: spacing.xl, gap: spacing.sm },
 });

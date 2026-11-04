@@ -265,6 +265,33 @@ describe('R03.3B: targeted team invitation security hardening', { concurrency: f
     assert.strictEqual(sentEmail.subject, 'Invitation to join Resistance HQ on Rota');
   });
 
+  // F2. Strips caller-supplied clientBaseUrl and rejects open-redirect poisoning
+  it('F2. ignores or strips caller-supplied clientBaseUrl so untrusted redirect domains cannot poison email', async () => {
+    const owner = await register();
+    const teamId = await createTeam(owner, 'Phish Defense Team');
+    const targetEmail = `phish-defense-${randomUUID()}@example.com`;
+
+    const res = await jsonRequest(`/teams/${teamId}/invitations`, owner.accessToken, {
+      email: targetEmail,
+      role: 'STAFF',
+      clientBaseUrl: 'https://evil-phishing-site.attacker.com/steal-token',
+    });
+    assert.strictEqual(res.status, 201);
+
+    const sentEmail = mockEmailProvider.getLastEmail()!;
+    assert.ok(sentEmail, 'Email must have been sent');
+    assert.strictEqual(
+      sentEmail.text.includes('evil-phishing-site.attacker.com'),
+      false,
+      'Email text must not contain caller-supplied phishing URL'
+    );
+    assert.strictEqual(
+      sentEmail.html!.includes('evil-phishing-site.attacker.com'),
+      false,
+      'Email HTML must not contain caller-supplied phishing URL'
+    );
+  });
+
   // G. 10 concurrent invitation attempts respect the limit
   it('G. allows exactly 10 concurrent invitation attempts across unique recipients', async () => {
     const owner = await register();

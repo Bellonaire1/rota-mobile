@@ -14,7 +14,6 @@ export const createInvitationSchema = z.object({
     .max(255)
     .transform((val) => val.toLowerCase()),
   role: allowedInvitationRoleSchema,
-  clientBaseUrl: z.string().trim().max(1024).optional(),
 });
 
 export const teamInvitationParamsSchema = z.object({

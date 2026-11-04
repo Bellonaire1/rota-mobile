@@ -36,5 +36,4 @@ export interface TeamInvitationEmailOptions {
   role: 'STAFF' | 'MANAGER';
   token: string;
   expiresAt: Date;
-  clientBaseUrl?: string;
 }

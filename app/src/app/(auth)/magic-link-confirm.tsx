@@ -14,6 +14,7 @@ import { BrandHeader } from '@/components/common/BrandHeader';
 import { FormField } from '@/components/common/FormField';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
+import { pendingInvitationStorage } from '@/services/pendingInvitation';
 import { colors, spacing, typography } from '@/constants/theme';
 
 export default function MagicLinkConfirmScreen() {
@@ -47,7 +48,12 @@ export default function MagicLinkConfirmScreen() {
       await signInWithMagicLink(token.trim());
       // Clear token from memory immediately upon success
       setToken('');
-      router.replace('/(app)/select-team');
+      const pendingToken = await pendingInvitationStorage.getPendingToken();
+      if (pendingToken) {
+        router.replace({ pathname: '/invite', params: { token: pendingToken } });
+      } else {
+        router.replace('/(app)/select-team');
+      }
     } catch (requestError) {
       if (requestError instanceof ApiError) {
         if (requestError.statusCode === 400) {

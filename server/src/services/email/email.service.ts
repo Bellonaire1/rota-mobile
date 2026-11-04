@@ -225,7 +225,7 @@ export class EmailService {
   }
 
   async sendTeamInvitationEmail(options: TeamInvitationEmailOptions): Promise<SendEmailResult> {
-    const rawBaseUrl = options.clientBaseUrl ?? process.env.APP_BASE_URL;
+    const rawBaseUrl = process.env.APP_BASE_URL;
     const trustedBaseUrl = rawBaseUrl ? resolveTrustedWebUrl(rawBaseUrl) : null;
     const webInviteUrl = trustedBaseUrl
       ? `${trustedBaseUrl}/invite?token=${encodeURIComponent(options.token)}`

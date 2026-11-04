@@ -210,7 +210,6 @@ export const teamInvitationService = {
         role: input.role,
         token: rawToken,
         expiresAt,
-        clientBaseUrl: input.clientBaseUrl,
       });
     } catch (err: any) {
       await prisma.teamInvitation

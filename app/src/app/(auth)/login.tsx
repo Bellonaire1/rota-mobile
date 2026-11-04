@@ -6,6 +6,7 @@ import { BrandHeader } from '@/components/common/BrandHeader';
 import { FormField } from '@/components/common/FormField';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
+import { pendingInvitationStorage } from '@/services/pendingInvitation';
 import { colors, spacing, typography } from '@/constants/theme';
 
 export default function LoginScreen() {
@@ -25,7 +26,12 @@ export default function LoginScreen() {
     setError(null);
     try {
       await signIn(email.trim(), password);
-      router.replace('/(app)/select-team');
+      const pendingToken = await pendingInvitationStorage.getPendingToken();
+      if (pendingToken) {
+        router.replace({ pathname: '/invite', params: { token: pendingToken } });
+      } else {
+        router.replace('/(app)/select-team');
+      }
     } catch (requestError) {
       setError(requestError instanceof ApiError ? requestError.message : 'Unable to sign in. Try again.');
     } finally {

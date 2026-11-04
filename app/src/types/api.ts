@@ -209,3 +209,60 @@ export interface ActivityFeedQuery {
   limit?: number;
   cursor?: string;
 }
+
+export type TeamInvitationStatus = 'PENDING' | 'ACCEPTED' | 'REVOKED' | 'EXPIRED';
+
+export interface TeamInvitation {
+  id: string;
+  teamId: string;
+  invitedEmail: string;
+  role: TeamRole;
+  status: TeamInvitationStatus;
+  createdAt: string;
+  expiresAt: string;
+  acceptedAt?: string | null;
+  revokedAt?: string | null;
+}
+
+export interface InvitationPreview {
+  id: string;
+  teamId: string;
+  teamName: string;
+  invitedEmail: string;
+  role: TeamRole;
+  inviterName: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface InvitationPreviewResponse {
+  invitation: InvitationPreview;
+}
+
+export interface InvitationAcceptResponse {
+  membership: {
+    id: string;
+    teamId: string;
+    userId: string;
+    role: TeamRole;
+    createdAt: string;
+    updatedAt: string;
+  };
+  team: {
+    id: string;
+    name: string;
+  };
+}
+
+export interface TeamInvitationSingleResponse {
+  invitation: TeamInvitation;
+}
+
+export interface TeamInvitationsListResponse {
+  invitations: TeamInvitation[];
+}
+
+export interface CreateInvitationInput {
+  email: string;
+  role: Exclude<TeamRole, 'OWNER'>;
+}

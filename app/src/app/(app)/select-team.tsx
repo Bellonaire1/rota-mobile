@@ -86,6 +86,11 @@ export default function SelectTeamScreen() {
         <FormField label="Team name" value={teamName} onChangeText={setTeamName} placeholder="The Morning Crew" maxLength={100} />
         <ActionButton label="Create team" onPress={createTeam} loading={creating} />
       </View>
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Have an invitation code?</Text>
+        <Text style={styles.muted}>If you received an invitation by email or link, you can enter the code to join.</Text>
+        <ActionButton label="Enter invitation code" onPress={() => router.push('/invite')} variant="secondary" />
+      </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <View style={styles.signOutRow}>
         <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
