@@ -52,14 +52,34 @@ export function AuthProvider({ children }: PropsWithChildren) {
     setUser(null);
     setSelectedTeam(null);
     await clearQueryCache(queryClient);
+
+    let offlineError: Error | null = null;
     if (userId) {
-      await offlineShiftStorage.clearUserShifts(userId);
+      try {
+        let persistedTeam: string | null = null;
+        if (persistenceAvailableRef.current) {
+          persistedTeam = await SecureStore.getItemAsync(selectedTeamKey(userId)).catch(() => null);
+        }
+        const knownTeams = [selectedTeam?.id, persistedTeam].filter(Boolean) as string[];
+        await offlineShiftStorage.clearUserShifts(userId, knownTeams);
+      } catch (err: any) {
+        offlineError = err instanceof Error ? err : new Error(String(err));
+        console.error('Failed to clean up offline storage during sign-out:', err);
+      }
     }
-    if (persistenceAvailableRef.current && userId) {
-      await SecureStore.deleteItemAsync(refreshTokenKey(userId));
-      await SecureStore.deleteItemAsync(selectedTeamKey(userId));
+
+    if (persistenceAvailableRef.current) {
+      if (userId) {
+        await SecureStore.deleteItemAsync(refreshTokenKey(userId)).catch(() => {});
+        await SecureStore.deleteItemAsync(selectedTeamKey(userId)).catch(() => {});
+      }
+      await SecureStore.deleteItemAsync('rota.last-user-id').catch(() => {});
     }
-  }, []);
+
+    if (offlineError) {
+      throw offlineError;
+    }
+  }, [selectedTeam?.id]);
 
   const refreshSession = useCallback(async (storedUserId?: string): Promise<string | null> => {
     if (!refreshTokenRef.current) return null;

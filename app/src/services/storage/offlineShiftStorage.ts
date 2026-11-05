@@ -116,24 +116,44 @@ export class SecureStoreAdapter implements OfflineStorageAdapter {
  */
 export class MemoryStorageAdapter implements OfflineStorageAdapter {
   private store = new Map<string, string>();
-  private failureMode: { set?: boolean; remove?: boolean; get?: boolean } = {};
+  private failureMode: {
+    set?: boolean | ((key: string) => boolean);
+    remove?: boolean | ((key: string) => boolean);
+    get?: boolean | ((key: string) => boolean);
+  } = {};
 
-  public setFailureMode(mode: { set?: boolean; remove?: boolean; get?: boolean }) {
+  public setFailureMode(mode: {
+    set?: boolean | ((key: string) => boolean);
+    remove?: boolean | ((key: string) => boolean);
+    get?: boolean | ((key: string) => boolean);
+  }) {
     this.failureMode = mode;
   }
 
   async getItem(key: string): Promise<string | null> {
-    if (this.failureMode.get) throw new Error('Simulated storage read error');
+    const shouldFail =
+      typeof this.failureMode.get === 'function'
+        ? this.failureMode.get(key)
+        : this.failureMode.get;
+    if (shouldFail) throw new Error(`Simulated storage read error for key: ${key}`);
     return this.store.get(key) ?? null;
   }
 
   async setItem(key: string, value: string): Promise<void> {
-    if (this.failureMode.set) throw new Error('Simulated storage write error');
+    const shouldFail =
+      typeof this.failureMode.set === 'function'
+        ? this.failureMode.set(key)
+        : this.failureMode.set;
+    if (shouldFail) throw new Error(`Simulated storage write error for key: ${key}`);
     this.store.set(key, value);
   }
 
   async removeItem(key: string): Promise<void> {
-    if (this.failureMode.remove) throw new Error('Simulated storage delete error');
+    const shouldFail =
+      typeof this.failureMode.remove === 'function'
+        ? this.failureMode.remove(key)
+        : this.failureMode.remove;
+    if (shouldFail) throw new Error(`Simulated storage delete error for key: ${key}`);
     this.store.delete(key);
   }
 
@@ -241,28 +261,25 @@ export class OfflineShiftStorageManager {
       );
     }
 
+    // 1. Update user's team index FIRST so snapshot is never left untracked
+    const indexKey = getOfflineTeamIndexKey(userId);
+    const rawIndex = await this.adapter.getItem(indexKey);
+    let teams: string[] = [];
+    if (rawIndex) {
+      try {
+        teams = JSON.parse(rawIndex);
+      } catch {
+        teams = [];
+      }
+    }
+    if (!teams.includes(teamId)) {
+      teams.push(teamId);
+      await this.adapter.setItem(indexKey, JSON.stringify(teams));
+    }
+
+    // 2. Persist shift snapshot
     const key = getOfflineShiftKey(userId, teamId);
     await this.adapter.setItem(key, serialized);
-
-    // Register team in user's team index
-    try {
-      const indexKey = getOfflineTeamIndexKey(userId);
-      const rawIndex = await this.adapter.getItem(indexKey);
-      let teams: string[] = [];
-      if (rawIndex) {
-        try {
-          teams = JSON.parse(rawIndex);
-        } catch {
-          teams = [];
-        }
-      }
-      if (!teams.includes(teamId)) {
-        teams.push(teamId);
-        await this.adapter.setItem(indexKey, JSON.stringify(teams));
-      }
-    } catch (err) {
-      // Do not fail snapshot persistence if index update fails, but re-throw if critical
-    }
 
     return snapshot;
   }
@@ -337,6 +354,7 @@ export class OfflineShiftStorageManager {
     }
 
     const allTeams = Array.from(new Set([...indexedTeams, ...knownTeamIds]));
+    const failedTeams: string[] = [];
     const errors: Error[] = [];
 
     for (const teamId of allTeams) {
@@ -344,14 +362,24 @@ export class OfflineShiftStorageManager {
         const key = getOfflineShiftKey(userId, teamId);
         await this.adapter.removeItem(key);
       } catch (err: any) {
+        failedTeams.push(teamId);
         errors.push(err instanceof Error ? err : new Error(String(err)));
       }
     }
 
-    try {
-      await this.adapter.removeItem(indexKey);
-    } catch (err: any) {
-      errors.push(err instanceof Error ? err : new Error(String(err)));
+    if (failedTeams.length > 0) {
+      // Retain failed teams in the index so retry can discover and clean them up
+      try {
+        await this.adapter.setItem(indexKey, JSON.stringify(failedTeams));
+      } catch (err: any) {
+        errors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    } else {
+      try {
+        await this.adapter.removeItem(indexKey);
+      } catch (err: any) {
+        errors.push(err instanceof Error ? err : new Error(String(err)));
+      }
     }
 
     if (errors.length > 0) {

@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { shiftSwapService } from '@/services/api/shiftSwapService';
 import { teamService } from '@/services/api/teamService';
 import { queryKeys } from '../queryKeys';
@@ -19,6 +19,83 @@ export interface ShiftSwapTabCounts {
 }
 
 /**
+ * Core query function to fetch a single page of shift swaps partitioned by active tab and filter.
+ */
+export async function fetchShiftSwapsTabPage(
+  teamId: string,
+  userId: string,
+  activeTab: TabType,
+  historyFilter: HistoryFilter,
+  page: number
+): Promise<ShiftSwapsTabResult> {
+  if (activeTab === 'MANAGER_REVIEW') {
+    const response = await shiftSwapService.list(teamId, {
+      page,
+      limit: 20,
+      status: 'PENDING_MANAGER',
+    });
+    return {
+      shiftSwaps: response.shiftSwaps,
+      pagination: response.pagination,
+    };
+  }
+
+  if (activeTab === 'INCOMING') {
+    const response = await shiftSwapService.list(teamId, {
+      page,
+      limit: 30,
+      status: 'PENDING_PEER',
+    });
+    const incomingOnly = response.shiftSwaps.filter((s) => s.receivingUserId === userId);
+    return {
+      shiftSwaps: incomingOnly,
+      pagination: response.pagination,
+    };
+  }
+
+  if (activeTab === 'MY_REQUESTS') {
+    const [peerRes, mgrRes] = await Promise.all([
+      shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_PEER' }),
+      shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_MANAGER' }),
+    ]);
+    const myActive = [...peerRes.shiftSwaps, ...mgrRes.shiftSwaps].filter(
+      (s) => s.requestingUserId === userId
+    );
+    const maxTotalPages = Math.max(peerRes.pagination.totalPages, mgrRes.pagination.totalPages);
+    const combinedTotal = peerRes.pagination.total + mgrRes.pagination.total;
+    return {
+      shiftSwaps: myActive,
+      pagination: {
+        page,
+        limit: 30,
+        total: combinedTotal,
+        totalPages: maxTotalPages,
+      },
+    };
+  }
+
+  // HISTORY tab
+  const statusParam = historyFilter === 'ALL' ? undefined : historyFilter;
+  const response = await shiftSwapService.list(teamId, {
+    page,
+    limit: 30,
+    status: statusParam,
+  });
+
+  const historyOnly =
+    historyFilter === 'ALL'
+      ? response.shiftSwaps.filter(
+          (s) => !['PENDING_PEER', 'PENDING_MANAGER'].includes(s.status)
+        )
+      : response.shiftSwaps;
+
+  return {
+    shiftSwaps: historyOnly,
+    pagination: response.pagination,
+  };
+}
+
+/**
  * Loads paginated shift swaps partitioned by active tab and history filter.
  * Kept in TanStack Query cache to enable instant optimistic UI mutations.
  */
@@ -35,72 +112,37 @@ export function useShiftSwapsTab(
       if (!teamId || !userId) {
         return { shiftSwaps: [], pagination: { total: 0, page: 1, limit: 20, totalPages: 1 } };
       }
+      return fetchShiftSwapsTabPage(teamId, userId, activeTab, historyFilter, page);
+    },
+    enabled: Boolean(teamId && userId),
+  });
+}
 
-      if (activeTab === 'MANAGER_REVIEW') {
-        const response = await shiftSwapService.list(teamId, {
-          page,
-          limit: 20,
-          status: 'PENDING_MANAGER',
-        });
-        return {
-          shiftSwaps: response.shiftSwaps,
-          pagination: response.pagination,
-        };
+/**
+ * Loads paginated shift swaps via TanStack Infinite Query partitioned by active tab and history filter.
+ * Keeps all loaded pages in query cache so clicking "Load more" accumulates pages without replacing earlier items.
+ */
+export function useInfiniteShiftSwapsTab(
+  teamId?: string,
+  userId?: string,
+  activeTab: TabType = 'INCOMING',
+  historyFilter: HistoryFilter = 'ALL'
+) {
+  return useInfiniteQuery<ShiftSwapsTabResult, Error>({
+    queryKey: queryKeys.shiftSwaps.infiniteTab(teamId ?? '', userId ?? '', activeTab, historyFilter),
+    queryFn: async ({ pageParam = 1 }): Promise<ShiftSwapsTabResult> => {
+      const page = pageParam as number;
+      if (!teamId || !userId) {
+        return { shiftSwaps: [], pagination: { total: 0, page: 1, limit: 20, totalPages: 1 } };
       }
-
-      if (activeTab === 'INCOMING') {
-        const response = await shiftSwapService.list(teamId, {
-          page,
-          limit: 30,
-          status: 'PENDING_PEER',
-        });
-        const incomingOnly = response.shiftSwaps.filter((s) => s.receivingUserId === userId);
-        return {
-          shiftSwaps: incomingOnly,
-          pagination: response.pagination,
-        };
+      return fetchShiftSwapsTabPage(teamId, userId, activeTab, historyFilter, page);
+    },
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+      if (lastPage.pagination.page < lastPage.pagination.totalPages) {
+        return lastPage.pagination.page + 1;
       }
-
-      if (activeTab === 'MY_REQUESTS') {
-        const [peerRes, mgrRes] = await Promise.all([
-          shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_PEER' }),
-          shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_MANAGER' }),
-        ]);
-        const myActive = [...peerRes.shiftSwaps, ...mgrRes.shiftSwaps].filter(
-          (s) => s.requestingUserId === userId
-        );
-        const maxTotalPages = Math.max(peerRes.pagination.totalPages, mgrRes.pagination.totalPages);
-        const combinedTotal = peerRes.pagination.total + mgrRes.pagination.total;
-        return {
-          shiftSwaps: myActive,
-          pagination: {
-            page,
-            limit: 30,
-            total: combinedTotal,
-            totalPages: maxTotalPages,
-          },
-        };
-      }
-
-      // HISTORY tab
-      const statusParam = historyFilter === 'ALL' ? undefined : historyFilter;
-      const response = await shiftSwapService.list(teamId, {
-        page,
-        limit: 30,
-        status: statusParam,
-      });
-
-      const historyOnly =
-        historyFilter === 'ALL'
-          ? response.shiftSwaps.filter(
-              (s) => !['PENDING_PEER', 'PENDING_MANAGER'].includes(s.status)
-            )
-          : response.shiftSwaps;
-
-      return {
-        shiftSwaps: historyOnly,
-        pagination: response.pagination,
-      };
+      return undefined;
     },
     enabled: Boolean(teamId && userId),
   });

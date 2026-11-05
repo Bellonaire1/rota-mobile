@@ -1,9 +1,9 @@
-# ROTA — TASK R06B & R06B.1 EVIDENCE
-## Offline Cache Security, Real Connectivity & Optimistic UI Workflows
+# ROTA — TASK R06B, R06B.1 & R06B.2 EVIDENCE
+## Offline Cache Security, Real Connectivity, Native Network Integration & Swap Pagination Hardening
 
 **Repository:** `C:\Users\USER\rota-mobile`  
-**Verified Baseline:** `fd1c31eef8ba86718de68cb33002487f2eda2432`  
-**Requirements Addressed:** R06.2, R06.3, R06.4  
+**Verified Starting Baseline:** `163a39c44dc5ada589a8186c2471485402b089c1`  
+**Requirements Addressed:** R06.2, R06.3, R06.4, R06.5  
 **Evaluation Dimensions:** Impl: YES | Test: YES | Dep: NO | Evid: YES  
 **Status Result:** PARTIAL (Awaiting production deployment & physical Android device airplane mode validation)  
 
@@ -21,55 +21,60 @@
 
 ---
 
-### 2. Bounded Offline Shift Storage & Sign-Out Cleanup Hardening (Task R06B.1)
+### 2. Offline Storage Security & Recoverable Cleanup (Tasks R06B.1 & R06B.2)
 
-- **Team Registry Discovery for Zero-Parameter Sign-Out Cleanup:**
-  - **Identified Flaw:** `clearUserShifts(userId)` previously only removed keys for teams provided in an optional `knownTeamIds` parameter. Because `AuthContext.clearCredentials()` passed no team IDs, sign-out left all persisted offline shifts on the device.
-  - **Correction:** Implemented `getOfflineTeamIndexKey(userId)` registry key (`rota.offline-shifts.index.${userId}`). When `saveShifts` saves a snapshot for any team, it automatically records the `teamId` in the user's registry.
-  - `clearUserShifts(userId)` now discovers all historical teams the user ever visited, deletes every snapshot key, deletes the index itself, and explicitly catches and reports any storage deletion failures rather than falsely claiming success.
-- **Measured Byte-Size Boundary (< 2000 Bytes):**
-  - **Identified Flaw:** Assuming 20 records always serialize below 2048 bytes was unsafe for long titles, descriptions, and user names.
-  - **Correction:** Enforced measured UTF-8 byte-length (`getUtf8ByteLength(serialized)`). Titles are truncated to 40 characters and assigned names to 30 characters. If the serialized snapshot exceeds `MAX_OFFLINE_PAYLOAD_BYTES = 2000`, older shifts are iteratively pruned until the payload strictly fits under 2000 bytes.
-- **Storage Write Failure Detection:**
-  - `SecureStoreAdapter` and `saveShifts` propagate storage errors rather than silently swallowing them. If secure storage is full or fails, an exception is thrown and the failure is handled gracefully without falsely reporting successful persistence.
-- **Snapshot Isolation During Render & Filter Correctness:**
-  - Synchronously clears loaded `offlineSnapshot` during the render phase if `selectedTeam?.id` changes, preventing Team A snapshots from rendering under Team B before effects execute.
-  - Offline snapshots are filtered strictly against the active `statusFilter` and `filterDate`. An unfiltered snapshot is never presented as if it satisfies a specific status or date filter.
-  - Authoritative HTTP 403/404 errors wipe the team's offline cache immediately via `clearTeamShifts(userId, teamId)` and suppress offline rendering.
+- **Index-First Persistence Pre-Allocation:**
+  - `OfflineShiftStorageManager.saveShifts(userId, teamId, shifts)` now writes `teamId` to the user's index registry (`rota.offline-shifts.index.${userId}`) *before* persisting the snapshot to storage. If the index update fails, the operation throws immediately and the snapshot write is never initiated, guaranteeing zero untracked orphan snapshots.
+- **Recoverable Partial Deletion:**
+  - In `clearUserShifts(userId, knownTeamIds)`, if any team snapshot fails to delete, the failed team IDs are preserved in the user index rather than wiping the index. A subsequent retry or sign-out retains full knowledge of which snapshots remain to be cleaned up.
+- **Independent Credential Wipe in `AuthContext`:**
+  - In `AuthContext.clearCredentials()`, offline shift deletion is isolated in its own try/catch block. Deletion of the refresh token, selected team, and session metadata from `SecureStore` always executes even if offline storage cleanup encounters an unexpected error.
+- **Strict Byte-Size Boundary (< 2000 Bytes):**
+  - Enforced measured UTF-8 byte-length (`getUtf8ByteLength(serialized)`). Titles are truncated to 40 characters and assigned names to 30 characters. If the serialized snapshot exceeds `MAX_OFFLINE_PAYLOAD_BYTES = 2000`, older shifts are iteratively pruned until the payload strictly fits under 2000 bytes.
+- **Authoritative 403 / 404 Access Revocation:**
+  - When `shiftsQuery` encounters an HTTP 403 (FORBIDDEN) or 404 (NOT_FOUND), `displayedShifts` immediately evaluates to `[]`.
+  - The query cache for the revoked team is purged via `queryClient.removeQueries({ queryKey: queryKeys.shifts.all(teamId, userId) })`.
+  - The offline snapshot is deleted via `offlineShiftStorage.clearTeamShifts(userId, teamId)` and the offline banner suppressed, rendering an explicit access revoked state.
 - **True Server Synchronization Timestamp Semantics:**
-  - `syncedAt` timestamps are only created/updated upon genuine successful server fetch responses for the team's general schedule (`statusFilter === 'ALL' && !filterDate`). Merely reading data from the offline cache or TanStack Query cache never advances the timestamp.
+  - `syncedAt` timestamps are only created/updated when TanStack Query's `dataUpdatedAt` genuinely advances past `lastSavedDataUpdatedAtRef.current` following a fresh, successful server response for the team's unfiltered schedule (`statusFilter === 'ALL' && !filterDate`). Merely mounting offline or reading from cached queries never advances `syncedAt`.
+- **Bounded Offline Schedule Clarification:**
+  - When the offline snapshot holds `MAX_OFFLINE_SHIFTS_PER_TEAM = 20` shifts, the offline banner clearly displays: `'Viewing cached schedule (Partial schedule · Max 20 shifts)'`.
 
 ---
 
-### 3. Real Network Connectivity & Lifecycle Integration (Task R06B.1)
+### 3. Native Network Event Integration & Lifecycle (Task R06B.2)
 
-- **Identified Flaw:** `connectivityManager.checkConnectivity()` existed as an isolated helper but was never wired into the application root or lifecycle. The manager initialized `online = true`, meaning the app would never detect airplane mode on startup or foreground transitions.
-- **Correction:**
-  - Created `setupNetworkConnectivity(appStateSource)` in `app/src/services/network/connectivityManager.ts`.
-  - Wired into `RootLayout` (`app/src/app/_layout.tsx`) alongside `setupQueryFocusManager`.
-  - Executes an immediate real network probe at application startup.
-  - Listens to React Native `AppState` change events to re-probe connectivity whenever the application transitions to `active` (foreground).
-  - Listens to web `online` and `offline` window events when running on Web.
-  - Distinguishes device network connectivity from backend server availability: network transport errors (`TypeError`, `AbortError`, timeout) transition device to offline (`isOnline = false`), while HTTP 5xx responses indicate device is online but backend is unavailable (`isOnline = true, backendAvailable = false`).
-  - Automatically synchronizes TanStack Query's `onlineManager.setOnline(isOnline)` and notifies all reactive subscribers.
+- **`@react-native-community/netinfo` Integration:**
+  - Installed version `12.0.1` cleanly into `app/package.json`.
+  - Integrated via lazy module loader `getNetInfo()` in `app/src/services/network/connectivityManager.ts`, allowing unit tests and headless environments to run without native binary bindings.
+  - Listens to real-time native network transitions (e.g. flipping Airplane Mode or toggling Wi-Fi while the application remains active).
+  - When `state.isConnected === false`, immediately marks the device offline and updates `onlineManager.setOnline(false)` without waiting for health probe timeouts.
+  - When `state.isConnected === true` and `state.isInternetReachable !== false`, immediately verifies connectivity via `checkConnectivity()`.
+- **Distinction Between Device Offline and Backend Unavailable:**
+  - Device network failures (`TypeError`, `AbortError`, timeout) transition device to offline (`isOnline = false, backendAvailable = false`).
+  - Backend errors (HTTP 500 on `/health`) keep `isOnline = true` while setting `backendAvailable = false`, ensuring TanStack Query does not falsely classify server downtime as device disconnection.
+- **Clean Teardown:**
+  - `setupNetworkConnectivity(AppState)` wired in `_layout.tsx` returns a combined teardown function that deregisters both NetInfo and AppState listeners on unmount.
 
 ---
 
-### 4. Visible Optimistic Swap Mutations & Rollback Architecture (Task R06B.1)
+### 4. Shift Swap Infinite Pagination & Optimistic Updates (Task R06B.2)
 
-- **Identified Flaw:** `shift-swaps.tsx` previously kept swaps in a component-level `useState` array populated by a manual `loadSwaps()` function. Optimistic mutations updated the TanStack Query cache, but because the visible list did not observe that cache, optimistic updates had no effect on the visible list. Furthermore, `useOptimisticSwapCancel` lacked a genuine optimistic cache update and rollback.
-- **Correction:**
-  - Created typed TanStack Query hooks in `app/src/services/query/hooks/useShiftSwapsQuery.ts`:
-    - `useShiftSwapsTab(teamId, userId, activeTab, historyFilter, page)`: drives the visible swap list directly from the query cache.
-    - `useShiftSwapsTabCounts(teamId, userId)`: drives the tab badge counts directly from the query cache.
-    - `useShiftSwapRole(teamId, userId)`: caches the user's role in the active team.
-  - Migrated `app/src/app/(app)/shift-swaps.tsx` to use these hooks, removing manual `swaps` state and `loadSwaps()`.
-  - Hardened `useOptimisticSwapMutations.ts`:
-    - `useOptimisticSwapRespond`: `onMutate` immediately removes the swap from the visible `INCOMING` tab and decrements `incoming` badge count.
-    - `useOptimisticSwapReview`: `onMutate` immediately removes the swap from the visible `MANAGER_REVIEW` tab and decrements `managerReview` badge count.
-    - `useOptimisticSwapCancel`: `onMutate` immediately removes the swap from the visible `MY_REQUESTS` tab and decrements `myRequests` badge count.
-  - **Non-Clobbering Rollback:** On error (network failure, HTTP 409 conflict, or HTTP 403 authorization failure), `onError` re-inserts the specific failed swap into the current cache if missing and restores badge counts, without wiping or clobbering concurrent mutations that succeeded.
-  - `onSettled` invalidates `queryKeys.shiftSwaps.all` and `queryKeys.shifts.all` to reconcile with authoritative server state.
+- **Infinite Query for Swap Lists:**
+  - Implemented `useInfiniteShiftSwapsTab(teamId, userId, activeTab, historyFilter)` in `app/src/services/query/hooks/useShiftSwapsQuery.ts`.
+  - Hierarchical query key: `queryKeys.shiftSwaps.infiniteTab(teamId, userId, activeTab, historyFilter)`.
+  - `shift-swaps.tsx` derives `displayedSwaps` directly from `data.pages.flatMap(...)` with ID deduplication.
+  - "Load more" invokes `fetchNextPage()`, accumulating subsequent pages into the cache without replacing or discarding earlier pages.
+- **Multi-Page Optimistic Updates:**
+  - In `useOptimisticSwapMutations.ts` (`useOptimisticSwapRespond`, `useOptimisticSwapReview`, `useOptimisticSwapCancel`):
+    - `onMutate` searches across all loaded pages of `InfiniteData<ShiftSwapsTabResult>` to find the target swap regardless of which page it resides on.
+    - Captures `removedSwap` and `targetPageIndex`.
+    - Optimistically removes the target swap from the specific page and decrements the page total.
+    - Captures query cache snapshots for rollback.
+- **Non-Clobbering Multi-Page Rollback:**
+  - On mutation failure (`onError`), re-inserts `removedSwap` into its exact original page index in `InfiniteData<ShiftSwapsTabResult>` without wiping or clobbering other concurrent mutations.
+- **Authoritative Invalidation:**
+  - On settlement (`onSettled`), invalidates `queryKeys.shiftSwaps.all` and `queryKeys.shifts.all` to synchronize with authoritative backend state.
 
 ---
 
@@ -83,40 +88,38 @@
 
 ### 6. Executable Test Suite Results
 
-#### Test Suite 1: R06B.1 Offline Cache Security & Optimistic Workflows (`server/src/teams/offline-and-optimistic.test.ts`)
+#### Test Suite 1: R06B.2 Offline Security, Native Network & Swap Pagination (`server/src/teams/offline-and-optimistic.test.ts`)
 Executed via `npx tsx --test server/src/teams/offline-and-optimistic.test.ts`:
 
 ```
-▶ R06B.1: Offline Cache Security, Real Connectivity & Optimistic UI Workflows
-  ✔ A. Sign-out cleanup with NO explicit team IDs: index discovers and clears all user data (7.11ms)
-  ✔ B. Cleanup of multiple previously visited teams: wipes all historical teams for user (1.1277ms)
-  ✔ C. Failed deletion is detectable: storage failure bubbles and is not reported as success (1.685ms)
-  ✔ D. Real connectivity initialization: lifecycle setup triggers initial probe and listener (273.1098ms)
-  ✔ E. Online to airplane-mode transition: network failure transitions to offline (45.751ms)
-  ✔ F. Airplane-mode to online reconnection: successful probe restores online state (1.4611ms)
-  ✔ G. Exact storage payload-size enforcement: serialized payload strictly below 2000 bytes (1.9519ms)
-  ✔ H. Oversized payload handling: truncates titles and safely prunes records to stay within byte boundary (1.9118ms)
-  ✔ I. Secure storage write failure: write error throws and is not falsely reported as success (0.658ms)
-  ✔ J. Cross-team offline snapshot state isolation: Team A data is never returned for Team B (0.6887ms)
-  ✔ K. Authorization failure prevents stale display: 403 wipes cache and prevents rendering (0.5716ms)
-  ✔ L. Offline date/status filter correctness: does not present unfiltered snapshot as matching filtered query (0.3897ms)
-  ✔ M. True server-sync timestamp semantics: timestamp only recorded on genuine server save (0.4714ms)
-  ✔ N. Visible swap list updates before server response: onMutate optimistically removes item from visible tab (3.5972ms)
-  ✔ O. Failed peer response rolls back visibly: error re-inserts removed swap and restores count (1.3241ms)
-  ✔ P. Failed manager review rolls back visibly: manager approve/reject rolls back on network error (1.0527ms)
-  ✔ Q. Cancel action updates visibly and rolls back: requester cancellation updates cache and restores on error (0.8646ms)
-  ✔ R. Concurrent mutations do not corrupt state: rollback of action 1 preserves action 2 (1.4796ms)
-  ✔ S. Tab pagination and badge counts remain consistent: multi-tab counts reflect accurate totals (0.7745ms)
-  ✔ T. No fabricated endpoints: verifies no settings routes were fabricated in backend (1.8303ms)
-✔ R06B.1: Offline Cache Security, Real Connectivity & Optimistic UI Workflows (352.5585ms)
-ℹ tests 20
+▶ R06B.2: Final Offline Security, Native Network & Swap Pagination Hardening
+  ✔ A. Index-write failure does not leave an untracked snapshot: snapshot write aborted if index update fails (32.1781ms)
+  ✔ B. Partial deletion failure retains retry information in index for failed teams (14.2006ms)
+  ✔ C. Credential cleanup continues even if offline deletion throws (3.5471ms)
+  ✔ D. Multiple team snapshots cleared correctly across multiple workspaces (5.5072ms)
+  ✔ E. Native network events: airplane mode triggers offline immediately without waiting for probe timeout (3.2131ms)
+  ✔ F. Native reconnection: isConnected + isInternetReachable triggers connectivity verification (4.5944ms)
+  ✔ G. Backend 500 error does NOT mark device as offline: distinguishes offline from backend down (2.0207ms)
+  ✔ H. Authoritative 403/404 hides cached live shifts immediately and purges query cache (16.569ms)
+  ✔ I. Stale/cached shifts do not generate a fresh syncedAt timestamp on mount (2.0101ms)
+  ✔ J. Genuine server update updates syncedAt timestamp (43.5794ms)
+  ✔ K. Shift swap infinite pagination accumulates pages without losing previous page (2.043ms)
+  ✔ L. Tab and filter switching strictly isolates query cache without cross-contamination (4.5011ms)
+  ✔ M. Optimistic removal handles items on page 2 or later of infinite query (3.1613ms)
+  ✔ N. Rollback on error restores target item to its original page without clobbering other items (2.7047ms)
+  ✔ O. Concurrent mutations on different items do not overwrite each other (3.5836ms)
+  ✔ P. Bounded cache indicator clearly reflects MAX_OFFLINE_SHIFTS_PER_TEAM limit (1.1653ms)
+  ✔ Q. No fabricated settings routes exist under server/src/routes (2.6323ms)
+  ✔ R. Exact storage payload-size enforcement: serialized payload strictly <= 2000 bytes (3.5701ms)
+✔ R06B.2: Final Offline Security, Native Network & Swap Pagination Hardening (167.6569ms)
+ℹ tests 18
 ℹ suites 1
-ℹ pass 20
+ℹ pass 18
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 3004.0949
+ℹ duration_ms 3846.0065
 ```
 
 #### Test Suite 2: R06A TanStack Query Foundation (`server/src/teams/tanstack-query-foundation.test.ts`)

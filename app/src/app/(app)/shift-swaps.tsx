@@ -20,10 +20,10 @@ import { colors, spacing, typography } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
 import {
+  useInfiniteShiftSwapsTab,
   useOptimisticSwapCancel,
   useOptimisticSwapRespond,
   useOptimisticSwapReview,
-  useShiftSwapsTab,
   useShiftSwapsTabCounts,
   useShiftSwapRole,
 } from '@/services/query';
@@ -102,7 +102,6 @@ export default function ShiftSwapsScreen() {
 
   const [activeTab, setActiveTab] = useState<TabType>('INCOMING');
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('ALL');
-  const [page, setPage] = useState(1);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -114,19 +113,21 @@ export default function ShiftSwapsScreen() {
   const [rejecting, setRejecting] = useState(false);
   const [rejectError, setRejectError] = useState<string | null>(null);
 
-  // Reset page and local error when team, tab, or filter changes
+  // Reset local error when team, tab, or filter changes
   useEffect(() => {
-    setPage(1);
     setLocalError(null);
   }, [selectedTeam?.id, activeTab, historyFilter]);
 
-  // Tab Swaps Query: directly drives displayed swap list
+  // Tab Swaps Infinite Query: stores all loaded pages directly in query cache
   const {
-    data: tabData,
+    data: infiniteTabData,
     isLoading: loadingSwaps,
+    isFetchingNextPage: loadingMoreSwaps,
+    hasNextPage: hasMoreSwaps,
+    fetchNextPage: loadMoreSwaps,
     error: swapsQueryError,
     refetch: refetchSwaps,
-  } = useShiftSwapsTab(selectedTeam?.id, user?.id, activeTab, historyFilter, page);
+  } = useInfiniteShiftSwapsTab(selectedTeam?.id, user?.id, activeTab, historyFilter);
 
   // Tab Badge Counts Query
   const {
@@ -144,9 +145,22 @@ export default function ShiftSwapsScreen() {
   const role: TeamRole | null = cachedRole ?? null;
   const canManage = role === 'OWNER' || role === 'MANAGER';
 
-  const displayedSwaps = tabData?.shiftSwaps ?? [];
-  const pagination = tabData?.pagination ?? { page: 1, totalPages: 1, total: 0, limit: 20 };
-  const loading = loadingSwaps && !tabData;
+  // Derive displayed swaps from all loaded pages with ID deduplication
+  const displayedSwaps = useMemo(() => {
+    if (!infiniteTabData?.pages) return [];
+    const all = infiniteTabData.pages.flatMap((p) => p.shiftSwaps);
+    const seen = new Set<string>();
+    const unique: ShiftSwap[] = [];
+    for (const swap of all) {
+      if (!seen.has(swap.id)) {
+        seen.add(swap.id);
+        unique.push(swap);
+      }
+    }
+    return unique;
+  }, [infiniteTabData]);
+
+  const loading = loadingSwaps && !infiniteTabData;
 
   const error =
     localError ||
@@ -319,8 +333,6 @@ export default function ShiftSwapsScreen() {
       ]
     );
   };
-
-  const hasMore = pagination.page < pagination.totalPages;
 
   return (
     <ScrollView
@@ -628,12 +640,12 @@ export default function ShiftSwapsScreen() {
             );
           })}
 
-          {hasMore ? (
+          {hasMoreSwaps ? (
             <ActionButton
-              label={loading ? 'Loading...' : 'Load more'}
-              onPress={() => setPage((p) => p + 1)}
+              label={loadingMoreSwaps ? 'Loading...' : 'Load more'}
+              onPress={() => loadMoreSwaps()}
               variant="secondary"
-              loading={loading}
+              loading={loadingMoreSwaps}
             />
           ) : null}
         </View>

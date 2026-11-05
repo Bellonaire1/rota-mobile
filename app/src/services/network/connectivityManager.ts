@@ -21,6 +21,29 @@ export interface AppStateSource {
   ) => { remove: () => void };
 }
 
+export interface NetInfoState {
+  isConnected: boolean | null;
+  isInternetReachable?: boolean | null;
+  type?: string;
+}
+
+export interface NetInfoSource {
+  addEventListener: (listener: (state: NetInfoState) => void) => (() => void) | { remove: () => void };
+  fetch?: () => Promise<NetInfoState>;
+}
+
+let cachedNetInfo: any = undefined;
+function getNetInfo(): any {
+  if (cachedNetInfo !== undefined) return cachedNetInfo;
+  try {
+    const mod = require('@react-native-community/netinfo');
+    cachedNetInfo = mod?.default || mod;
+  } catch {
+    cachedNetInfo = null;
+  }
+  return cachedNetInfo;
+}
+
 export class ConnectivityManager {
   private online = true;
   private backendAvailable = true;
@@ -97,6 +120,9 @@ export class ConnectivityManager {
             // Ignore
           }
         }, 4000);
+        if (timeoutId && typeof timeoutId.unref === 'function') {
+          timeoutId.unref();
+        }
 
         const res = await fetch(healthUrl, {
           method: 'GET',
@@ -147,15 +173,55 @@ export const connectivityManager = new ConnectivityManager();
 
 /**
  * Registers application lifecycle listeners for network connectivity.
- * Probes at startup and on AppState active foreground transition.
+ * Probes at startup, listens to native NetInfo network transitions, and handles AppState transitions.
  */
-export function setupNetworkConnectivity(appStateSource?: AppStateSource): () => void {
-  // 1. Initial real probe at startup
-  connectivityManager.checkConnectivity().catch(() => {});
-
+export function setupNetworkConnectivity(
+  appStateSource?: AppStateSource,
+  netInfoSource?: NetInfoSource,
+  options?: { skipInitialProbe?: boolean }
+): () => void {
   const cleanups: (() => void)[] = [];
 
-  // 2. React Native AppState listener
+  // 1. Native NetInfo listener (real-time airplane mode / wifi toggle)
+  const netInfo = netInfoSource !== undefined ? netInfoSource : getNetInfo();
+  if (netInfo && typeof netInfo.addEventListener === 'function') {
+    const unsub = netInfo.addEventListener((state: NetInfoState) => {
+      const isConnected = state?.isConnected ?? false;
+      const isInternetReachable = state?.isInternetReachable;
+
+      if (!isConnected) {
+        // Device is offline immediately without waiting for probe timeout
+        connectivityManager.setOnline(false, false);
+      } else if (isInternetReachable === false) {
+        // Local connection but no internet reachability
+        connectivityManager.setOnline(false, false);
+      } else {
+        // Device is connected, verify backend connectivity
+        connectivityManager.checkConnectivity().catch(() => {});
+      }
+    });
+
+    if (typeof unsub === 'function') {
+      cleanups.push(unsub);
+    } else if (unsub && typeof (unsub as any).remove === 'function') {
+      cleanups.push(() => (unsub as any).remove());
+    }
+
+    if (typeof netInfo.fetch === 'function') {
+      netInfo.fetch().then((state: NetInfoState) => {
+        if (state && state.isConnected === false) {
+          connectivityManager.setOnline(false, false);
+        }
+      }).catch(() => {});
+    }
+  }
+
+  // 2. Initial real probe at startup
+  if (!options?.skipInitialProbe) {
+    connectivityManager.checkConnectivity().catch(() => {});
+  }
+
+  // 3. React Native AppState listener
   if (appStateSource) {
     const sub = appStateSource.addEventListener('change', (nextState: any) => {
       if (nextState === 'active') {
@@ -165,7 +231,7 @@ export function setupNetworkConnectivity(appStateSource?: AppStateSource): () =>
     cleanups.push(() => sub.remove());
   }
 
-  // 3. Web window online / offline listeners
+  // 4. Web window online / offline listeners
   if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
     const onOnline = () => connectivityManager.checkConnectivity().catch(() => {});
     const onOffline = () => connectivityManager.setOnline(false, false);
@@ -195,4 +261,22 @@ export function useIsOnline(): boolean {
   }, []);
 
   return online;
+}
+
+/**
+ * React hook exposing live connectivity & backend health state.
+ */
+export function useConnectivity(): { isOnline: boolean; backendAvailable: boolean } {
+  const [state, setState] = useState({
+    isOnline: connectivityManager.isOnline(),
+    backendAvailable: connectivityManager.isBackendAvailable(),
+  });
+
+  useEffect(() => {
+    return connectivityManager.subscribe((isOnline, backendAvailable) => {
+      setState({ isOnline, backendAvailable });
+    });
+  }, []);
+
+  return state;
 }

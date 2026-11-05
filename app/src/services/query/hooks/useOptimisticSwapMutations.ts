@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { InfiniteData, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   RespondShiftSwapInput,
   ReviewShiftSwapInput,
@@ -12,8 +12,9 @@ import { ShiftSwapTabCounts, ShiftSwapsTabResult } from './useShiftSwapsQuery';
 /**
  * Optimistic mutation for Peer Response (accept or decline).
  *
- * Updates visible INCOMING tab list and tab badge counts immediately in cache,
- * with non-clobbering rollback on failure and authoritative server invalidation onSettled.
+ * Updates visible INCOMING tab list (both infinite and single-page) and tab badge counts
+ * immediately in cache, with non-clobbering rollback on failure and authoritative
+ * server invalidation onSettled.
  */
 export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
   const queryClient = useQueryClient();
@@ -38,22 +39,57 @@ export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
       });
 
       // 2. Target query keys
+      const infiniteIncomingKey = queryKeys.shiftSwaps.infiniteTab(teamId, userId, 'INCOMING', 'ALL');
       const incomingTabKey = queryKeys.shiftSwaps.tab(teamId, userId, 'INCOMING', 'ALL', 1);
       const tabCountsKey = queryKeys.shiftSwaps.tabCounts(teamId, userId);
       const legacyListKey = queryKeys.shiftSwaps.list(teamId, userId, { status: 'PENDING_PEER' });
       const pendingCountsKey = queryKeys.shiftSwaps.pendingCounts(teamId, userId);
 
       // 3. Capture snapshots
+      const previousInfiniteIncoming =
+        queryClient.getQueryData<InfiniteData<ShiftSwapsTabResult>>(infiniteIncomingKey);
       const previousIncomingTab = queryClient.getQueryData<ShiftSwapsTabResult>(incomingTabKey);
       const previousTabCounts = queryClient.getQueryData<ShiftSwapTabCounts>(tabCountsKey);
       const previousLegacyList = queryClient.getQueryData<ShiftSwapsResponse>(legacyListKey);
       const previousPendingCounts = queryClient.getQueryData<PendingSwapsSummary>(pendingCountsKey);
 
       let removedSwap: ShiftSwap | null = null;
+      let targetPageIndex = -1;
 
-      // 4. Optimistically update INCOMING tab
+      // 4. Optimistically update INCOMING infinite tab (handles items on any page)
+      if (previousInfiniteIncoming?.pages) {
+        for (let i = 0; i < previousInfiniteIncoming.pages.length; i++) {
+          const found = previousInfiniteIncoming.pages[i].shiftSwaps.find((s) => s.id === swapId);
+          if (found) {
+            removedSwap = found;
+            targetPageIndex = i;
+            break;
+          }
+        }
+
+        if (removedSwap && targetPageIndex >= 0) {
+          queryClient.setQueryData<InfiniteData<ShiftSwapsTabResult>>(infiniteIncomingKey, {
+            ...previousInfiniteIncoming,
+            pages: previousInfiniteIncoming.pages.map((page, idx) => {
+              if (idx !== targetPageIndex) return page;
+              return {
+                ...page,
+                shiftSwaps: page.shiftSwaps.filter((s) => s.id !== swapId),
+                pagination: {
+                  ...page.pagination,
+                  total: Math.max(0, page.pagination.total - 1),
+                },
+              };
+            }),
+          });
+        }
+      }
+
+      // 5. Optimistically update INCOMING single-page tab (if present)
       if (previousIncomingTab) {
-        removedSwap = previousIncomingTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        if (!removedSwap) {
+          removedSwap = previousIncomingTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        }
         queryClient.setQueryData<ShiftSwapsTabResult>(incomingTabKey, {
           ...previousIncomingTab,
           shiftSwaps: previousIncomingTab.shiftSwaps.filter((s) => s.id !== swapId),
@@ -64,7 +100,7 @@ export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
         });
       }
 
-      // 5. Optimistically update Tab Counts
+      // 6. Optimistically update Tab Counts
       if (previousTabCounts) {
         queryClient.setQueryData<ShiftSwapTabCounts>(tabCountsKey, {
           ...previousTabCounts,
@@ -72,7 +108,7 @@ export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
         });
       }
 
-      // 6. Optimistically update legacy list and pending counts for dashboard badge
+      // 7. Optimistically update legacy list and pending counts for dashboard badge
       if (previousLegacyList) {
         if (!removedSwap) {
           removedSwap = previousLegacyList.shiftSwaps.find((s) => s.id === swapId) || null;
@@ -97,10 +133,13 @@ export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
       return {
         swapId,
         removedSwap,
+        targetPageIndex,
+        infiniteIncomingKey,
         incomingTabKey,
         tabCountsKey,
         legacyListKey,
         pendingCountsKey,
+        previousInfiniteIncoming,
         previousIncomingTab,
         previousTabCounts,
         previousLegacyList,
@@ -110,8 +149,36 @@ export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
     onError: (_err, _variables, context) => {
       if (!context) return;
 
-      // Rollback without clobbering concurrent mutations:
-      // If removedSwap exists, re-insert it into current cache if not already present
+      // Rollback infinite tab without clobbering concurrent mutations
+      if (context.infiniteIncomingKey && context.removedSwap && context.targetPageIndex >= 0) {
+        queryClient.setQueryData<InfiniteData<ShiftSwapsTabResult>>(
+          context.infiniteIncomingKey,
+          (current) => {
+            if (!current) return context.previousInfiniteIncoming;
+            const alreadyPresent = current.pages.some((page) =>
+              page.shiftSwaps.some((s) => s.id === context.swapId)
+            );
+            if (alreadyPresent) return current;
+
+            return {
+              ...current,
+              pages: current.pages.map((page, idx) => {
+                if (idx !== context.targetPageIndex) return page;
+                return {
+                  ...page,
+                  shiftSwaps: [context.removedSwap!, ...page.shiftSwaps],
+                  pagination: {
+                    ...page.pagination,
+                    total: page.pagination.total + 1,
+                  },
+                };
+              }),
+            };
+          }
+        );
+      }
+
+      // Rollback single-page tab
       if (context.incomingTabKey && context.removedSwap) {
         queryClient.setQueryData<ShiftSwapsTabResult>(context.incomingTabKey, (current) => {
           if (!current) return context.previousIncomingTab;
@@ -187,20 +254,56 @@ export function useOptimisticSwapReview(teamId?: string, userId?: string) {
         queryKey: queryKeys.shiftSwaps.all(teamId, userId),
       });
 
+      const infiniteMgrKey = queryKeys.shiftSwaps.infiniteTab(teamId, userId, 'MANAGER_REVIEW', 'ALL');
       const mgrTabKey = queryKeys.shiftSwaps.tab(teamId, userId, 'MANAGER_REVIEW', 'ALL', 1);
       const tabCountsKey = queryKeys.shiftSwaps.tabCounts(teamId, userId);
       const legacyMgrKey = queryKeys.shiftSwaps.list(teamId, userId, {
         status: 'PENDING_MANAGER',
       });
 
+      const previousInfiniteMgr =
+        queryClient.getQueryData<InfiniteData<ShiftSwapsTabResult>>(infiniteMgrKey);
       const previousMgrTab = queryClient.getQueryData<ShiftSwapsTabResult>(mgrTabKey);
       const previousTabCounts = queryClient.getQueryData<ShiftSwapTabCounts>(tabCountsKey);
       const previousLegacyMgr = queryClient.getQueryData<ShiftSwapsResponse>(legacyMgrKey);
 
       let removedSwap: ShiftSwap | null = null;
+      let targetPageIndex = -1;
 
+      // Optimistically update infinite manager review tab
+      if (previousInfiniteMgr?.pages) {
+        for (let i = 0; i < previousInfiniteMgr.pages.length; i++) {
+          const found = previousInfiniteMgr.pages[i].shiftSwaps.find((s) => s.id === swapId);
+          if (found) {
+            removedSwap = found;
+            targetPageIndex = i;
+            break;
+          }
+        }
+
+        if (removedSwap && targetPageIndex >= 0) {
+          queryClient.setQueryData<InfiniteData<ShiftSwapsTabResult>>(infiniteMgrKey, {
+            ...previousInfiniteMgr,
+            pages: previousInfiniteMgr.pages.map((page, idx) => {
+              if (idx !== targetPageIndex) return page;
+              return {
+                ...page,
+                shiftSwaps: page.shiftSwaps.filter((s) => s.id !== swapId),
+                pagination: {
+                  ...page.pagination,
+                  total: Math.max(0, page.pagination.total - 1),
+                },
+              };
+            }),
+          });
+        }
+      }
+
+      // Optimistically update single-page manager tab
       if (previousMgrTab) {
-        removedSwap = previousMgrTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        if (!removedSwap) {
+          removedSwap = previousMgrTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        }
         queryClient.setQueryData<ShiftSwapsTabResult>(mgrTabKey, {
           ...previousMgrTab,
           shiftSwaps: previousMgrTab.shiftSwaps.filter((s) => s.id !== swapId),
@@ -235,9 +338,12 @@ export function useOptimisticSwapReview(teamId?: string, userId?: string) {
       return {
         swapId,
         removedSwap,
+        targetPageIndex,
+        infiniteMgrKey,
         mgrTabKey,
         tabCountsKey,
         legacyMgrKey,
+        previousInfiniteMgr,
         previousMgrTab,
         previousTabCounts,
         previousLegacyMgr,
@@ -245,6 +351,34 @@ export function useOptimisticSwapReview(teamId?: string, userId?: string) {
     },
     onError: (_err, _variables, context) => {
       if (!context) return;
+
+      if (context.infiniteMgrKey && context.removedSwap && context.targetPageIndex >= 0) {
+        queryClient.setQueryData<InfiniteData<ShiftSwapsTabResult>>(
+          context.infiniteMgrKey,
+          (current) => {
+            if (!current) return context.previousInfiniteMgr;
+            const alreadyPresent = current.pages.some((page) =>
+              page.shiftSwaps.some((s) => s.id === context.swapId)
+            );
+            if (alreadyPresent) return current;
+
+            return {
+              ...current,
+              pages: current.pages.map((page, idx) => {
+                if (idx !== context.targetPageIndex) return page;
+                return {
+                  ...page,
+                  shiftSwaps: [context.removedSwap!, ...page.shiftSwaps],
+                  pagination: {
+                    ...page.pagination,
+                    total: page.pagination.total + 1,
+                  },
+                };
+              }),
+            };
+          }
+        );
+      }
 
       if (context.mgrTabKey && context.removedSwap) {
         queryClient.setQueryData<ShiftSwapsTabResult>(context.mgrTabKey, (current) => {
@@ -293,8 +427,8 @@ export function useOptimisticSwapReview(teamId?: string, userId?: string) {
 /**
  * Optimistic mutation for Requesting User Cancel.
  *
- * Optimistically removes the cancelled swap from MY_REQUESTS tab and decrements
- * myRequests tab badge count, with automatic rollback on network failure or 409 conflict.
+ * Optimistically removes the cancelled swap from MY_REQUESTS tab (both infinite and single page)
+ * and decrements myRequests tab badge count, with automatic rollback on failure.
  */
 export function useOptimisticSwapCancel(teamId?: string, userId?: string) {
   const queryClient = useQueryClient();
@@ -311,16 +445,54 @@ export function useOptimisticSwapCancel(teamId?: string, userId?: string) {
         queryKey: queryKeys.shiftSwaps.all(teamId, userId),
       });
 
+      const infiniteMyRequestsKey =
+        queryKeys.shiftSwaps.infiniteTab(teamId, userId, 'MY_REQUESTS', 'ALL');
       const myRequestsTabKey = queryKeys.shiftSwaps.tab(teamId, userId, 'MY_REQUESTS', 'ALL', 1);
       const tabCountsKey = queryKeys.shiftSwaps.tabCounts(teamId, userId);
 
-      const previousMyRequestsTab = queryClient.getQueryData<ShiftSwapsTabResult>(myRequestsTabKey);
+      const previousInfiniteMyRequests =
+        queryClient.getQueryData<InfiniteData<ShiftSwapsTabResult>>(infiniteMyRequestsKey);
+      const previousMyRequestsTab =
+        queryClient.getQueryData<ShiftSwapsTabResult>(myRequestsTabKey);
       const previousTabCounts = queryClient.getQueryData<ShiftSwapTabCounts>(tabCountsKey);
 
       let removedSwap: ShiftSwap | null = null;
+      let targetPageIndex = -1;
 
+      // Optimistically update infinite MY_REQUESTS tab
+      if (previousInfiniteMyRequests?.pages) {
+        for (let i = 0; i < previousInfiniteMyRequests.pages.length; i++) {
+          const found = previousInfiniteMyRequests.pages[i].shiftSwaps.find((s) => s.id === swapId);
+          if (found) {
+            removedSwap = found;
+            targetPageIndex = i;
+            break;
+          }
+        }
+
+        if (removedSwap && targetPageIndex >= 0) {
+          queryClient.setQueryData<InfiniteData<ShiftSwapsTabResult>>(infiniteMyRequestsKey, {
+            ...previousInfiniteMyRequests,
+            pages: previousInfiniteMyRequests.pages.map((page, idx) => {
+              if (idx !== targetPageIndex) return page;
+              return {
+                ...page,
+                shiftSwaps: page.shiftSwaps.filter((s) => s.id !== swapId),
+                pagination: {
+                  ...page.pagination,
+                  total: Math.max(0, page.pagination.total - 1),
+                },
+              };
+            }),
+          });
+        }
+      }
+
+      // Optimistically update single-page MY_REQUESTS tab
       if (previousMyRequestsTab) {
-        removedSwap = previousMyRequestsTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        if (!removedSwap) {
+          removedSwap = previousMyRequestsTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        }
         queryClient.setQueryData<ShiftSwapsTabResult>(myRequestsTabKey, {
           ...previousMyRequestsTab,
           shiftSwaps: previousMyRequestsTab.shiftSwaps.filter((s) => s.id !== swapId),
@@ -341,14 +513,49 @@ export function useOptimisticSwapCancel(teamId?: string, userId?: string) {
       return {
         swapId,
         removedSwap,
+        targetPageIndex,
+        infiniteMyRequestsKey,
         myRequestsTabKey,
         tabCountsKey,
+        previousInfiniteMyRequests,
         previousMyRequestsTab,
         previousTabCounts,
       };
     },
     onError: (_err, _variables, context) => {
       if (!context) return;
+
+      if (
+        context.infiniteMyRequestsKey &&
+        context.removedSwap &&
+        context.targetPageIndex >= 0
+      ) {
+        queryClient.setQueryData<InfiniteData<ShiftSwapsTabResult>>(
+          context.infiniteMyRequestsKey,
+          (current) => {
+            if (!current) return context.previousInfiniteMyRequests;
+            const alreadyPresent = current.pages.some((page) =>
+              page.shiftSwaps.some((s) => s.id === context.swapId)
+            );
+            if (alreadyPresent) return current;
+
+            return {
+              ...current,
+              pages: current.pages.map((page, idx) => {
+                if (idx !== context.targetPageIndex) return page;
+                return {
+                  ...page,
+                  shiftSwaps: [context.removedSwap!, ...page.shiftSwaps],
+                  pagination: {
+                    ...page.pagination,
+                    total: page.pagination.total + 1,
+                  },
+                };
+              }),
+            };
+          }
+        );
+      }
 
       if (context.myRequestsTabKey && context.removedSwap) {
         queryClient.setQueryData<ShiftSwapsTabResult>(context.myRequestsTabKey, (current) => {

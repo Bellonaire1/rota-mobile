@@ -67,6 +67,12 @@ export const queryKeys = {
       filter?: string,
       page?: number
     ) => ['shiftSwaps', teamId, userId, 'tab', tab ?? 'INCOMING', filter ?? 'ALL', page ?? 1] as const,
+    infiniteTab: (
+      teamId: string,
+      userId: string,
+      tab?: string,
+      filter?: string
+    ) => ['shiftSwaps', teamId, userId, 'infiniteTab', tab ?? 'INCOMING', filter ?? 'ALL'] as const,
     tabCounts: (teamId: string, userId: string) =>
       ['shiftSwaps', teamId, userId, 'tabCounts'] as const,
     pendingCounts: (teamId: string, userId: string) =>

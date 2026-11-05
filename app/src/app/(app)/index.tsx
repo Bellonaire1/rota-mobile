@@ -1,5 +1,5 @@
 import { Redirect, useFocusEffect, useRouter } from 'expo-router';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -22,6 +22,8 @@ import { ApiError } from '@/services/api/apiClient';
 import { ShiftListParams } from '@/services/api/shiftService';
 import { useIsOnline } from '@/services/network/connectivityManager';
 import {
+  queryClient,
+  queryKeys,
   useCancelShift,
   useCreateShift,
   useInfiniteShifts,
@@ -31,6 +33,7 @@ import {
 } from '@/services/query';
 import {
   CompactOfflineShift,
+  MAX_OFFLINE_SHIFTS_PER_TEAM,
   offlineShiftStorage,
   OfflineShiftSnapshot,
 } from '@/services/storage/offlineShiftStorage';
@@ -123,11 +126,13 @@ export default function DashboardScreen() {
 
   const [offlineSnapshot, setOfflineSnapshot] = useState<OfflineShiftSnapshot | null>(null);
   const [renderedTeamId, setRenderedTeamId] = useState(selectedTeam?.id);
+  const lastSavedDataUpdatedAtRef = useRef<number>(0);
 
   // Synchronously isolate offline snapshot across team switches before effects run
   if (renderedTeamId !== selectedTeam?.id) {
     setRenderedTeamId(selectedTeam?.id);
     setOfflineSnapshot(null);
+    lastSavedDataUpdatedAtRef.current = 0;
   }
 
   const activeOfflineSnapshot = useMemo(() => {
@@ -193,6 +198,7 @@ export default function DashboardScreen() {
     fetchNextPage: loadMoreShifts,
     error: shiftsQueryError,
     refetch: refetchShifts,
+    dataUpdatedAt: shiftsDataUpdatedAt,
   } = useInfiniteShifts(selectedTeam?.id, user?.id, shiftParams);
 
   const {
@@ -235,7 +241,8 @@ export default function DashboardScreen() {
     return unique;
   }, [shiftsData]);
 
-  // Persist offline snapshot only after genuine successful server response for unfiltered schedule
+  // Persist offline snapshot ONLY after genuine successful server response (shiftsDataUpdatedAt > lastSavedDataUpdatedAtRef.current)
+  // for unfiltered schedule. Prevents stale memory/cached query loads from generating fake fresh syncedAt timestamps.
   useEffect(() => {
     if (
       user?.id &&
@@ -244,8 +251,11 @@ export default function DashboardScreen() {
       isOnline &&
       !shiftsQueryError &&
       statusFilter === 'ALL' &&
-      !filterDate
+      !filterDate &&
+      shiftsDataUpdatedAt > 0 &&
+      shiftsDataUpdatedAt > lastSavedDataUpdatedAtRef.current
     ) {
+      lastSavedDataUpdatedAtRef.current = shiftsDataUpdatedAt;
       offlineShiftStorage
         .saveShifts(user.id, selectedTeam.id, liveShifts)
         .then((snapshot) => setOfflineSnapshot(snapshot))
@@ -254,15 +264,27 @@ export default function DashboardScreen() {
           console.warn('Failed to persist offline shift snapshot:', err);
         });
     }
-  }, [user?.id, selectedTeam?.id, liveShifts, isOnline, shiftsQueryError, statusFilter, filterDate]);
+  }, [
+    user?.id,
+    selectedTeam?.id,
+    liveShifts,
+    isOnline,
+    shiftsQueryError,
+    statusFilter,
+    filterDate,
+    shiftsDataUpdatedAt,
+  ]);
 
-  // Clear offline cache and snapshot if membership is revoked (403/404)
+  // Clear offline cache, query cache and snapshot if membership is revoked (403/404)
   useEffect(() => {
     if (
       shiftsQueryError instanceof ApiError &&
       (shiftsQueryError.statusCode === 403 || shiftsQueryError.statusCode === 404)
     ) {
       if (user?.id && selectedTeam?.id) {
+        queryClient.removeQueries({
+          queryKey: queryKeys.shifts.all(selectedTeam.id, user.id),
+        });
         offlineShiftStorage.clearTeamShifts(user.id, selectedTeam.id);
         setOfflineSnapshot(null);
       }
@@ -297,8 +319,9 @@ export default function DashboardScreen() {
     liveShifts.length === 0 &&
     Boolean(activeOfflineSnapshot);
 
-  // Effective shifts displayed to user
+  // Effective shifts displayed to user: strictly suppressed if authorization is revoked
   const displayedShifts = useMemo(() => {
+    if (isAuthError) return [];
     if (liveShifts.length > 0) return liveShifts;
     if (isUsingOfflineCache && activeOfflineSnapshot) {
       return filteredOfflineShifts.map((s) => ({
@@ -319,7 +342,7 @@ export default function DashboardScreen() {
       }));
     }
     return [];
-  }, [liveShifts, isUsingOfflineCache, activeOfflineSnapshot, filteredOfflineShifts, selectedTeam?.id]);
+  }, [isAuthError, liveShifts, isUsingOfflineCache, activeOfflineSnapshot, filteredOfflineShifts, selectedTeam?.id]);
 
   const sortedShifts = useMemo(
     () => [...displayedShifts].sort((a, b) => a.startsAt.localeCompare(b.startsAt)),
@@ -470,9 +493,11 @@ export default function DashboardScreen() {
 
   const error =
     localError ||
-    (shiftsQueryError && !isUsingOfflineCache
+    (shiftsQueryError && (!isUsingOfflineCache || isAuthError)
       ? shiftsQueryError instanceof ApiError
-        ? shiftsQueryError.message
+        ? isAuthError
+          ? 'Access revoked. You no longer have permission to view this team schedule.'
+          : shiftsQueryError.message
         : 'Unable to load the schedule.'
       : null);
 
@@ -513,7 +538,9 @@ export default function DashboardScreen() {
           </View>
           <Text style={styles.offlineTitle}>
             {isUsingOfflineCache
-              ? 'Viewing cached schedule (Read-only)'
+              ? activeOfflineSnapshot && activeOfflineSnapshot.shifts.length >= MAX_OFFLINE_SHIFTS_PER_TEAM
+                ? 'Viewing cached schedule (Partial schedule · Max 20 shifts)'
+                : 'Viewing cached schedule (Read-only)'
               : 'Device is offline'}
           </Text>
           {activeOfflineSnapshot?.syncedAt ? (
@@ -611,14 +638,20 @@ export default function DashboardScreen() {
       ) : sortedShifts.length === 0 ? (
         <View style={styles.emptyCard}>
           <Text style={styles.emptyTitle}>
-            {statusFilter === 'CANCELLED' ? 'No cancelled shifts' : 'No shifts found'}
+            {isAuthError
+              ? 'Access Revoked'
+              : statusFilter === 'CANCELLED'
+              ? 'No cancelled shifts'
+              : 'No shifts found'}
           </Text>
           <Text style={styles.muted}>
-            {canManage
+            {isAuthError
+              ? 'You no longer have access to this team. Please select another workspace.'
+              : canManage
               ? 'Create the first shift or adjust the filters.'
               : 'Your team has no shifts matching these filters.'}
           </Text>
-          {canManage ? (
+          {canManage && !isAuthError ? (
             <ActionButton
               label="Create a shift"
               onPress={handleOpenCreate}
