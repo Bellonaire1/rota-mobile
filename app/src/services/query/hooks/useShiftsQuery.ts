@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   CreateShiftInput,
   ShiftListParams,
@@ -14,7 +14,7 @@ export interface PendingSwapsSummary {
 }
 
 /**
- * Hook to retrieve a list of shifts according to filters and pagination.
+ * Hook to retrieve a single page of shifts according to filters and pagination.
  */
 export function useShifts(
   teamId?: string,
@@ -24,6 +24,31 @@ export function useShifts(
   return useQuery({
     queryKey: queryKeys.shifts.list(teamId ?? '', userId ?? '', params),
     queryFn: () => shiftService.list(teamId!, params),
+    enabled: Boolean(teamId && userId),
+  });
+}
+
+/**
+ * Infinite query hook for paginated shifts.
+ * Stores all loaded pages directly in the query cache, eliminating component-level
+ * accumulated state and preventing cross-team / cross-filter rendering flashes.
+ */
+export function useInfiniteShifts(
+  teamId?: string,
+  userId?: string,
+  params: Omit<ShiftListParams, 'page'> = {}
+) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.shifts.infinite(teamId ?? '', userId ?? '', params),
+    queryFn: ({ pageParam = 1 }) =>
+      shiftService.list(teamId!, { ...params, page: pageParam as number, limit: 20 }),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+      if (lastPage.pagination.page < lastPage.pagination.totalPages) {
+        return lastPage.pagination.page + 1;
+      }
+      return undefined;
+    },
     enabled: Boolean(teamId && userId),
   });
 }
@@ -127,4 +152,3 @@ export function useCancelShift(teamId?: string, userId?: string) {
     },
   });
 }
-

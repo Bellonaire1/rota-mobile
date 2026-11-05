@@ -141,12 +141,9 @@ Executed via `npx tsx --test server/src/teams/tanstack-query-foundation.test.ts`
 
 ---
 
-### 8. Remaining Work for R06B
+### 8. Progress to Task R06B
 
-1. **R06.3 — Offline Shift Viewing:**
-   - Configure persistent offline storage adapter (`createAsyncStoragePersister` or SecureStore-backed SQLite cache).
-   - Implement client-side synchronization timestamp and offline status indicator banner.
-2. **R06.4 — Optimistic UI Updates:**
-   - Implement `onMutate`, `onError` rollback, and `onSettled` cache reconciliation for shift swap requests and member updates.
-3. **Physical Device & Production Verification:**
-   - Compile EAS build and perform physical Android smoke-testing.
+- **R06.3 — Offline Shift Viewing:** Implemented in `app/src/services/storage/offlineShiftStorage.ts` with compact bounded offline snapshots (max 20 shifts / ~1.5KB), offline indicator banner, and last sync timestamp. Fully evidenced in `docs/evidence/offline-and-optimistic-query-evidence.md`.
+- **R06.4 — Optimistic UI Updates:** Implemented in `app/src/services/query/hooks/useOptimisticSwapMutations.ts` with `onMutate` cache snapshots, `onError` rollback, and `onSettled` invalidations for shift swaps.
+- **Mandatory Pagination Safety:** Eliminated component-level accumulated state and race conditions by migrating dashboard and members screens to `useInfiniteQuery`.
+- **Remaining Gap for R06:** Physical Android device testing in Airplane Mode and cloud production deployment.

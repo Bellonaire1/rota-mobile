@@ -19,6 +19,11 @@ import { FormField } from '@/components/common/FormField';
 import { colors, spacing, typography } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
+import {
+  useOptimisticSwapCancel,
+  useOptimisticSwapRespond,
+  useOptimisticSwapReview,
+} from '@/services/query';
 import { shiftSwapService } from '@/services/api/shiftSwapService';
 import { teamService } from '@/services/api/teamService';
 import {
@@ -91,6 +96,9 @@ const statusBadgeColor = (status: ShiftSwapStatus) => {
 export default function ShiftSwapsScreen() {
   const router = useRouter();
   const { user, selectedTeam } = useAuth();
+  const respondMutation = useOptimisticSwapRespond(selectedTeam?.id, user?.id);
+  const reviewMutation = useOptimisticSwapReview(selectedTeam?.id, user?.id);
+  const cancelMutation = useOptimisticSwapCancel(selectedTeam?.id, user?.id);
 
   const [activeTab, setActiveTab] = useState<TabType>('INCOMING');
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('ALL');
@@ -320,7 +328,7 @@ export default function ShiftSwapsScreen() {
           setActionLoadingId(swap.id);
           setError(null);
           try {
-            await shiftSwapService.respond(selectedTeam.id, swap.id, { action });
+            await respondMutation.mutateAsync({ swapId: swap.id, input: { action } });
             await Promise.all([loadSwaps(true), loadCounts()]);
           } catch (err) {
             const msg =
@@ -354,8 +362,9 @@ export default function ShiftSwapsScreen() {
             setActionLoadingId(swap.id);
             setError(null);
             try {
-              await shiftSwapService.review(selectedTeam.id, swap.id, {
-                action: 'approve',
+              await reviewMutation.mutateAsync({
+                swapId: swap.id,
+                input: { action: 'approve' },
               });
               Alert.alert(
                 'Swap Approved',
@@ -396,9 +405,12 @@ export default function ShiftSwapsScreen() {
     setRejectError(null);
 
     try {
-      await shiftSwapService.review(selectedTeam.id, selectedSwapForReject.id, {
-        action: 'reject',
-        reason: rejectReason.trim() || undefined,
+      await reviewMutation.mutateAsync({
+        swapId: selectedSwapForReject.id,
+        input: {
+          action: 'reject',
+          reason: rejectReason.trim() || undefined,
+        },
       });
       setRejectModalVisible(false);
       await Promise.all([loadSwaps(true), loadCounts()]);
@@ -427,7 +439,7 @@ export default function ShiftSwapsScreen() {
             setActionLoadingId(swap.id);
             setError(null);
             try {
-              await shiftSwapService.cancel(selectedTeam.id, swap.id);
+              await cancelMutation.mutateAsync(swap.id);
               await Promise.all([loadSwaps(true), loadCounts()]);
             } catch (err) {
               const msg =

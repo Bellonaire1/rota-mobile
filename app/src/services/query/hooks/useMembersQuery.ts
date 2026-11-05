@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { teamService } from '@/services/api/teamService';
 import { teamInvitationService } from '@/services/api/teamInvitationService';
 import { queryKeys } from '../queryKeys';
@@ -16,6 +16,31 @@ export function useTeamMembers(
   return useQuery({
     queryKey: queryKeys.members.list(teamId ?? '', userId ?? '', { page, limit }),
     queryFn: () => teamService.listMembers(teamId!, page, limit),
+    enabled: Boolean(teamId && userId),
+  });
+}
+
+/**
+ * Infinite query hook for team members.
+ * Keeps all loaded pages in query cache, eliminating component-level accumulation
+ * and cross-team stale data rendering.
+ */
+export function useInfiniteTeamMembers(
+  teamId?: string,
+  userId?: string,
+  limit = 20
+) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.members.infinite(teamId ?? '', userId ?? '', { limit }),
+    queryFn: ({ pageParam = 1 }) =>
+      teamService.listMembers(teamId!, pageParam as number, limit),
+    initialPageParam: 1,
+    getNextPageParam: (lastPage) => {
+      if (lastPage.pagination.page < lastPage.pagination.totalPages) {
+        return lastPage.pagination.page + 1;
+      }
+      return undefined;
+    },
     enabled: Boolean(teamId && userId),
   });
 }
@@ -138,4 +163,3 @@ export function useRevokeInvitation(teamId?: string, userId?: string) {
     },
   });
 }
-

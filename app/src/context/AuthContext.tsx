@@ -2,6 +2,7 @@ import * as SecureStore from 'expo-secure-store';
 import React, { createContext, PropsWithChildren, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
 import { clearQueryCache, queryClient } from '@/services/query';
+import { offlineShiftStorage } from '@/services/storage/offlineShiftStorage';
 import { apiClient } from '@/services/api/apiClient';
 import { authService } from '@/services/api/authService';
 import { teamService } from '@/services/api/teamService';
@@ -51,6 +52,9 @@ export function AuthProvider({ children }: PropsWithChildren) {
     setUser(null);
     setSelectedTeam(null);
     await clearQueryCache(queryClient);
+    if (userId) {
+      await offlineShiftStorage.clearUserShifts(userId);
+    }
     if (persistenceAvailableRef.current && userId) {
       await SecureStore.deleteItemAsync(refreshTokenKey(userId));
       await SecureStore.deleteItemAsync(selectedTeamKey(userId));

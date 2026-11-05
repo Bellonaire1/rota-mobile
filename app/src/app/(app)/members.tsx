@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard';
 import { Redirect, useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -20,11 +20,11 @@ import { ApiError } from '@/services/api/apiClient';
 import {
   useAddMember,
   useCreateInvitation,
+  useInfiniteTeamMembers,
   useRemoveMember,
   useRevokeInvitation,
   useTeamAllMembers,
   useTeamInvitations,
-  useTeamMembers,
   useUpdateMemberRole,
 } from '@/services/query';
 import { TeamInvitation, TeamMember, TeamRole } from '@/types/api';
@@ -37,8 +37,6 @@ export default function MembersScreen() {
   const router = useRouter();
   const { user, selectedTeam, signOut } = useAuth();
 
-  const [page, setPage] = useState(1);
-  const [accumulatedMembers, setAccumulatedMembers] = useState<TeamMember[]>([]);
   const [localError, setLocalError] = useState<string | null>(null);
   const [userIdInput, setUserIdInput] = useState('');
   const [newRole, setNewRole] = useState<ManagedRole>('STAFF');
@@ -51,28 +49,39 @@ export default function MembersScreen() {
   const [inviteSuccess, setInviteSuccess] = useState<string | null>(null);
   const [revokingId, setRevokingId] = useState<string | null>(null);
 
-  // Reset page and accumulated list when selectedTeam changes
-  useEffect(() => {
-    setPage(1);
-    setAccumulatedMembers([]);
-    setLocalError(null);
-  }, [selectedTeam?.id]);
-
-  // Paginated members query for current page
+  // Paginated members infinite query: pages kept in query cache directly
   const {
-    data: membersPageData,
+    data: membersData,
     isLoading: loadingMembers,
     isRefetching: refreshingMembers,
+    isFetchingNextPage: loadingMoreMembers,
+    hasNextPage: hasMoreMembers,
+    fetchNextPage: loadMoreMembers,
     error: membersQueryError,
     refetch: refetchMembers,
-  } = useTeamMembers(selectedTeam?.id, user?.id, page, 20);
+  } = useInfiniteTeamMembers(selectedTeam?.id, user?.id, 20);
 
-  // All members query used for role discovery if member isn't in page 1
+  // Derive unique members directly from query cache
+  const displayMembers: TeamMember[] = useMemo(() => {
+    if (!membersData?.pages) return [];
+    const all = membersData.pages.flatMap((page) => page.members);
+    const seen = new Set<string>();
+    const unique: TeamMember[] = [];
+    for (const member of all) {
+      if (!seen.has(member.userId)) {
+        seen.add(member.userId);
+        unique.push(member);
+      }
+    }
+    return unique;
+  }, [membersData]);
+
+  // All members query used for role discovery if member isn't in first page
   const { data: allMembersData } = useTeamAllMembers(selectedTeam?.id, user?.id);
 
   // Determine user's role in the team
   const userRole: TeamRole | null =
-    membersPageData?.members.find((m) => m.userId === user?.id)?.role ??
+    displayMembers.find((m) => m.userId === user?.id)?.role ??
     allMembersData?.find((m) => m.userId === user?.id)?.role ??
     null;
 
@@ -81,7 +90,6 @@ export default function MembersScreen() {
   // Invitations query (enabled only for owner)
   const {
     data: invitationsData,
-    isLoading: loadingInvitations,
     refetch: refetchInvitations,
   } = useTeamInvitations(selectedTeam?.id, user?.id, isOwner);
 
@@ -94,23 +102,6 @@ export default function MembersScreen() {
   const createInvitationMutation = useCreateInvitation(selectedTeam?.id, user?.id);
   const revokeInvitationMutation = useRevokeInvitation(selectedTeam?.id, user?.id);
 
-  // Synchronize members page data into accumulated list
-  useEffect(() => {
-    if (!membersPageData) return;
-    if (page === 1) {
-      setAccumulatedMembers(membersPageData.members);
-    } else {
-      setAccumulatedMembers((current) => {
-        const existingIds = new Set(current.map((m) => m.userId));
-        const newMembers = membersPageData.members.filter((m) => !existingIds.has(m.userId));
-        return [...current, ...newMembers];
-      });
-    }
-  }, [membersPageData, page]);
-
-  const totalPages = membersPageData?.pagination.totalPages ?? 1;
-  const hasMore = page < totalPages;
-
   const error =
     localError ||
     (membersQueryError
@@ -121,16 +112,9 @@ export default function MembersScreen() {
 
   const handleRefresh = async () => {
     setLocalError(null);
-    setPage(1);
     await refetchMembers();
     if (isOwner) {
       await refetchInvitations();
-    }
-  };
-
-  const loadMore = () => {
-    if (hasMore && !loadingMembers) {
-      setPage((p) => p + 1);
     }
   };
 
@@ -199,7 +183,6 @@ export default function MembersScreen() {
     try {
       await addMemberMutation.mutateAsync({ newUserId: userId, role: newRole });
       setUserIdInput('');
-      setPage(1);
     } catch (requestError) {
       setLocalError(requestError instanceof ApiError ? requestError.message : 'Unable to add this registered user.');
     }
@@ -212,7 +195,6 @@ export default function MembersScreen() {
     setLocalError(null);
     try {
       await updateMemberRoleMutation.mutateAsync({ memberUserId: member.userId, role: nextRole });
-      setPage(1);
     } catch (requestError) {
       setLocalError(requestError instanceof ApiError ? requestError.message : 'Unable to change this member’s role.');
     } finally {
@@ -232,7 +214,6 @@ export default function MembersScreen() {
           setLocalError(null);
           try {
             await removeMemberMutation.mutateAsync(member.userId);
-            setPage(1);
           } catch (requestError) {
             setLocalError(requestError instanceof ApiError ? requestError.message : 'Unable to remove this member.');
           } finally {
@@ -255,8 +236,6 @@ export default function MembersScreen() {
 
   if (!selectedTeam) return <Redirect href="/(app)/select-team" />;
   if (!user) return <Redirect href="/(auth)/login" />;
-
-  const displayMembers = page === 1 && membersPageData ? membersPageData.members : accumulatedMembers;
 
   return (
     <ScrollView
@@ -407,11 +386,11 @@ export default function MembersScreen() {
             {userRole ? `You are a ${userRole.toLowerCase()}.` : 'Your membership role is unavailable.'}
           </Text>
         </View>
-        <Text style={styles.count}>{page === 1 ? displayMembers.length : '...'}</Text>
+        <Text style={styles.count}>{displayMembers.length}</Text>
       </View>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {loadingMembers && page === 1 ? (
+      {loadingMembers && displayMembers.length === 0 ? (
         <ActivityIndicator color={colors.primary} style={styles.loader} />
       ) : displayMembers.length === 0 ? (
         <View style={styles.emptyCard}>
@@ -454,11 +433,11 @@ export default function MembersScreen() {
         ))
       )}
 
-      {hasMore ? (
+      {hasMoreMembers ? (
         <ActionButton
-          label={loadingMembers ? 'Loading...' : 'Load more members'}
-          onPress={loadMore}
-          loading={loadingMembers}
+          label={loadingMoreMembers ? 'Loading...' : 'Load more members'}
+          onPress={() => loadMoreMembers()}
+          loading={loadingMoreMembers}
           variant="secondary"
         />
       ) : null}

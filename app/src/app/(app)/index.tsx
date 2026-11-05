@@ -20,14 +20,20 @@ import { colors, spacing, typography } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
 import { ShiftListParams } from '@/services/api/shiftService';
+import { useIsOnline } from '@/services/network/connectivityManager';
 import {
   useCancelShift,
   useCreateShift,
+  useInfiniteShifts,
   usePendingSwapsSummary,
-  useShifts,
   useTeamAllMembers,
   useUpdateShift,
 } from '@/services/query';
+import {
+  CompactOfflineShift,
+  offlineShiftStorage,
+  OfflineShiftSnapshot,
+} from '@/services/storage/offlineShiftStorage';
 import { Shift, ShiftStatus, TeamMember, TeamRole } from '@/types/api';
 
 type StatusFilter = 'ALL' | ShiftStatus;
@@ -78,7 +84,7 @@ const dateTimeFromInputs = (dateValue: string, timeValue: string): Date | null =
 
 const displayName = (member: TeamMember) => member.user.name || member.user.email;
 
-const shiftDisplay = (shift: Shift) => {
+const shiftDisplay = (shift: { startsAt: string; endsAt: string }) => {
   const start = new Date(shift.startsAt);
   const end = new Date(shift.endsAt);
   const date = start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
@@ -108,13 +114,14 @@ const emptyForm = (assigneeId = ''): ShiftFormState => {
 export default function DashboardScreen() {
   const router = useRouter();
   const { user, selectedTeam, signOut, isPersistenceAvailable } = useAuth();
+  const isOnline = useIsOnline();
 
-  const [page, setPage] = useState(1);
-  const [accumulatedShifts, setAccumulatedShifts] = useState<Shift[]>([]);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
   const [dateDraft, setDateDraft] = useState('');
   const [filterDate, setFilterDate] = useState('');
   const [localError, setLocalError] = useState<string | null>(null);
+
+  const [offlineSnapshot, setOfflineSnapshot] = useState<OfflineShiftSnapshot | null>(null);
 
   const [modalVisible, setModalVisible] = useState(false);
   const [editingShift, setEditingShift] = useState<Shift | null>(null);
@@ -122,37 +129,52 @@ export default function DashboardScreen() {
   const [formError, setFormError] = useState<string | null>(null);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
 
-  // Clear accumulated shifts and reset page when team or filter changes
+  // Clear local error when filters or team change
   useEffect(() => {
-    setPage(1);
-    setAccumulatedShifts([]);
     setLocalError(null);
   }, [selectedTeam?.id, statusFilter, filterDate]);
 
-  // Build shift query parameters
-  const shiftParams: ShiftListParams = useMemo(() => {
+  // Load offline snapshot on mount or team change
+  useEffect(() => {
+    let active = true;
+    if (!user?.id || !selectedTeam?.id) {
+      setOfflineSnapshot(null);
+      return;
+    }
+    offlineShiftStorage.getShifts(user.id, selectedTeam.id).then((snapshot) => {
+      if (active) setOfflineSnapshot(snapshot);
+    });
+    return () => {
+      active = false;
+    };
+  }, [user?.id, selectedTeam?.id]);
+
+  // Build shift query parameters (without page; managed by useInfiniteQuery)
+  const shiftParams: Omit<ShiftListParams, 'page'> = useMemo(() => {
     const fromDate = filterDate ? dateFromInput(filterDate) : null;
     const toDate = fromDate
       ? new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate() + 1)
       : null;
 
     return {
-      page,
       limit: 20,
       status: statusFilter === 'ALL' ? undefined : statusFilter,
       from: fromDate ? localOffsetIso(fromDate) : undefined,
       to: toDate ? localOffsetIso(toDate) : undefined,
     };
-  }, [page, statusFilter, filterDate]);
+  }, [statusFilter, filterDate]);
 
-  // TanStack Query hooks
+  // TanStack Infinite Query hook: all pages kept in query cache directly
   const {
-    data: shiftsPageData,
+    data: shiftsData,
     isLoading: loadingShifts,
     isRefetching: refreshingShifts,
+    isFetchingNextPage: loadingMoreShifts,
+    hasNextPage: hasMoreShifts,
+    fetchNextPage: loadMoreShifts,
     error: shiftsQueryError,
     refetch: refetchShifts,
-  } = useShifts(selectedTeam?.id, user?.id, shiftParams);
+  } = useInfiniteShifts(selectedTeam?.id, user?.id, shiftParams);
 
   const {
     data: membersData,
@@ -179,54 +201,116 @@ export default function DashboardScreen() {
   const updateShiftMutation = useUpdateShift(selectedTeam?.id, user?.id);
   const cancelShiftMutation = useCancelShift(selectedTeam?.id, user?.id);
 
-  // Sync paginated query data into accumulated array
-  useEffect(() => {
-    if (!shiftsPageData) return;
-    if (page === 1) {
-      setAccumulatedShifts(shiftsPageData.shifts);
-    } else {
-      setAccumulatedShifts((current) => {
-        const existingIds = new Set(current.map((s) => s.id));
-        const newShifts = shiftsPageData.shifts.filter((s) => !existingIds.has(s.id));
-        return [...current, ...newShifts];
-      });
+  // Derive shifts directly from query cache with deduplication: zero local accumulation state
+  const liveShifts: Shift[] = useMemo(() => {
+    if (!shiftsData?.pages) return [];
+    const all = shiftsData.pages.flatMap((page) => page.shifts);
+    const seen = new Set<string>();
+    const unique: Shift[] = [];
+    for (const shift of all) {
+      if (!seen.has(shift.id)) {
+        seen.add(shift.id);
+        unique.push(shift);
+      }
     }
-  }, [shiftsPageData, page]);
+    return unique;
+  }, [shiftsData]);
 
-  const totalPages = shiftsPageData?.pagination.totalPages ?? 1;
-  const hasMore = page < totalPages;
+  // Persist offline snapshot when live shifts are retrieved
+  useEffect(() => {
+    if (user?.id && selectedTeam?.id && liveShifts.length > 0 && isOnline) {
+      offlineShiftStorage
+        .saveShifts(user.id, selectedTeam.id, liveShifts)
+        .then((snapshot) => setOfflineSnapshot(snapshot))
+        .catch(() => {});
+    }
+  }, [user?.id, selectedTeam?.id, liveShifts, isOnline]);
+
+  // Clear offline cache if membership is revoked (403/404)
+  useEffect(() => {
+    if (
+      shiftsQueryError instanceof ApiError &&
+      (shiftsQueryError.statusCode === 403 || shiftsQueryError.statusCode === 404)
+    ) {
+      if (user?.id && selectedTeam?.id) {
+        offlineShiftStorage.clearTeamShifts(user.id, selectedTeam.id);
+        setOfflineSnapshot(null);
+      }
+    }
+  }, [shiftsQueryError, user?.id, selectedTeam?.id]);
+
+  // Determine whether we are rendering offline fallback shifts
+  const isUsingOfflineCache =
+    (!isOnline || Boolean(shiftsQueryError)) &&
+    liveShifts.length === 0 &&
+    Boolean(offlineSnapshot?.shifts.length);
+
+  // Effective shifts displayed to user
+  const displayedShifts = useMemo(() => {
+    if (liveShifts.length > 0) return liveShifts;
+    if (isUsingOfflineCache && offlineSnapshot) {
+      return offlineSnapshot.shifts.map((s) => ({
+        id: s.id,
+        teamId: selectedTeam?.id ?? '',
+        assignedToUserId: s.assignedToUserId,
+        createdByUserId: s.assignedToUserId,
+        title: s.title,
+        startsAt: s.startsAt,
+        endsAt: s.endsAt,
+        status: s.status,
+        cancelledAt: null,
+        cancelledByUserId: null,
+        createdAt: s.startsAt,
+        updatedAt: s.startsAt,
+        assignedTo: { id: s.assignedToUserId, name: s.assignedToName, email: '' },
+        createdBy: { id: s.assignedToUserId, name: s.assignedToName, email: '' },
+      }));
+    }
+    return [];
+  }, [liveShifts, isUsingOfflineCache, offlineSnapshot, selectedTeam?.id]);
+
+  const sortedShifts = useMemo(
+    () => [...displayedShifts].sort((a, b) => a.startsAt.localeCompare(b.startsAt)),
+    [displayedShifts]
+  );
+
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time';
 
   // Navigation focus refresh
   useFocusEffect(
     useCallback(() => {
-      if (!selectedTeam?.id) return;
+      if (!selectedTeam?.id || !isOnline) return;
       refetchShifts();
       refetchMembers();
       refetchSwaps();
-    }, [selectedTeam?.id, refetchShifts, refetchMembers, refetchSwaps])
+    }, [selectedTeam?.id, isOnline, refetchShifts, refetchMembers, refetchSwaps])
   );
 
   const handleRefresh = async () => {
     setLocalError(null);
-    setPage(1);
+    if (!isOnline) {
+      Alert.alert('Offline', 'Cannot refresh while offline. Check your network connection.');
+      return;
+    }
     await Promise.all([refetchShifts(), refetchMembers(), refetchSwaps()]);
   };
 
-  const loadMore = () => {
-    if (hasMore && !loadingShifts) {
-      setPage((p) => p + 1);
+  const handleOpenCreate = () => {
+    if (!isOnline || isUsingOfflineCache) {
+      Alert.alert('Offline Mode', 'Shift modifications require an active internet connection.');
+      return;
     }
-  };
-
-  const openCreate = () => {
     setEditingShift(null);
     setForm(emptyForm(members[0]?.userId ?? ''));
     setFormError(null);
     setModalVisible(true);
   };
 
-  const openEdit = (shift: Shift) => {
+  const handleOpenEdit = (shift: Shift) => {
+    if (!isOnline || isUsingOfflineCache) {
+      Alert.alert('Offline Mode', 'Shift modifications require an active internet connection.');
+      return;
+    }
     setEditingShift(shift);
     setForm(formForShift(shift));
     setFormError(null);
@@ -237,6 +321,10 @@ export default function DashboardScreen() {
     setForm((current) => ({ ...current, [field]: value }));
 
   const saveShift = async () => {
+    if (!isOnline) {
+      setFormError('Cannot save shifts while offline.');
+      return;
+    }
     const title = form.title.trim();
     const start = dateTimeFromInputs(form.startDate, form.startTime);
     const end = dateTimeFromInputs(form.endDate, form.endTime);
@@ -265,7 +353,6 @@ export default function DashboardScreen() {
         await createShiftMutation.mutateAsync(input);
       }
       setModalVisible(false);
-      setPage(1);
     } catch (requestError) {
       if (requestError instanceof ApiError && requestError.statusCode === 409) {
         setFormError(`${requestError.message} Refresh the schedule and try again.`);
@@ -279,6 +366,10 @@ export default function DashboardScreen() {
   };
 
   const cancelShift = (shift: Shift) => {
+    if (!isOnline || isUsingOfflineCache) {
+      Alert.alert('Offline Mode', 'Shift cancellation requires an active internet connection.');
+      return;
+    }
     Alert.alert(
       'Cancel shift?',
       `Cancel "${shift.title}" for ${shift.assignedTo.name || shift.assignedTo.email}?`,
@@ -296,7 +387,6 @@ export default function DashboardScreen() {
                 shiftId: shift.id,
                 updatedAt: shift.updatedAt,
               });
-              setPage(1);
             } catch (requestError) {
               setLocalError(
                 requestError instanceof ApiError && requestError.statusCode === 409
@@ -326,16 +416,9 @@ export default function DashboardScreen() {
     setFilterDate(dateDraft);
   };
 
-  const displayShifts =
-    page === 1 && shiftsPageData ? shiftsPageData.shifts : accumulatedShifts;
-  const sortedShifts = useMemo(
-    () => [...displayShifts].sort((a, b) => a.startsAt.localeCompare(b.startsAt)),
-    [displayShifts]
-  );
-
   const error =
     localError ||
-    (shiftsQueryError
+    (shiftsQueryError && !isUsingOfflineCache
       ? shiftsQueryError instanceof ApiError
         ? shiftsQueryError.message
         : 'Unable to load the schedule.'
@@ -368,13 +451,47 @@ export default function DashboardScreen() {
         title={selectedTeam.name}
         subtitle={`Schedule · ${role ? role.toLowerCase() : 'team member'}`}
       />
+
+      {/* Offline Mode Banner */}
+      {!isOnline || isUsingOfflineCache ? (
+        <View style={styles.offlineBanner}>
+          <View style={styles.offlineHeader}>
+            <View style={styles.offlineDot} />
+            <Text style={styles.offlineBadgeText}>OFFLINE MODE</Text>
+          </View>
+          <Text style={styles.offlineTitle}>
+            {isUsingOfflineCache
+              ? 'Viewing cached schedule (Read-only)'
+              : 'Device is offline'}
+          </Text>
+          {offlineSnapshot?.syncedAt ? (
+            <Text style={styles.offlineTimestamp}>
+              Last synchronized: {new Date(offlineSnapshot.syncedAt).toLocaleTimeString()} ·{' '}
+              {new Date(offlineSnapshot.syncedAt).toLocaleDateString()}
+            </Text>
+          ) : (
+            <Text style={styles.offlineTimestamp}>
+              Reconnect to synchronize live schedule
+            </Text>
+          )}
+        </View>
+      ) : null}
+
       <View style={styles.headerRow}>
         <View>
           <Text style={styles.eyebrow}>TEAM SCHEDULE</Text>
           <Text style={styles.title}>Shifts</Text>
         </View>
-        {canManage ? <ActionButton size="small" label="Add shift" onPress={openCreate} /> : null}
+        {canManage ? (
+          <ActionButton
+            size="small"
+            label="Add shift"
+            onPress={handleOpenCreate}
+            disabled={!isOnline || isUsingOfflineCache}
+          />
+        ) : null}
       </View>
+
       <View style={styles.navLinksRow}>
         <Pressable accessibilityRole="button" onPress={() => router.push('/(app)/members')} style={styles.membersLink}>
           <Text style={styles.membersLinkText}>Members →</Text>
@@ -437,7 +554,7 @@ export default function DashboardScreen() {
         <Text style={styles.warning}>{memberError} Management controls are unavailable.</Text>
       ) : null}
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {loadingShifts && page === 1 ? (
+      {loadingShifts && !isUsingOfflineCache ? (
         <ActivityIndicator color={colors.primary} style={styles.loader} />
       ) : sortedShifts.length === 0 ? (
         <View style={styles.emptyCard}>
@@ -449,7 +566,13 @@ export default function DashboardScreen() {
               ? 'Create the first shift or adjust the filters.'
               : 'Your team has no shifts matching these filters.'}
           </Text>
-          {canManage ? <ActionButton label="Create a shift" onPress={openCreate} /> : null}
+          {canManage ? (
+            <ActionButton
+              label="Create a shift"
+              onPress={handleOpenCreate}
+              disabled={!isOnline || isUsingOfflineCache}
+            />
+          ) : null}
         </View>
       ) : (
         <View>
@@ -473,7 +596,7 @@ export default function DashboardScreen() {
                 </Text>
               </View>
               <Text style={styles.assignee}>
-                Assigned to {shift.assignedTo.name || shift.assignedTo.email}
+                Assigned to {shift.assignedTo?.name || shift.assignedTo?.email}
               </Text>
               {activeSwapShiftIds.has(shift.id) ? (
                 <View style={styles.swapPendingBadge}>
@@ -487,8 +610,9 @@ export default function DashboardScreen() {
                       <ActionButton
                         size="small"
                         label="Edit"
-                        onPress={() => openEdit(shift)}
+                        onPress={() => handleOpenEdit(shift)}
                         variant="secondary"
+                        disabled={!isOnline || isUsingOfflineCache}
                       />
                       <ActionButton
                         size="small"
@@ -496,6 +620,7 @@ export default function DashboardScreen() {
                         onPress={() => cancelShift(shift)}
                         variant="quiet"
                         loading={cancellingId === shift.id}
+                        disabled={!isOnline || isUsingOfflineCache}
                       />
                     </>
                   ) : null}
@@ -504,23 +629,28 @@ export default function DashboardScreen() {
                       size="small"
                       label="Request swap"
                       variant="secondary"
-                      onPress={() =>
+                      disabled={!isOnline || isUsingOfflineCache}
+                      onPress={() => {
+                        if (!isOnline || isUsingOfflineCache) {
+                          Alert.alert('Offline Mode', 'Cannot propose swaps while offline.');
+                          return;
+                        }
                         router.push({
                           pathname: '/(app)/swap-request',
                           params: { sourceShiftId: shift.id },
-                        })
-                      }
+                        });
+                      }}
                     />
                   ) : null}
                 </View>
               ) : null}
             </View>
           ))}
-          {hasMore ? (
+          {hasMoreShifts && !isUsingOfflineCache ? (
             <ActionButton
-              label={loadingShifts ? 'Loading...' : 'Load more'}
-              onPress={loadMore}
-              loading={loadingShifts}
+              label={loadingMoreShifts ? 'Loading...' : 'Load more'}
+              onPress={() => loadMoreShifts()}
+              loading={loadingMoreShifts}
               variant="secondary"
             />
           ) : null}
@@ -637,7 +767,7 @@ export default function DashboardScreen() {
                 label={editingShift ? 'Save changes' : 'Create shift'}
                 onPress={saveShift}
                 loading={createShiftMutation.isPending || updateShiftMutation.isPending}
-                disabled={!canManage}
+                disabled={!canManage || !isOnline}
               />
             </View>
           </ScrollView>
@@ -650,6 +780,42 @@ export default function DashboardScreen() {
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
+  offlineBanner: {
+    backgroundColor: '#FEF3C7',
+    borderWidth: 1,
+    borderColor: '#F59E0B',
+    borderRadius: 16,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+  },
+  offlineHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 4,
+  },
+  offlineDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#D97706',
+  },
+  offlineBadgeText: {
+    color: '#92400E',
+    fontSize: typography.sizes.xs,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+  },
+  offlineTitle: {
+    color: '#78350F',
+    fontSize: typography.sizes.sm,
+    fontWeight: '700',
+  },
+  offlineTimestamp: {
+    color: '#92400E',
+    fontSize: typography.sizes.xs,
+    marginTop: 2,
+  },
   headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: spacing.md },
   navLinksRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.md, flexWrap: 'wrap', gap: spacing.xs },
   membersLink: { alignSelf: 'flex-start' },

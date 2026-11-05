@@ -10,7 +10,7 @@ import { ActivityFeedQuery } from '@/types/api';
  *
  * This ensures:
  * 1. Targeted invalidation: Invalidate `shifts.all(teamId, userId)` invalidates ALL lists,
- *    details, and paginated queries for that specific team and user.
+ *    infinite queries, details, and paginated queries for that specific team and user.
  * 2. Cross-team isolation: Team A queries are strictly partitioned from Team B.
  * 3. Cross-user isolation: User A cache entries are never returned for User B.
  * 4. Deterministic prefix matching by TanStack Query query filters.
@@ -30,6 +30,8 @@ export const queryKeys = {
    */
   members: {
     all: (teamId: string, userId: string) => ['members', teamId, userId] as const,
+    infinite: (teamId: string, userId: string, params?: { limit?: number }) =>
+      ['members', teamId, userId, 'infinite', params ?? {}] as const,
     list: (teamId: string, userId: string, params?: { page?: number; limit?: number }) =>
       ['members', teamId, userId, 'list', params ?? {}] as const,
     allList: (teamId: string, userId: string) =>
@@ -43,6 +45,8 @@ export const queryKeys = {
    */
   shifts: {
     all: (teamId: string, userId: string) => ['shifts', teamId, userId] as const,
+    infinite: (teamId: string, userId: string, params?: Omit<ShiftListParams, 'page'>) =>
+      ['shifts', teamId, userId, 'infinite', params ?? {}] as const,
     list: (teamId: string, userId: string, params?: ShiftListParams) =>
       ['shifts', teamId, userId, 'list', params ?? {}] as const,
     detail: (teamId: string, shiftId: string, userId: string) =>
