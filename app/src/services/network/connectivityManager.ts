@@ -50,6 +50,7 @@ export class ConnectivityManager {
   private listeners = new Set<ConnectivityListener>();
   private checkInFlight: Promise<{ isOnline: boolean; backendAvailable: boolean }> | null = null;
   private lastCheckedAt: number | null = null;
+  private currentGeneration = 0;
 
   constructor() {
     this.online = true;
@@ -65,6 +66,10 @@ export class ConnectivityManager {
   }
 
   public setOnline(isOnline: boolean, backendAvailable: boolean = isOnline): void {
+    if (!isOnline) {
+      // Invalidate any in-flight probes so a delayed HTTP 200 cannot race and reset offline state
+      this.currentGeneration++;
+    }
     const changed = this.online !== isOnline || this.backendAvailable !== backendAvailable;
     this.online = isOnline;
     this.backendAvailable = backendAvailable;
@@ -86,6 +91,7 @@ export class ConnectivityManager {
   /**
    * Probes the health endpoint to verify genuine internet access and server health.
    * Uses AbortController with a 4s timeout. Avoids redundant concurrent in-flight checks.
+   * Uses generation tokens to prevent race conditions when offline events occur while in-flight.
    */
   public async checkConnectivity(
     probeFn?: () => Promise<{ ok: boolean; status: number }>
@@ -94,11 +100,16 @@ export class ConnectivityManager {
       return this.checkInFlight;
     }
 
+    const probeGen = this.currentGeneration;
+
     const checkPromise = (async () => {
       let timeoutId: any = null;
       try {
         if (probeFn) {
           const res = await probeFn();
+          if (this.currentGeneration !== probeGen) {
+            return { isOnline: this.online, backendAvailable: this.backendAvailable };
+          }
           const isOnline = true;
           const backendAvailable = res.ok && res.status === 200;
           this.setOnline(isOnline, backendAvailable);
@@ -107,6 +118,9 @@ export class ConnectivityManager {
         }
 
         if (typeof fetch !== 'function') {
+          if (this.currentGeneration !== probeGen) {
+            return { isOnline: this.online, backendAvailable: this.backendAvailable };
+          }
           this.setOnline(true, true);
           return { isOnline: true, backendAvailable: true };
         }
@@ -131,6 +145,10 @@ export class ConnectivityManager {
 
         if (timeoutId) clearTimeout(timeoutId);
 
+        if (this.currentGeneration !== probeGen) {
+          return { isOnline: this.online, backendAvailable: this.backendAvailable };
+        }
+
         const isOnline = true;
         const backendAvailable = res.ok && res.status === 200;
         this.setOnline(isOnline, backendAvailable);
@@ -138,6 +156,10 @@ export class ConnectivityManager {
         return { isOnline, backendAvailable };
       } catch (err: any) {
         if (timeoutId) clearTimeout(timeoutId);
+
+        if (this.currentGeneration !== probeGen) {
+          return { isOnline: this.online, backendAvailable: this.backendAvailable };
+        }
 
         // Network transport failure or timeout indicates offline / disconnected state
         const isNetworkFailure =

@@ -126,13 +126,12 @@ export default function DashboardScreen() {
 
   const [offlineSnapshot, setOfflineSnapshot] = useState<OfflineShiftSnapshot | null>(null);
   const [renderedTeamId, setRenderedTeamId] = useState(selectedTeam?.id);
-  const lastSavedDataUpdatedAtRef = useRef<number>(0);
+  const lastSavedDataUpdatedAtByTeamRef = useRef<Record<string, number>>({});
 
   // Synchronously isolate offline snapshot across team switches before effects run
   if (renderedTeamId !== selectedTeam?.id) {
     setRenderedTeamId(selectedTeam?.id);
     setOfflineSnapshot(null);
-    lastSavedDataUpdatedAtRef.current = 0;
   }
 
   const activeOfflineSnapshot = useMemo(() => {
@@ -241,23 +240,35 @@ export default function DashboardScreen() {
     return unique;
   }, [shiftsData]);
 
-  // Persist offline snapshot ONLY after genuine successful server response (shiftsDataUpdatedAt > lastSavedDataUpdatedAtRef.current)
+  // Persist offline snapshot ONLY after genuine successful server response (shiftsDataUpdatedAt > lastSavedDataUpdatedAtByTeamRef.current[teamId])
   // for unfiltered schedule. Prevents stale memory/cached query loads from generating fake fresh syncedAt timestamps.
   useEffect(() => {
+    const teamId = selectedTeam?.id;
+    const lastSaved = teamId ? (lastSavedDataUpdatedAtByTeamRef.current[teamId] ?? 0) : 0;
     if (
       user?.id &&
-      selectedTeam?.id &&
+      teamId &&
       liveShifts.length > 0 &&
       isOnline &&
       !shiftsQueryError &&
       statusFilter === 'ALL' &&
       !filterDate &&
       shiftsDataUpdatedAt > 0 &&
-      shiftsDataUpdatedAt > lastSavedDataUpdatedAtRef.current
+      shiftsDataUpdatedAt > lastSaved
     ) {
-      lastSavedDataUpdatedAtRef.current = shiftsDataUpdatedAt;
+      lastSavedDataUpdatedAtByTeamRef.current[teamId] = shiftsDataUpdatedAt;
+      const hasMoreServerPages = Boolean(
+        shiftsData?.pages?.[0]?.pagination?.totalPages &&
+        shiftsData.pages[0].pagination.totalPages > 1
+      );
+      const totalServerCount = shiftsData?.pages?.[0]?.pagination?.total;
+
       offlineShiftStorage
-        .saveShifts(user.id, selectedTeam.id, liveShifts)
+        .saveShifts(user.id, teamId, liveShifts, {
+          syncedAt: shiftsDataUpdatedAt,
+          hasMoreServerPages,
+          totalServerCount,
+        })
         .then((snapshot) => setOfflineSnapshot(snapshot))
         .catch((err) => {
           // Gracefully log storage degradation without blocking UI
@@ -273,6 +284,7 @@ export default function DashboardScreen() {
     statusFilter,
     filterDate,
     shiftsDataUpdatedAt,
+    shiftsData,
   ]);
 
   // Clear offline cache, query cache and snapshot if membership is revoked (403/404)
@@ -538,9 +550,13 @@ export default function DashboardScreen() {
           </View>
           <Text style={styles.offlineTitle}>
             {isUsingOfflineCache
-              ? activeOfflineSnapshot && activeOfflineSnapshot.shifts.length >= MAX_OFFLINE_SHIFTS_PER_TEAM
-                ? 'Viewing cached schedule (Partial schedule · Max 20 shifts)'
-                : 'Viewing cached schedule (Read-only)'
+              ? activeOfflineSnapshot?.isPartial
+                ? activeOfflineSnapshot.partialReason === 'MAX_RECORDS_REACHED'
+                  ? 'Viewing cached schedule (Partial schedule · Max 20 shifts)'
+                  : activeOfflineSnapshot.partialReason === 'BYTE_LIMIT'
+                  ? 'Viewing cached schedule (Partial schedule · Storage limit)'
+                  : 'Viewing cached schedule (Partial schedule · More shifts on server)'
+                : 'Viewing cached schedule (Complete schedule · Read-only)'
               : 'Device is offline'}
           </Text>
           {activeOfflineSnapshot?.syncedAt ? (

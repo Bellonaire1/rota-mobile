@@ -46,6 +46,9 @@ export function AuthProvider({ children }: PropsWithChildren) {
   const clearCredentials = useCallback(async (storedUserId?: string) => {
     const currentUser = userRef.current;
     const userId = currentUser?.id ?? storedUserId;
+    if (userId) {
+      offlineShiftStorage.markSessionCleared(userId);
+    }
     refreshTokenRef.current = null;
     apiClient.setAccessToken(null);
     userRef.current = null;
@@ -110,6 +113,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
     userRef.current = result.user;
     setUser(result.user);
     apiClient.setAccessToken(result.accessToken);
+    offlineShiftStorage.setSessionActive(result.user.id);
     await persistRefreshToken(result.user.id, result.refreshToken);
   }, [persistRefreshToken]);
 
@@ -162,6 +166,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
         const result = await authService.me();
         userRef.current = result.user;
         setUser(result.user);
+        offlineShiftStorage.setSessionActive(result.user.id);
         await restoreSelectedTeam(result.user);
       } catch {
         await clearCredentials(storedUserId);

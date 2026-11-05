@@ -38,11 +38,25 @@ export interface CompactOfflineShift {
   assignedToUserId: string;
 }
 
+export type PartialReason =
+  | 'BYTE_LIMIT'
+  | 'MAX_RECORDS_REACHED'
+  | 'MORE_PAGES_EXIST';
+
+export interface SaveShiftsOptions {
+  syncedAt?: string | number;
+  totalServerCount?: number;
+  hasMoreServerPages?: boolean;
+}
+
 export interface OfflineShiftSnapshot {
   userId: string;
   teamId: string;
   syncedAt: string; // ISO 8601 string
   shifts: CompactOfflineShift[];
+  isPartial: boolean;
+  partialReason?: PartialReason;
+  totalServerCount?: number;
 }
 
 /**
@@ -202,6 +216,8 @@ function truncateText(str: string | undefined | null, maxChars: number): string 
 
 export class OfflineShiftStorageManager {
   private adapter: OfflineStorageAdapter;
+  private sessionClearedUsers = new Set<string>();
+  private userIndexLocks = new Map<string, Promise<void>>();
 
   constructor(adapter?: OfflineStorageAdapter) {
     this.adapter = adapter ?? new SecureStoreAdapter();
@@ -211,18 +227,75 @@ export class OfflineShiftStorageManager {
     return this.adapter;
   }
 
+  public markSessionCleared(userId: string): void {
+    if (userId) {
+      this.sessionClearedUsers.add(userId);
+    }
+  }
+
+  public setSessionActive(userId: string): void {
+    if (userId) {
+      this.sessionClearedUsers.delete(userId);
+    }
+  }
+
+  public isSessionCleared(userId: string): boolean {
+    return this.sessionClearedUsers.has(userId);
+  }
+
+  /**
+   * Serializes index operations per user to prevent race conditions during concurrent team saves.
+   */
+  private async withUserIndexLock<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+    while (this.userIndexLocks.has(userId)) {
+      try {
+        await this.userIndexLocks.get(userId);
+      } catch {
+        // Continue even if previous queue item threw
+      }
+    }
+    let resolveLock!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      resolveLock = resolve;
+    });
+    this.userIndexLocks.set(userId, lockPromise);
+    try {
+      return await fn();
+    } finally {
+      if (this.userIndexLocks.get(userId) === lockPromise) {
+        this.userIndexLocks.delete(userId);
+      }
+      resolveLock();
+    }
+  }
+
   /**
    * Compacts, truncates, bounds, and persists shifts for the active team.
    * Enforces exact UTF-8 byte size limit under 2000 bytes.
+   * Records whether the snapshot is complete or partial.
    */
   async saveShifts(
     userId: string,
     teamId: string,
-    shifts: Shift[]
+    shifts: Shift[],
+    options?: SaveShiftsOptions
   ): Promise<OfflineShiftSnapshot> {
     if (!userId || !teamId) {
       throw new Error('userId and teamId are required to persist offline shifts');
     }
+
+    if (this.isSessionCleared(userId)) {
+      throw new Error(`Cannot persist offline shifts: session has been cleared for user ${userId}`);
+    }
+
+    const maxRecordsReached =
+      shifts.length > MAX_OFFLINE_SHIFTS_PER_TEAM ||
+      (options?.totalServerCount !== undefined &&
+        options.totalServerCount > MAX_OFFLINE_SHIFTS_PER_TEAM);
+    const morePages = Boolean(
+      options?.hasMoreServerPages ||
+      (options?.totalServerCount !== undefined && options.totalServerCount > shifts.length)
+    );
 
     let compactShifts: CompactOfflineShift[] = shifts
       .slice(0, MAX_OFFLINE_SHIFTS_PER_TEAM)
@@ -239,11 +312,21 @@ export class OfflineShiftStorageManager {
         assignedToUserId: s.assignedToUserId,
       }));
 
+    const countBeforePruning = compactShifts.length;
+
+    const authoritativeSyncedAt = options?.syncedAt
+      ? typeof options.syncedAt === 'number'
+        ? new Date(options.syncedAt).toISOString()
+        : new Date(options.syncedAt).toISOString()
+      : new Date().toISOString();
+
     let snapshot: OfflineShiftSnapshot = {
       userId,
       teamId,
-      syncedAt: new Date().toISOString(),
+      syncedAt: authoritativeSyncedAt,
       shifts: compactShifts,
+      isPartial: false,
+      totalServerCount: options?.totalServerCount ?? shifts.length,
     };
 
     let serialized = JSON.stringify(snapshot);
@@ -261,21 +344,49 @@ export class OfflineShiftStorageManager {
       );
     }
 
-    // 1. Update user's team index FIRST so snapshot is never left untracked
-    const indexKey = getOfflineTeamIndexKey(userId);
-    const rawIndex = await this.adapter.getItem(indexKey);
-    let teams: string[] = [];
-    if (rawIndex) {
-      try {
-        teams = JSON.parse(rawIndex);
-      } catch {
-        teams = [];
+    const bytePruned = compactShifts.length < countBeforePruning;
+
+    let isPartial = false;
+    let partialReason: PartialReason | undefined = undefined;
+
+    if (maxRecordsReached) {
+      isPartial = true;
+      partialReason = 'MAX_RECORDS_REACHED';
+    } else if (bytePruned) {
+      isPartial = true;
+      partialReason = 'BYTE_LIMIT';
+    } else if (morePages) {
+      isPartial = true;
+      partialReason = 'MORE_PAGES_EXIST';
+    }
+
+    snapshot = {
+      ...snapshot,
+      shifts: compactShifts,
+      isPartial,
+      partialReason,
+      totalServerCount: options?.totalServerCount ?? (isPartial ? undefined : compactShifts.length),
+    };
+    serialized = JSON.stringify(snapshot);
+
+    // 1. Update user's team index FIRST inside per-user lock so concurrent saves never lose entries
+    await this.withUserIndexLock(userId, async () => {
+      const indexKey = getOfflineTeamIndexKey(userId);
+      const rawIndex = await this.adapter.getItem(indexKey);
+      let teams: string[] = [];
+      if (rawIndex) {
+        try {
+          teams = JSON.parse(rawIndex);
+          if (!Array.isArray(teams)) teams = [];
+        } catch {
+          teams = [];
+        }
       }
-    }
-    if (!teams.includes(teamId)) {
-      teams.push(teamId);
-      await this.adapter.setItem(indexKey, JSON.stringify(teams));
-    }
+      if (!teams.includes(teamId)) {
+        teams.push(teamId);
+        await this.adapter.setItem(indexKey, JSON.stringify(teams));
+      }
+    });
 
     // 2. Persist shift snapshot
     const key = getOfflineShiftKey(userId, teamId);
@@ -316,19 +427,21 @@ export class OfflineShiftStorageManager {
     const key = getOfflineShiftKey(userId, teamId);
     await this.adapter.removeItem(key);
 
-    // Remove team from user's index
+    // Remove team from user's index inside lock
     try {
-      const indexKey = getOfflineTeamIndexKey(userId);
-      const rawIndex = await this.adapter.getItem(indexKey);
-      if (rawIndex) {
-        const teams: string[] = JSON.parse(rawIndex);
-        const updated = teams.filter((t) => t !== teamId);
-        if (updated.length > 0) {
-          await this.adapter.setItem(indexKey, JSON.stringify(updated));
-        } else {
-          await this.adapter.removeItem(indexKey);
+      await this.withUserIndexLock(userId, async () => {
+        const indexKey = getOfflineTeamIndexKey(userId);
+        const rawIndex = await this.adapter.getItem(indexKey);
+        if (rawIndex) {
+          const teams: string[] = JSON.parse(rawIndex);
+          const updated = teams.filter((t) => t !== teamId);
+          if (updated.length > 0) {
+            await this.adapter.setItem(indexKey, JSON.stringify(updated));
+          } else {
+            await this.adapter.removeItem(indexKey);
+          }
         }
-      }
+      });
     } catch {
       // Ignore
     }
@@ -337,25 +450,49 @@ export class OfflineShiftStorageManager {
   /**
    * Discovers and clears all offline shift snapshots for a user across all previously
    * visited teams without requiring caller to guess or pass team IDs.
-   * Explicitly detects and reports deletion failures.
+   *
+   * Security & Reliability Invariants:
+   * 1. Failed index reads do NOT silently become empty cleanups; the index is preserved for retries.
+   * 2. Failed snapshot deletions retain their team IDs in the index so retry can discover them.
+   * 3. Session is marked cleared to prevent race-condition writes after signout.
+   *
+   * Note on Legacy Snapshots:
+   * For snapshots created prior to the introduction of the index registry, secure hardware
+   * storage APIs (iOS Keychain and Android Keystore) do not permit key enumeration.
+   * Legacy snapshots can only be cleaned up if their teamId is supplied via knownTeamIds.
    */
   async clearUserShifts(userId: string, knownTeamIds: string[] = []): Promise<void> {
     if (!userId) return;
 
+    this.markSessionCleared(userId);
+
     const indexKey = getOfflineTeamIndexKey(userId);
     let indexedTeams: string[] = [];
+    let indexReadError: Error | null = null;
+
     try {
       const rawIndex = await this.adapter.getItem(indexKey);
       if (rawIndex) {
-        indexedTeams = JSON.parse(rawIndex);
+        try {
+          indexedTeams = JSON.parse(rawIndex);
+          if (!Array.isArray(indexedTeams)) {
+            indexedTeams = [];
+          }
+        } catch {
+          indexedTeams = [];
+        }
       }
-    } catch {
-      indexedTeams = [];
+    } catch (err: any) {
+      indexReadError = err instanceof Error ? err : new Error(String(err));
+    }
+
+    const errors: Error[] = [];
+    if (indexReadError) {
+      errors.push(new Error(`Failed to read team index for user ${userId}: ${indexReadError.message}`));
     }
 
     const allTeams = Array.from(new Set([...indexedTeams, ...knownTeamIds]));
     const failedTeams: string[] = [];
-    const errors: Error[] = [];
 
     for (const teamId of allTeams) {
       try {
@@ -367,8 +504,11 @@ export class OfflineShiftStorageManager {
       }
     }
 
-    if (failedTeams.length > 0) {
-      // Retain failed teams in the index so retry can discover and clean them up
+    // Retain retry information in index
+    if (indexReadError) {
+      // If we couldn't read the index, DO NOT delete or overwrite it!
+      // Preserving the existing index key allows subsequent retry to read and clean it up.
+    } else if (failedTeams.length > 0) {
       try {
         await this.adapter.setItem(indexKey, JSON.stringify(failedTeams));
       } catch (err: any) {

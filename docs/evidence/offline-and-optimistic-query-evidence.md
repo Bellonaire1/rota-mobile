@@ -1,8 +1,8 @@
-# ROTA — TASK R06B, R06B.1 & R06B.2 EVIDENCE
-## Offline Cache Security, Real Connectivity, Native Network Integration & Swap Pagination Hardening
+# ROTA — TASK R06B, R06B.1, R06B.2 & R06C EVIDENCE
+## Offline Cache Security, Real Connectivity, Native Network Integration, Swap Pagination & Android Readiness
 
 **Repository:** `C:\Users\USER\rota-mobile`  
-**Verified Starting Baseline:** `163a39c44dc5ada589a8186c2471485402b089c1`  
+**Verified Starting Baseline:** `3d38c468a8942c9d86f84e353532fac53b8e03b0`  
 **Requirements Addressed:** R06.2, R06.3, R06.4, R06.5  
 **Evaluation Dimensions:** Impl: YES | Test: YES | Dep: NO | Evid: YES  
 **Status Result:** PARTIAL (Awaiting production deployment & physical Android device airplane mode validation)  
@@ -21,10 +21,14 @@
 
 ---
 
-### 2. Offline Storage Security & Recoverable Cleanup (Tasks R06B.1 & R06B.2)
+### 2. Offline Storage Security & Recoverable Cleanup (Tasks R06B.1, R06B.2 & R06C)
 
-- **Index-First Persistence Pre-Allocation:**
-  - `OfflineShiftStorageManager.saveShifts(userId, teamId, shifts)` now writes `teamId` to the user's index registry (`rota.offline-shifts.index.${userId}`) *before* persisting the snapshot to storage. If the index update fails, the operation throws immediately and the snapshot write is never initiated, guaranteeing zero untracked orphan snapshots.
+- **Index Mutex Serialization Lock (`withUserIndexLock`):**
+  - Implemented an asynchronous per-user mutex lock queue in `OfflineShiftStorageManager`. Concurrent `saveShifts()` calls for different teams belonging to the same user are strictly serialized, eliminating race conditions that previously dropped index registry entries.
+- **Session Clearance Tracking (`markSessionCleared` / `setSessionActive`):**
+  - Integrated explicit session state tracking into `OfflineShiftStorageManager`. On user sign-out (`AuthContext.clearCredentials()`), `markSessionCleared(userId)` is triggered immediately. Any in-flight background query resolving after sign-out is rejected with an explicit error, preventing orphaned or unencrypted post-signout snapshot persistence. Login and session restore re-enable persistence via `setSessionActive(userId)`.
+- **Index Read Failure Protection:**
+  - In `clearUserShifts(userId, knownTeamIds)`, if reading the user index key throws a storage read error, the index key is **not** overwritten with an empty array or destroyed. The disk key is preserved, an error is reported, and any subsequent retry can read the existing index and complete full multi-workspace cleanup.
 - **Recoverable Partial Deletion:**
   - In `clearUserShifts(userId, knownTeamIds)`, if any team snapshot fails to delete, the failed team IDs are preserved in the user index rather than wiping the index. A subsequent retry or sign-out retains full knowledge of which snapshots remain to be cleaned up.
 - **Independent Credential Wipe in `AuthContext`:**
@@ -35,14 +39,19 @@
   - When `shiftsQuery` encounters an HTTP 403 (FORBIDDEN) or 404 (NOT_FOUND), `displayedShifts` immediately evaluates to `[]`.
   - The query cache for the revoked team is purged via `queryClient.removeQueries({ queryKey: queryKeys.shifts.all(teamId, userId) })`.
   - The offline snapshot is deleted via `offlineShiftStorage.clearTeamShifts(userId, teamId)` and the offline banner suppressed, rendering an explicit access revoked state.
-- **True Server Synchronization Timestamp Semantics:**
-  - `syncedAt` timestamps are only created/updated when TanStack Query's `dataUpdatedAt` genuinely advances past `lastSavedDataUpdatedAtRef.current` following a fresh, successful server response for the team's unfiltered schedule (`statusFilter === 'ALL' && !filterDate`). Merely mounting offline or reading from cached queries never advances `syncedAt`.
-- **Bounded Offline Schedule Clarification:**
-  - When the offline snapshot holds `MAX_OFFLINE_SHIFTS_PER_TEAM = 20` shifts, the offline banner clearly displays: `'Viewing cached schedule (Partial schedule · Max 20 shifts)'`.
+- **Accurate Per-Team Server Synchronization Timestamp Semantics:**
+  - Tracked via `lastSavedDataUpdatedAtByTeamRef = useRef<Record<string, number>>({})` in `index.tsx`. Switching between workspaces retains each team's last known synchronization timestamp without reset. Mounting offline, switching teams, or viewing cached queries never advances `syncedAt`. Timestamps advance only when a fresh, successful server response genuinely advances `shiftsDataUpdatedAt > lastSavedDataUpdatedAtByTeamRef.current[teamId]`.
+- **Explicit Partial Schedule Labeling & Reason Tracking:**
+  - `OfflineShiftSnapshot` includes `isPartial: boolean`, `partialReason?: 'BYTE_LIMIT' | 'MAX_RECORDS_REACHED' | 'MORE_PAGES_EXIST'`, and `totalServerCount?: number`.
+  - The offline banner dynamically reflects schedule completeness:
+    - Complete: `'Viewing cached schedule (Complete schedule · Read-only)'`
+    - More pages on server: `'Viewing cached schedule (Partial schedule · More shifts on server)'`
+    - Max records reached: `'Viewing cached schedule (Partial schedule · Max 20 shifts)'`
+    - Storage byte limit pruned: `'Viewing cached schedule (Partial schedule · Storage limit)'`
 
 ---
 
-### 3. Native Network Event Integration & Lifecycle (Task R06B.2)
+### 3. Native Network Event Integration & Lifecycle (Tasks R06B.2 & R06C)
 
 - **`@react-native-community/netinfo` Integration:**
   - Installed version `12.0.1` cleanly into `app/package.json`.
@@ -50,6 +59,10 @@
   - Listens to real-time native network transitions (e.g. flipping Airplane Mode or toggling Wi-Fi while the application remains active).
   - When `state.isConnected === false`, immediately marks the device offline and updates `onlineManager.setOnline(false)` without waiting for health probe timeouts.
   - When `state.isConnected === true` and `state.isInternetReachable !== false`, immediately verifies connectivity via `checkConnectivity()`.
+- **In-Flight Health Probe Race Condition Prevention (`currentGeneration`):**
+  - Added monotonic generation counter (`currentGeneration`) in `ConnectivityManager`.
+  - When native NetInfo reports an offline event (e.g. user toggles airplane mode), `currentGeneration` increments.
+  - Any in-flight health probe initiated prior to the offline event discards its HTTP 200 response upon completion if its capture generation does not match `currentGeneration`. This guarantees an in-flight probe cannot falsely reset an airplane-mode device back to online.
 - **Distinction Between Device Offline and Backend Unavailable:**
   - Device network failures (`TypeError`, `AbortError`, timeout) transition device to offline (`isOnline = false, backendAvailable = false`).
   - Backend errors (HTTP 500 on `/health`) keep `isOnline = true` while setting `backendAvailable = false`, ensuring TanStack Query does not falsely classify server downtime as device disconnection.
@@ -88,47 +101,63 @@
 
 ### 6. Executable Test Suite Results
 
-#### Test Suite 1: R06B.2 Offline Security, Native Network & Swap Pagination (`server/src/teams/offline-and-optimistic.test.ts`)
-Executed via `npx tsx --test server/src/teams/offline-and-optimistic.test.ts`:
+#### Test Suite 1: R06B.2 & R06C Offline Security, Network Invariants & Swap Pagination (`server/src/teams/offline-and-optimistic.test.ts`)
+Executed via `.\node_modules\.bin\tsx --test src/teams/offline-and-optimistic.test.ts`:
 
 ```
 ▶ R06B.2: Final Offline Security, Native Network & Swap Pagination Hardening
-  ✔ A. Index-write failure does not leave an untracked snapshot: snapshot write aborted if index update fails (32.1781ms)
-  ✔ B. Partial deletion failure retains retry information in index for failed teams (14.2006ms)
-  ✔ C. Credential cleanup continues even if offline deletion throws (3.5471ms)
-  ✔ D. Multiple team snapshots cleared correctly across multiple workspaces (5.5072ms)
-  ✔ E. Native network events: airplane mode triggers offline immediately without waiting for probe timeout (3.2131ms)
-  ✔ F. Native reconnection: isConnected + isInternetReachable triggers connectivity verification (4.5944ms)
-  ✔ G. Backend 500 error does NOT mark device as offline: distinguishes offline from backend down (2.0207ms)
-  ✔ H. Authoritative 403/404 hides cached live shifts immediately and purges query cache (16.569ms)
-  ✔ I. Stale/cached shifts do not generate a fresh syncedAt timestamp on mount (2.0101ms)
-  ✔ J. Genuine server update updates syncedAt timestamp (43.5794ms)
-  ✔ K. Shift swap infinite pagination accumulates pages without losing previous page (2.043ms)
-  ✔ L. Tab and filter switching strictly isolates query cache without cross-contamination (4.5011ms)
-  ✔ M. Optimistic removal handles items on page 2 or later of infinite query (3.1613ms)
-  ✔ N. Rollback on error restores target item to its original page without clobbering other items (2.7047ms)
-  ✔ O. Concurrent mutations on different items do not overwrite each other (3.5836ms)
-  ✔ P. Bounded cache indicator clearly reflects MAX_OFFLINE_SHIFTS_PER_TEAM limit (1.1653ms)
-  ✔ Q. No fabricated settings routes exist under server/src/routes (2.6323ms)
-  ✔ R. Exact storage payload-size enforcement: serialized payload strictly <= 2000 bytes (3.5701ms)
-✔ R06B.2: Final Offline Security, Native Network & Swap Pagination Hardening (167.6569ms)
-ℹ tests 18
-ℹ suites 1
-ℹ pass 18
+  ✔ A. Index-write failure does not leave an untracked snapshot: snapshot write aborted if index update fails (13.9576ms)
+  ✔ B. Partial deletion failure retains retry information in index for failed teams (4.4999ms)
+  ✔ C. Credential cleanup continues even if offline deletion throws (5.9004ms)
+  ✔ D. Multiple team snapshots cleared correctly across multiple workspaces (2.5832ms)
+  ✔ E. Native network events: airplane mode triggers offline immediately without waiting for probe timeout (1.7534ms)
+  ✔ F. Native reconnection: isConnected + isInternetReachable triggers connectivity verification (1.3534ms)
+  ✔ G. Backend 500 error does NOT mark device as offline: distinguishes offline from backend down (0.5034ms)
+  ✔ H. Authoritative 403/404 hides cached live shifts immediately and purges query cache (4.5689ms)
+  ✔ I. Stale/cached shifts do not generate a fresh syncedAt timestamp on mount (0.6989ms)
+  ✔ J. Genuine server update updates syncedAt timestamp (22.2411ms)
+  ✔ K. Shift swap infinite pagination accumulates pages without losing previous page (1.0807ms)
+  ✔ L. Tab and filter switching strictly isolates query cache without cross-contamination (2.4179ms)
+  ✔ M. Optimistic removal handles items on page 2 or later of infinite query (1.075ms)
+  ✔ N. Rollback on error restores target item to its original page without clobbering other items (0.8943ms)
+  ✔ O. Concurrent mutations on different items do not overwrite each other (1.2624ms)
+  ✔ P. Bounded cache indicator clearly reflects MAX_OFFLINE_SHIFTS_PER_TEAM limit (0.4305ms)
+  ✔ Q. No fabricated settings routes exist under server/src/routes (1.0516ms)
+  ✔ R. Exact storage payload-size enforcement: serialized payload strictly <= 2000 bytes (1.2347ms)
+✔ R06B.2: Final Offline Security, Native Network & Swap Pagination Hardening (72.8993ms)
+▶ R06C: Final R06 Correctness Gate and Android Test Readiness
+  ✔ A. Failed index read does not wipe or corrupt index; error is reported and index key is preserved on disk for retry (1.183ms)
+  ✔ B. Concurrent saves for different teams of same user retain all team entries in index (serialization lock) (0.6003ms)
+  ✔ C. Failed cleanup followed by successful retry cleans up preserved failed teams (1.2491ms)
+  ✔ D. Session clearance prevents background writes after sign-out, while login reactivates storage (1.7666ms)
+  ✔ E. Dashboard remount with cached query data does not advance syncedAt (1.4144ms)
+  ✔ F. Genuine new server response advances sync timestamp (1.3257ms)
+  ✔ G. Partial snapshot labeling accurately labels completeness and partial reasons (2.684ms)
+  ✔ H. In-flight health probe racing NetInfo offline event is discarded and does not set app to online (0.4403ms)
+  ✔ I. Multi-tenant workspace and account isolation is strictly maintained (0.8339ms)
+  ✔ J. Multi-page swap functionality remains intact with infinite accumulation and page-aware optimistic mutation (1.0756ms)
+✔ R06C: Final R06 Correctness Gate and Android Test Readiness (13.6599ms)
+ℹ tests 28
+ℹ suites 2
+ℹ pass 28
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 3846.0065
+ℹ duration_ms 1866.4788
 ```
 
 #### Test Suite 2: R06A TanStack Query Foundation (`server/src/teams/tanstack-query-foundation.test.ts`)
-Executed via `npx tsx --test server/src/teams/tanstack-query-foundation.test.ts`:
-- **15 passed, 0 failed**
+Executed via `.\node_modules\.bin\tsx --test src/teams/tanstack-query-foundation.test.ts`:
+- **15 passed, 0 failed** (15/15)
 
 #### Test Suite 3: Mobile Invitation Logic (`server/src/teams/mobile-invitation-logic.test.ts`)
-Executed via `npx tsx --test server/src/teams/mobile-invitation-logic.test.ts`:
-- **30 passed, 0 failed**
+Executed via `.\node_modules\.bin\tsx --test src/teams/mobile-invitation-logic.test.ts`:
+- **30 passed, 0 failed** (30/30)
+
+#### Combined Execution:
+Executed via `.\node_modules\.bin\tsx --test src/teams/offline-and-optimistic.test.ts src/teams/tanstack-query-foundation.test.ts src/teams/mobile-invitation-logic.test.ts`:
+- **73 passed, 0 failed, 0 skipped** (4 suites, 73 tests)
 
 #### Typecheck Verification:
 - `cd app; npx tsc --noEmit`: **0 errors**
@@ -136,8 +165,44 @@ Executed via `npx tsx --test server/src/teams/mobile-invitation-logic.test.ts`:
 
 ---
 
-### 7. Remaining Gaps to Close Requirement R06
+### 7. Android Device Test Readiness & 12-Step Test Procedure
 
-1. **Physical Device Verification:** Test offline mode and reconnection on physical Android hardware in Airplane Mode. Note: Offline app restart requires successful session/refresh token restoration from SecureStore.
+#### Android Compatibility Findings:
+1. **Expo SDK Version:** Expo SDK `~52.0.28` (`react-native: 0.76.6`) configured in `app/package.json`.
+2. **Native NetInfo Dependency:** `@react-native-community/netinfo: 12.0.1` installed and configured. Requires a standalone EAS native build (`buildType: apk`) or development build to link native Android broadcast receivers; standard Expo Go cannot link custom native binary modules.
+3. **Hardware Storage:** Uses `expo-secure-store` backed by Android Keystore with AES-GCM encrypted SharedPreferences for persisted credentials and offline snapshots.
+4. **Offline Restart Caveat:** When testing offline app restart on a physical device, the user must have already signed in while online so that credentials and refresh tokens exist in SecureStore to restore authentication on launch.
+
+#### 12-Step Physical Android Device Test Procedure:
+```powershell
+# 1. Build Standalone Preview APK (runs via EAS cloud build)
+cd C:\Users\USER\rota-mobile\app
+npx eas-cli build --platform android --profile preview
+
+# 2. Download and install the generated APK on your Android device (e.g. via adb or direct download)
+adb install -r rota-mobile-preview.apk
+
+# 3. Launch Rota app on the device with active Wi-Fi / cellular data.
+# 4. Sign in with valid credentials (e.g., owner@example.com).
+# 5. Select a team with scheduled shifts (e.g., "Engineering Team").
+# 6. Verify dashboard displays shifts, no offline banner appears, and management buttons ("Add shift") are active.
+# 7. Pull down to refresh to ensure shiftsDataUpdatedAt is populated.
+# 8. Enable AIRPLANE MODE on the Android device (disables Wi-Fi and mobile network).
+# 9. Verify the UI immediately displays the OFFLINE MODE banner without app restart or delay:
+#    - Banner title: "Viewing cached schedule (Complete schedule · Read-only)" or bounded partial reason.
+#    - Timestamp: "Last synchronized: [Time] · [Date]".
+#    - Management actions ("Add shift", edit, cancel) are disabled or show offline notification on tap.
+# 10. Close the app completely from the Android app switcher (kill process) and re-open while STILL in Airplane Mode.
+# 11. Verify the app restores session from SecureStore, remains in OFFLINE MODE, and renders the cached shifts.
+# 12. Disable AIRPLANE MODE (re-enable Wi-Fi / data):
+#     - Verify the banner clears automatically upon reconnection.
+#     - Verify pulling down to refresh successfully synchronizes live shifts and updates the sync timestamp.
+```
+
+---
+
+### 8. Remaining Gaps to Close Requirement R06
+
+1. **Physical Device Verification:** Execute the 12-step test on physical Android hardware.
 2. **Production Deployment & Standalone Build:** Compile an updated standalone EAS build (`apk`) and deploy updated backend routes to Vercel production.
 3. **Settings Optimistic Updates:** Implement optimistic updates for user settings when R09 settings schema and endpoints are built.
