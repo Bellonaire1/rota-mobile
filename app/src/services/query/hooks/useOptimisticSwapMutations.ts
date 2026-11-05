@@ -5,13 +5,15 @@ import {
   shiftSwapService,
 } from '@/services/api/shiftSwapService';
 import { queryKeys } from '../queryKeys';
-import { ShiftSwapResponse, ShiftSwapsResponse } from '@/types/api';
+import { ShiftSwap, ShiftSwapResponse, ShiftSwapsResponse } from '@/types/api';
 import { PendingSwapsSummary } from './useShiftsQuery';
+import { ShiftSwapTabCounts, ShiftSwapsTabResult } from './useShiftSwapsQuery';
 
 /**
  * Optimistic mutation for Peer Response (accept or decline).
  *
- * Implements standard TanStack Query optimistic update with complete rollback on failure.
+ * Updates visible INCOMING tab list and tab badge counts immediately in cache,
+ * with non-clobbering rollback on failure and authoritative server invalidation onSettled.
  */
 export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
   const queryClient = useQueryClient();
@@ -27,7 +29,7 @@ export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
       if (!teamId) throw new Error('teamId required');
       return shiftSwapService.respond(teamId, swapId, input);
     },
-    onMutate: async ({ swapId, input }) => {
+    onMutate: async ({ swapId }) => {
       if (!teamId || !userId) return;
 
       // 1. Cancel ongoing queries for shift swaps
@@ -35,48 +37,120 @@ export function useOptimisticSwapRespond(teamId?: string, userId?: string) {
         queryKey: queryKeys.shiftSwaps.all(teamId, userId),
       });
 
-      // 2. Snapshot current state for rollback
-      const peerListKey = queryKeys.shiftSwaps.list(teamId, userId, {
-        status: 'PENDING_PEER',
-      });
-      const countsKey = queryKeys.shiftSwaps.pendingCounts(teamId, userId);
+      // 2. Target query keys
+      const incomingTabKey = queryKeys.shiftSwaps.tab(teamId, userId, 'INCOMING', 'ALL', 1);
+      const tabCountsKey = queryKeys.shiftSwaps.tabCounts(teamId, userId);
+      const legacyListKey = queryKeys.shiftSwaps.list(teamId, userId, { status: 'PENDING_PEER' });
+      const pendingCountsKey = queryKeys.shiftSwaps.pendingCounts(teamId, userId);
 
-      const previousPeerList = queryClient.getQueryData<ShiftSwapsResponse>(peerListKey);
-      const previousCounts = queryClient.getQueryData<PendingSwapsSummary>(countsKey);
+      // 3. Capture snapshots
+      const previousIncomingTab = queryClient.getQueryData<ShiftSwapsTabResult>(incomingTabKey);
+      const previousTabCounts = queryClient.getQueryData<ShiftSwapTabCounts>(tabCountsKey);
+      const previousLegacyList = queryClient.getQueryData<ShiftSwapsResponse>(legacyListKey);
+      const previousPendingCounts = queryClient.getQueryData<PendingSwapsSummary>(pendingCountsKey);
 
-      // 3. Apply optimistic update to peer list
-      if (previousPeerList) {
-        queryClient.setQueryData<ShiftSwapsResponse>(peerListKey, {
-          ...previousPeerList,
-          shiftSwaps: previousPeerList.shiftSwaps.filter((s) => s.id !== swapId),
+      let removedSwap: ShiftSwap | null = null;
+
+      // 4. Optimistically update INCOMING tab
+      if (previousIncomingTab) {
+        removedSwap = previousIncomingTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        queryClient.setQueryData<ShiftSwapsTabResult>(incomingTabKey, {
+          ...previousIncomingTab,
+          shiftSwaps: previousIncomingTab.shiftSwaps.filter((s) => s.id !== swapId),
           pagination: {
-            ...previousPeerList.pagination,
-            total: Math.max(0, previousPeerList.pagination.total - 1),
+            ...previousIncomingTab.pagination,
+            total: Math.max(0, previousIncomingTab.pagination.total - 1),
           },
         });
       }
 
-      // 4. Apply optimistic update to counts badge
-      if (previousCounts) {
-        queryClient.setQueryData<PendingSwapsSummary>(countsKey, {
-          ...previousCounts,
-          pendingSwapCount: Math.max(0, previousCounts.pendingSwapCount - 1),
+      // 5. Optimistically update Tab Counts
+      if (previousTabCounts) {
+        queryClient.setQueryData<ShiftSwapTabCounts>(tabCountsKey, {
+          ...previousTabCounts,
+          incoming: Math.max(0, previousTabCounts.incoming - 1),
         });
       }
 
-      return { previousPeerList, previousCounts, peerListKey, countsKey };
+      // 6. Optimistically update legacy list and pending counts for dashboard badge
+      if (previousLegacyList) {
+        if (!removedSwap) {
+          removedSwap = previousLegacyList.shiftSwaps.find((s) => s.id === swapId) || null;
+        }
+        queryClient.setQueryData<ShiftSwapsResponse>(legacyListKey, {
+          ...previousLegacyList,
+          shiftSwaps: previousLegacyList.shiftSwaps.filter((s) => s.id !== swapId),
+          pagination: {
+            ...previousLegacyList.pagination,
+            total: Math.max(0, previousLegacyList.pagination.total - 1),
+          },
+        });
+      }
+
+      if (previousPendingCounts) {
+        queryClient.setQueryData<PendingSwapsSummary>(pendingCountsKey, {
+          ...previousPendingCounts,
+          pendingSwapCount: Math.max(0, previousPendingCounts.pendingSwapCount - 1),
+        });
+      }
+
+      return {
+        swapId,
+        removedSwap,
+        incomingTabKey,
+        tabCountsKey,
+        legacyListKey,
+        pendingCountsKey,
+        previousIncomingTab,
+        previousTabCounts,
+        previousLegacyList,
+        previousPendingCounts,
+      };
     },
     onError: (_err, _variables, context) => {
-      // Roll back to prior snapshot on failure (e.g. 409 conflict, network error)
-      if (context?.previousPeerList && context.peerListKey) {
-        queryClient.setQueryData(context.peerListKey, context.previousPeerList);
+      if (!context) return;
+
+      // Rollback without clobbering concurrent mutations:
+      // If removedSwap exists, re-insert it into current cache if not already present
+      if (context.incomingTabKey && context.removedSwap) {
+        queryClient.setQueryData<ShiftSwapsTabResult>(context.incomingTabKey, (current) => {
+          if (!current) return context.previousIncomingTab;
+          if (current.shiftSwaps.some((s) => s.id === context.swapId)) return current;
+          return {
+            ...current,
+            shiftSwaps: [context.removedSwap!, ...current.shiftSwaps],
+            pagination: { ...current.pagination, total: current.pagination.total + 1 },
+          };
+        });
       }
-      if (context?.previousCounts && context.countsKey) {
-        queryClient.setQueryData(context.countsKey, context.previousCounts);
+
+      if (context.tabCountsKey) {
+        queryClient.setQueryData<ShiftSwapTabCounts>(context.tabCountsKey, (current) => {
+          if (!current) return context.previousTabCounts;
+          return { ...current, incoming: current.incoming + 1 };
+        });
+      }
+
+      if (context.legacyListKey && context.removedSwap) {
+        queryClient.setQueryData<ShiftSwapsResponse>(context.legacyListKey, (current) => {
+          if (!current) return context.previousLegacyList;
+          if (current.shiftSwaps.some((s) => s.id === context.swapId)) return current;
+          return {
+            ...current,
+            shiftSwaps: [context.removedSwap!, ...current.shiftSwaps],
+            pagination: { ...current.pagination, total: current.pagination.total + 1 },
+          };
+        });
+      }
+
+      if (context.pendingCountsKey) {
+        queryClient.setQueryData<PendingSwapsSummary>(context.pendingCountsKey, (current) => {
+          if (!current) return context.previousPendingCounts;
+          return { ...current, pendingSwapCount: current.pendingSwapCount + 1 };
+        });
       }
     },
     onSettled: () => {
-      // Reconcile with authoritative server state
       if (teamId && userId) {
         queryClient.invalidateQueries({
           queryKey: queryKeys.shiftSwaps.all(teamId, userId),
@@ -109,50 +183,98 @@ export function useOptimisticSwapReview(teamId?: string, userId?: string) {
     onMutate: async ({ swapId }) => {
       if (!teamId || !userId) return;
 
-      // 1. Cancel in-flight queries
       await queryClient.cancelQueries({
         queryKey: queryKeys.shiftSwaps.all(teamId, userId),
       });
 
-      // 2. Snapshot current state
-      const managerListKey = queryKeys.shiftSwaps.list(teamId, userId, {
+      const mgrTabKey = queryKeys.shiftSwaps.tab(teamId, userId, 'MANAGER_REVIEW', 'ALL', 1);
+      const tabCountsKey = queryKeys.shiftSwaps.tabCounts(teamId, userId);
+      const legacyMgrKey = queryKeys.shiftSwaps.list(teamId, userId, {
         status: 'PENDING_MANAGER',
       });
-      const countsKey = queryKeys.shiftSwaps.pendingCounts(teamId, userId);
 
-      const previousManagerList =
-        queryClient.getQueryData<ShiftSwapsResponse>(managerListKey);
-      const previousCounts = queryClient.getQueryData<PendingSwapsSummary>(countsKey);
+      const previousMgrTab = queryClient.getQueryData<ShiftSwapsTabResult>(mgrTabKey);
+      const previousTabCounts = queryClient.getQueryData<ShiftSwapTabCounts>(tabCountsKey);
+      const previousLegacyMgr = queryClient.getQueryData<ShiftSwapsResponse>(legacyMgrKey);
 
-      // 3. Optimistically remove from manager review list
-      if (previousManagerList) {
-        queryClient.setQueryData<ShiftSwapsResponse>(managerListKey, {
-          ...previousManagerList,
-          shiftSwaps: previousManagerList.shiftSwaps.filter((s) => s.id !== swapId),
+      let removedSwap: ShiftSwap | null = null;
+
+      if (previousMgrTab) {
+        removedSwap = previousMgrTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        queryClient.setQueryData<ShiftSwapsTabResult>(mgrTabKey, {
+          ...previousMgrTab,
+          shiftSwaps: previousMgrTab.shiftSwaps.filter((s) => s.id !== swapId),
           pagination: {
-            ...previousManagerList.pagination,
-            total: Math.max(0, previousManagerList.pagination.total - 1),
+            ...previousMgrTab.pagination,
+            total: Math.max(0, previousMgrTab.pagination.total - 1),
           },
         });
       }
 
-      // 4. Decrement badge counts
-      if (previousCounts) {
-        queryClient.setQueryData<PendingSwapsSummary>(countsKey, {
-          ...previousCounts,
-          pendingSwapCount: Math.max(0, previousCounts.pendingSwapCount - 1),
+      if (previousTabCounts) {
+        queryClient.setQueryData<ShiftSwapTabCounts>(tabCountsKey, {
+          ...previousTabCounts,
+          managerReview: Math.max(0, previousTabCounts.managerReview - 1),
         });
       }
 
-      return { previousManagerList, previousCounts, managerListKey, countsKey };
+      if (previousLegacyMgr) {
+        if (!removedSwap) {
+          removedSwap = previousLegacyMgr.shiftSwaps.find((s) => s.id === swapId) || null;
+        }
+        queryClient.setQueryData<ShiftSwapsResponse>(legacyMgrKey, {
+          ...previousLegacyMgr,
+          shiftSwaps: previousLegacyMgr.shiftSwaps.filter((s) => s.id !== swapId),
+          pagination: {
+            ...previousLegacyMgr.pagination,
+            total: Math.max(0, previousLegacyMgr.pagination.total - 1),
+          },
+        });
+      }
+
+      return {
+        swapId,
+        removedSwap,
+        mgrTabKey,
+        tabCountsKey,
+        legacyMgrKey,
+        previousMgrTab,
+        previousTabCounts,
+        previousLegacyMgr,
+      };
     },
     onError: (_err, _variables, context) => {
-      // Rollback on conflict / network error
-      if (context?.previousManagerList && context.managerListKey) {
-        queryClient.setQueryData(context.managerListKey, context.previousManagerList);
+      if (!context) return;
+
+      if (context.mgrTabKey && context.removedSwap) {
+        queryClient.setQueryData<ShiftSwapsTabResult>(context.mgrTabKey, (current) => {
+          if (!current) return context.previousMgrTab;
+          if (current.shiftSwaps.some((s) => s.id === context.swapId)) return current;
+          return {
+            ...current,
+            shiftSwaps: [context.removedSwap!, ...current.shiftSwaps],
+            pagination: { ...current.pagination, total: current.pagination.total + 1 },
+          };
+        });
       }
-      if (context?.previousCounts && context.countsKey) {
-        queryClient.setQueryData(context.countsKey, context.previousCounts);
+
+      if (context.tabCountsKey) {
+        queryClient.setQueryData<ShiftSwapTabCounts>(context.tabCountsKey, (current) => {
+          if (!current) return context.previousTabCounts;
+          return { ...current, managerReview: current.managerReview + 1 };
+        });
+      }
+
+      if (context.legacyMgrKey && context.removedSwap) {
+        queryClient.setQueryData<ShiftSwapsResponse>(context.legacyMgrKey, (current) => {
+          if (!current) return context.previousLegacyMgr;
+          if (current.shiftSwaps.some((s) => s.id === context.swapId)) return current;
+          return {
+            ...current,
+            shiftSwaps: [context.removedSwap!, ...current.shiftSwaps],
+            pagination: { ...current.pagination, total: current.pagination.total + 1 },
+          };
+        });
       }
     },
     onSettled: () => {
@@ -170,6 +292,9 @@ export function useOptimisticSwapReview(teamId?: string, userId?: string) {
 
 /**
  * Optimistic mutation for Requesting User Cancel.
+ *
+ * Optimistically removes the cancelled swap from MY_REQUESTS tab and decrements
+ * myRequests tab badge count, with automatic rollback on network failure or 409 conflict.
  */
 export function useOptimisticSwapCancel(teamId?: string, userId?: string) {
   const queryClient = useQueryClient();
@@ -179,11 +304,70 @@ export function useOptimisticSwapCancel(teamId?: string, userId?: string) {
       if (!teamId) throw new Error('teamId required');
       return shiftSwapService.cancel(teamId, swapId);
     },
-    onMutate: async () => {
+    onMutate: async (swapId: string) => {
       if (!teamId || !userId) return;
+
       await queryClient.cancelQueries({
         queryKey: queryKeys.shiftSwaps.all(teamId, userId),
       });
+
+      const myRequestsTabKey = queryKeys.shiftSwaps.tab(teamId, userId, 'MY_REQUESTS', 'ALL', 1);
+      const tabCountsKey = queryKeys.shiftSwaps.tabCounts(teamId, userId);
+
+      const previousMyRequestsTab = queryClient.getQueryData<ShiftSwapsTabResult>(myRequestsTabKey);
+      const previousTabCounts = queryClient.getQueryData<ShiftSwapTabCounts>(tabCountsKey);
+
+      let removedSwap: ShiftSwap | null = null;
+
+      if (previousMyRequestsTab) {
+        removedSwap = previousMyRequestsTab.shiftSwaps.find((s) => s.id === swapId) || null;
+        queryClient.setQueryData<ShiftSwapsTabResult>(myRequestsTabKey, {
+          ...previousMyRequestsTab,
+          shiftSwaps: previousMyRequestsTab.shiftSwaps.filter((s) => s.id !== swapId),
+          pagination: {
+            ...previousMyRequestsTab.pagination,
+            total: Math.max(0, previousMyRequestsTab.pagination.total - 1),
+          },
+        });
+      }
+
+      if (previousTabCounts) {
+        queryClient.setQueryData<ShiftSwapTabCounts>(tabCountsKey, {
+          ...previousTabCounts,
+          myRequests: Math.max(0, previousTabCounts.myRequests - 1),
+        });
+      }
+
+      return {
+        swapId,
+        removedSwap,
+        myRequestsTabKey,
+        tabCountsKey,
+        previousMyRequestsTab,
+        previousTabCounts,
+      };
+    },
+    onError: (_err, _variables, context) => {
+      if (!context) return;
+
+      if (context.myRequestsTabKey && context.removedSwap) {
+        queryClient.setQueryData<ShiftSwapsTabResult>(context.myRequestsTabKey, (current) => {
+          if (!current) return context.previousMyRequestsTab;
+          if (current.shiftSwaps.some((s) => s.id === context.swapId)) return current;
+          return {
+            ...current,
+            shiftSwaps: [context.removedSwap!, ...current.shiftSwaps],
+            pagination: { ...current.pagination, total: current.pagination.total + 1 },
+          };
+        });
+      }
+
+      if (context.tabCountsKey) {
+        queryClient.setQueryData<ShiftSwapTabCounts>(context.tabCountsKey, (current) => {
+          if (!current) return context.previousTabCounts;
+          return { ...current, myRequests: current.myRequests + 1 };
+        });
+      }
     },
     onSettled: () => {
       if (teamId && userId) {
@@ -197,4 +381,3 @@ export function useOptimisticSwapCancel(teamId?: string, userId?: string) {
     },
   });
 }
-

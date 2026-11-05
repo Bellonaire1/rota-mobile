@@ -6,12 +6,15 @@ import { AppState, Platform } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AuthProvider } from '@/context/AuthContext';
 import { queryClient, setupQueryFocusManager } from '@/services/query';
+import { setupNetworkConnectivity } from '@/services/network/connectivityManager';
 
 export default function RootLayout() {
   useEffect(() => {
-    const teardown = setupQueryFocusManager(AppState, Platform.OS !== 'web');
+    const teardownFocus = setupQueryFocusManager(AppState, Platform.OS !== 'web');
+    const teardownConnectivity = setupNetworkConnectivity(AppState);
     return () => {
-      teardown();
+      teardownFocus();
+      teardownConnectivity();
     };
   }, []);
 

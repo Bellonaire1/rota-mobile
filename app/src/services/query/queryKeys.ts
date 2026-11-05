@@ -60,6 +60,15 @@ export const queryKeys = {
     all: (teamId: string, userId: string) => ['shiftSwaps', teamId, userId] as const,
     list: (teamId: string, userId: string, params?: ShiftSwapListParams) =>
       ['shiftSwaps', teamId, userId, 'list', params ?? {}] as const,
+    tab: (
+      teamId: string,
+      userId: string,
+      tab?: string,
+      filter?: string,
+      page?: number
+    ) => ['shiftSwaps', teamId, userId, 'tab', tab ?? 'INCOMING', filter ?? 'ALL', page ?? 1] as const,
+    tabCounts: (teamId: string, userId: string) =>
+      ['shiftSwaps', teamId, userId, 'tabCounts'] as const,
     pendingCounts: (teamId: string, userId: string) =>
       ['shiftSwaps', teamId, userId, 'pendingCounts'] as const,
   },

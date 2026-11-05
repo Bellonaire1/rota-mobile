@@ -53,15 +53,22 @@ export const getOfflineShiftKey = (userId: string, teamId: string) =>
   `rota.offline-shifts.${userId}.${teamId}`;
 
 /**
+ * Registry index key for discovering all teams that have persisted offline data for a user.
+ * Enables zero-parameter cleanups on sign-out and account switching.
+ */
+export const getOfflineTeamIndexKey = (userId: string) =>
+  `rota.offline-shifts.index.${userId}`;
+
+/**
  * Production SecureStore adapter.
  * Uses iOS Keychain and Android Keystore with AES-GCM / RSA encrypted SharedPreferences.
  * Assessed as ENCRYPTED: isEncrypted() returns true.
  */
 export class SecureStoreAdapter implements OfflineStorageAdapter {
   async getItem(key: string): Promise<string | null> {
+    const SecureStore = getSecureStore();
+    if (!SecureStore) return null;
     try {
-      const SecureStore = getSecureStore();
-      if (!SecureStore) return null;
       if (
         typeof SecureStore.isAvailableAsync === 'function' &&
         !(await SecureStore.isAvailableAsync())
@@ -75,35 +82,27 @@ export class SecureStoreAdapter implements OfflineStorageAdapter {
   }
 
   async setItem(key: string, value: string): Promise<void> {
-    try {
-      const SecureStore = getSecureStore();
-      if (!SecureStore) return;
-      if (
-        typeof SecureStore.isAvailableAsync === 'function' &&
-        !(await SecureStore.isAvailableAsync())
-      ) {
-        return;
-      }
-      await SecureStore.setItemAsync(key, value);
-    } catch {
-      // Ignore storage errors on unsupported platforms
+    const SecureStore = getSecureStore();
+    if (!SecureStore) throw new Error('SecureStore is not available');
+    if (
+      typeof SecureStore.isAvailableAsync === 'function' &&
+      !(await SecureStore.isAvailableAsync())
+    ) {
+      throw new Error('SecureStore is not available on this platform');
     }
+    await SecureStore.setItemAsync(key, value);
   }
 
   async removeItem(key: string): Promise<void> {
-    try {
-      const SecureStore = getSecureStore();
-      if (!SecureStore) return;
-      if (
-        typeof SecureStore.isAvailableAsync === 'function' &&
-        !(await SecureStore.isAvailableAsync())
-      ) {
-        return;
-      }
-      await SecureStore.deleteItemAsync(key);
-    } catch {
-      // Ignore
+    const SecureStore = getSecureStore();
+    if (!SecureStore) throw new Error('SecureStore is not available');
+    if (
+      typeof SecureStore.isAvailableAsync === 'function' &&
+      !(await SecureStore.isAvailableAsync())
+    ) {
+      throw new Error('SecureStore is not available on this platform');
     }
+    await SecureStore.deleteItemAsync(key);
   }
 
   isEncrypted(): boolean {
@@ -117,16 +116,24 @@ export class SecureStoreAdapter implements OfflineStorageAdapter {
  */
 export class MemoryStorageAdapter implements OfflineStorageAdapter {
   private store = new Map<string, string>();
+  private failureMode: { set?: boolean; remove?: boolean; get?: boolean } = {};
+
+  public setFailureMode(mode: { set?: boolean; remove?: boolean; get?: boolean }) {
+    this.failureMode = mode;
+  }
 
   async getItem(key: string): Promise<string | null> {
+    if (this.failureMode.get) throw new Error('Simulated storage read error');
     return this.store.get(key) ?? null;
   }
 
   async setItem(key: string, value: string): Promise<void> {
+    if (this.failureMode.set) throw new Error('Simulated storage write error');
     this.store.set(key, value);
   }
 
   async removeItem(key: string): Promise<void> {
+    if (this.failureMode.remove) throw new Error('Simulated storage delete error');
     this.store.delete(key);
   }
 
@@ -137,10 +144,41 @@ export class MemoryStorageAdapter implements OfflineStorageAdapter {
 
 /**
  * Maximum number of shifts cached for offline viewing.
- * Bounding to 20 shifts ensures payload stays under ~1.8KB, comfortably
- * within the 2048-byte Android SharedPreferences key-value boundary.
  */
 export const MAX_OFFLINE_SHIFTS_PER_TEAM = 20;
+
+/**
+ * Maximum serialized byte limit for Android SharedPreferences / SecureStore.
+ * Enforced via actual measured UTF-8 byte count.
+ */
+export const MAX_OFFLINE_PAYLOAD_BYTES = 2000;
+
+export function getUtf8ByteLength(str: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(str).length;
+  }
+  const buf = (globalThis as any).Buffer;
+  if (buf && typeof buf.byteLength === 'function') {
+    return buf.byteLength(str, 'utf8');
+  }
+  let bytes = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code <= 0x7f) bytes += 1;
+    else if (code <= 0x7ff) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+  }
+  return bytes;
+}
+
+function truncateText(str: string | undefined | null, maxChars: number): string {
+  if (!str) return '';
+  const trimmed = str.trim();
+  return trimmed.length > maxChars ? trimmed.slice(0, maxChars) : trimmed;
+}
 
 export class OfflineShiftStorageManager {
   private adapter: OfflineStorageAdapter;
@@ -154,7 +192,8 @@ export class OfflineShiftStorageManager {
   }
 
   /**
-   * Compacts and persists up to 20 shifts for the active team.
+   * Compacts, truncates, bounds, and persists shifts for the active team.
+   * Enforces exact UTF-8 byte size limit under 2000 bytes.
    */
   async saveShifts(
     userId: string,
@@ -165,27 +204,66 @@ export class OfflineShiftStorageManager {
       throw new Error('userId and teamId are required to persist offline shifts');
     }
 
-    const compactShifts: CompactOfflineShift[] = shifts
+    let compactShifts: CompactOfflineShift[] = shifts
       .slice(0, MAX_OFFLINE_SHIFTS_PER_TEAM)
       .map((s) => ({
         id: s.id,
-        title: s.title,
+        title: truncateText(s.title, 40),
         startsAt: s.startsAt,
         endsAt: s.endsAt,
         status: s.status,
-        assignedToName: s.assignedTo?.name || s.assignedTo?.email || 'Unassigned',
+        assignedToName: truncateText(
+          s.assignedTo?.name || s.assignedTo?.email || 'Unassigned',
+          30
+        ),
         assignedToUserId: s.assignedToUserId,
       }));
 
-    const snapshot: OfflineShiftSnapshot = {
+    let snapshot: OfflineShiftSnapshot = {
       userId,
       teamId,
       syncedAt: new Date().toISOString(),
       shifts: compactShifts,
     };
 
+    let serialized = JSON.stringify(snapshot);
+
+    // Iteratively drop older shifts if payload exceeds byte size limit
+    while (compactShifts.length > 0 && getUtf8ByteLength(serialized) > MAX_OFFLINE_PAYLOAD_BYTES) {
+      compactShifts = compactShifts.slice(0, compactShifts.length - 1);
+      snapshot = { ...snapshot, shifts: compactShifts };
+      serialized = JSON.stringify(snapshot);
+    }
+
+    if (getUtf8ByteLength(serialized) > MAX_OFFLINE_PAYLOAD_BYTES) {
+      throw new Error(
+        `Unable to compress offline shift snapshot within ${MAX_OFFLINE_PAYLOAD_BYTES} bytes limit`
+      );
+    }
+
     const key = getOfflineShiftKey(userId, teamId);
-    await this.adapter.setItem(key, JSON.stringify(snapshot));
+    await this.adapter.setItem(key, serialized);
+
+    // Register team in user's team index
+    try {
+      const indexKey = getOfflineTeamIndexKey(userId);
+      const rawIndex = await this.adapter.getItem(indexKey);
+      let teams: string[] = [];
+      if (rawIndex) {
+        try {
+          teams = JSON.parse(rawIndex);
+        } catch {
+          teams = [];
+        }
+      }
+      if (!teams.includes(teamId)) {
+        teams.push(teamId);
+        await this.adapter.setItem(indexKey, JSON.stringify(teams));
+      }
+    } catch (err) {
+      // Do not fail snapshot persistence if index update fails, but re-throw if critical
+    }
+
     return snapshot;
   }
 
@@ -220,15 +298,66 @@ export class OfflineShiftStorageManager {
     if (!userId || !teamId) return;
     const key = getOfflineShiftKey(userId, teamId);
     await this.adapter.removeItem(key);
+
+    // Remove team from user's index
+    try {
+      const indexKey = getOfflineTeamIndexKey(userId);
+      const rawIndex = await this.adapter.getItem(indexKey);
+      if (rawIndex) {
+        const teams: string[] = JSON.parse(rawIndex);
+        const updated = teams.filter((t) => t !== teamId);
+        if (updated.length > 0) {
+          await this.adapter.setItem(indexKey, JSON.stringify(updated));
+        } else {
+          await this.adapter.removeItem(indexKey);
+        }
+      }
+    } catch {
+      // Ignore
+    }
   }
 
   /**
-   * Clears offline data for user upon sign-out or account switch.
+   * Discovers and clears all offline shift snapshots for a user across all previously
+   * visited teams without requiring caller to guess or pass team IDs.
+   * Explicitly detects and reports deletion failures.
    */
   async clearUserShifts(userId: string, knownTeamIds: string[] = []): Promise<void> {
     if (!userId) return;
-    for (const teamId of knownTeamIds) {
-      await this.clearTeamShifts(userId, teamId);
+
+    const indexKey = getOfflineTeamIndexKey(userId);
+    let indexedTeams: string[] = [];
+    try {
+      const rawIndex = await this.adapter.getItem(indexKey);
+      if (rawIndex) {
+        indexedTeams = JSON.parse(rawIndex);
+      }
+    } catch {
+      indexedTeams = [];
+    }
+
+    const allTeams = Array.from(new Set([...indexedTeams, ...knownTeamIds]));
+    const errors: Error[] = [];
+
+    for (const teamId of allTeams) {
+      try {
+        const key = getOfflineShiftKey(userId, teamId);
+        await this.adapter.removeItem(key);
+      } catch (err: any) {
+        errors.push(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    try {
+      await this.adapter.removeItem(indexKey);
+    } catch (err: any) {
+      errors.push(err instanceof Error ? err : new Error(String(err)));
+    }
+
+    if (errors.length > 0) {
+      throw new Error(
+        `Failed to clean up offline shifts for user ${userId}: ${errors.map((e) => e.message).join('; ')}`
+      );
     }
   }
 }

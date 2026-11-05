@@ -122,6 +122,21 @@ export default function DashboardScreen() {
   const [localError, setLocalError] = useState<string | null>(null);
 
   const [offlineSnapshot, setOfflineSnapshot] = useState<OfflineShiftSnapshot | null>(null);
+  const [renderedTeamId, setRenderedTeamId] = useState(selectedTeam?.id);
+
+  // Synchronously isolate offline snapshot across team switches before effects run
+  if (renderedTeamId !== selectedTeam?.id) {
+    setRenderedTeamId(selectedTeam?.id);
+    setOfflineSnapshot(null);
+  }
+
+  const activeOfflineSnapshot = useMemo(() => {
+    if (!offlineSnapshot) return null;
+    if (offlineSnapshot.teamId !== selectedTeam?.id || offlineSnapshot.userId !== user?.id) {
+      return null;
+    }
+    return offlineSnapshot;
+  }, [offlineSnapshot, selectedTeam?.id, user?.id]);
 
   const [modalVisible, setModalVisible] = useState(false);
   const [editingShift, setEditingShift] = useState<Shift | null>(null);
@@ -137,12 +152,16 @@ export default function DashboardScreen() {
   // Load offline snapshot on mount or team change
   useEffect(() => {
     let active = true;
-    if (!user?.id || !selectedTeam?.id) {
+    const teamId = selectedTeam?.id;
+    const userId = user?.id;
+    if (!userId || !teamId) {
       setOfflineSnapshot(null);
       return;
     }
-    offlineShiftStorage.getShifts(user.id, selectedTeam.id).then((snapshot) => {
-      if (active) setOfflineSnapshot(snapshot);
+    offlineShiftStorage.getShifts(userId, teamId).then((snapshot) => {
+      if (active && snapshot && snapshot.teamId === teamId && snapshot.userId === userId) {
+        setOfflineSnapshot(snapshot);
+      }
     });
     return () => {
       active = false;
@@ -216,17 +235,28 @@ export default function DashboardScreen() {
     return unique;
   }, [shiftsData]);
 
-  // Persist offline snapshot when live shifts are retrieved
+  // Persist offline snapshot only after genuine successful server response for unfiltered schedule
   useEffect(() => {
-    if (user?.id && selectedTeam?.id && liveShifts.length > 0 && isOnline) {
+    if (
+      user?.id &&
+      selectedTeam?.id &&
+      liveShifts.length > 0 &&
+      isOnline &&
+      !shiftsQueryError &&
+      statusFilter === 'ALL' &&
+      !filterDate
+    ) {
       offlineShiftStorage
         .saveShifts(user.id, selectedTeam.id, liveShifts)
         .then((snapshot) => setOfflineSnapshot(snapshot))
-        .catch(() => {});
+        .catch((err) => {
+          // Gracefully log storage degradation without blocking UI
+          console.warn('Failed to persist offline shift snapshot:', err);
+        });
     }
-  }, [user?.id, selectedTeam?.id, liveShifts, isOnline]);
+  }, [user?.id, selectedTeam?.id, liveShifts, isOnline, shiftsQueryError, statusFilter, filterDate]);
 
-  // Clear offline cache if membership is revoked (403/404)
+  // Clear offline cache and snapshot if membership is revoked (403/404)
   useEffect(() => {
     if (
       shiftsQueryError instanceof ApiError &&
@@ -239,17 +269,39 @@ export default function DashboardScreen() {
     }
   }, [shiftsQueryError, user?.id, selectedTeam?.id]);
 
+  const isAuthError =
+    shiftsQueryError instanceof ApiError &&
+    (shiftsQueryError.statusCode === 403 || shiftsQueryError.statusCode === 404);
+
+  // Filter offline snapshot records strictly against active status and date filters
+  const filteredOfflineShifts: CompactOfflineShift[] = useMemo(() => {
+    if (!activeOfflineSnapshot) return [];
+    return activeOfflineSnapshot.shifts.filter((s) => {
+      if (statusFilter !== 'ALL' && s.status !== statusFilter) {
+        return false;
+      }
+      if (filterDate) {
+        const shiftDate = s.startsAt.split('T')[0];
+        if (shiftDate !== filterDate) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [activeOfflineSnapshot, statusFilter, filterDate]);
+
   // Determine whether we are rendering offline fallback shifts
   const isUsingOfflineCache =
+    !isAuthError &&
     (!isOnline || Boolean(shiftsQueryError)) &&
     liveShifts.length === 0 &&
-    Boolean(offlineSnapshot?.shifts.length);
+    Boolean(activeOfflineSnapshot);
 
   // Effective shifts displayed to user
   const displayedShifts = useMemo(() => {
     if (liveShifts.length > 0) return liveShifts;
-    if (isUsingOfflineCache && offlineSnapshot) {
-      return offlineSnapshot.shifts.map((s) => ({
+    if (isUsingOfflineCache && activeOfflineSnapshot) {
+      return filteredOfflineShifts.map((s) => ({
         id: s.id,
         teamId: selectedTeam?.id ?? '',
         assignedToUserId: s.assignedToUserId,
@@ -267,7 +319,7 @@ export default function DashboardScreen() {
       }));
     }
     return [];
-  }, [liveShifts, isUsingOfflineCache, offlineSnapshot, selectedTeam?.id]);
+  }, [liveShifts, isUsingOfflineCache, activeOfflineSnapshot, filteredOfflineShifts, selectedTeam?.id]);
 
   const sortedShifts = useMemo(
     () => [...displayedShifts].sort((a, b) => a.startsAt.localeCompare(b.startsAt)),
@@ -464,10 +516,10 @@ export default function DashboardScreen() {
               ? 'Viewing cached schedule (Read-only)'
               : 'Device is offline'}
           </Text>
-          {offlineSnapshot?.syncedAt ? (
+          {activeOfflineSnapshot?.syncedAt ? (
             <Text style={styles.offlineTimestamp}>
-              Last synchronized: {new Date(offlineSnapshot.syncedAt).toLocaleTimeString()} ·{' '}
-              {new Date(offlineSnapshot.syncedAt).toLocaleDateString()}
+              Last synchronized: {new Date(activeOfflineSnapshot.syncedAt).toLocaleTimeString()} ·{' '}
+              {new Date(activeOfflineSnapshot.syncedAt).toLocaleDateString()}
             </Text>
           ) : (
             <Text style={styles.offlineTimestamp}>

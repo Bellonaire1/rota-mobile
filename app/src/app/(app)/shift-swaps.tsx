@@ -23,14 +23,14 @@ import {
   useOptimisticSwapCancel,
   useOptimisticSwapRespond,
   useOptimisticSwapReview,
+  useShiftSwapsTab,
+  useShiftSwapsTabCounts,
+  useShiftSwapRole,
 } from '@/services/query';
-import { shiftSwapService } from '@/services/api/shiftSwapService';
-import { teamService } from '@/services/api/teamService';
 import {
   ShiftSwap,
   ShiftSwapShiftSummary,
   ShiftSwapStatus,
-  TeamMember,
   TeamRole,
 } from '@/types/api';
 
@@ -102,23 +102,10 @@ export default function ShiftSwapsScreen() {
 
   const [activeTab, setActiveTab] = useState<TabType>('INCOMING');
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('ALL');
-  const [swaps, setSwaps] = useState<ShiftSwap[]>([]);
-  const [role, setRole] = useState<TeamRole | null>(null);
-  const [tabCounts, setTabCounts] = useState({
-    incoming: 0,
-    myRequests: 0,
-    managerReview: 0,
-  });
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const [page, setPage] = useState(1);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [pagination, setPagination] = useState({ page: 1, totalPages: 1 });
-  const pageRef = useRef(1);
-
-  const currentTeamIdRef = useRef<string | null>(selectedTeam?.id ?? null);
-  const requestGenerationRef = useRef(0);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   // Reject Modal state
   const [rejectModalVisible, setRejectModalVisible] = useState(false);
@@ -127,189 +114,70 @@ export default function ShiftSwapsScreen() {
   const [rejecting, setRejecting] = useState(false);
   const [rejectError, setRejectError] = useState<string | null>(null);
 
+  // Reset page and local error when team, tab, or filter changes
+  useEffect(() => {
+    setPage(1);
+    setLocalError(null);
+  }, [selectedTeam?.id, activeTab, historyFilter]);
+
+  // Tab Swaps Query: directly drives displayed swap list
+  const {
+    data: tabData,
+    isLoading: loadingSwaps,
+    error: swapsQueryError,
+    refetch: refetchSwaps,
+  } = useShiftSwapsTab(selectedTeam?.id, user?.id, activeTab, historyFilter, page);
+
+  // Tab Badge Counts Query
+  const {
+    data: tabCountsData,
+    refetch: refetchCounts,
+  } = useShiftSwapsTabCounts(selectedTeam?.id, user?.id);
+
+  // Team Role Query
+  const {
+    data: cachedRole,
+    refetch: refetchRole,
+  } = useShiftSwapRole(selectedTeam?.id, user?.id);
+
+  const tabCounts = tabCountsData ?? { incoming: 0, myRequests: 0, managerReview: 0 };
+  const role: TeamRole | null = cachedRole ?? null;
   const canManage = role === 'OWNER' || role === 'MANAGER';
 
-  // Team-switching safety: clear stale state immediately when selectedTeam changes
-  useEffect(() => {
-    currentTeamIdRef.current = selectedTeam?.id ?? null;
-    requestGenerationRef.current += 1;
-    setSwaps([]);
-    setRole(null);
-    setTabCounts({ incoming: 0, myRequests: 0, managerReview: 0 });
-    setPagination({ page: 1, totalPages: 1 });
-    pageRef.current = 1;
-    setError(null);
-  }, [selectedTeam?.id]);
+  const displayedSwaps = tabData?.shiftSwaps ?? [];
+  const pagination = tabData?.pagination ?? { page: 1, totalPages: 1, total: 0, limit: 20 };
+  const loading = loadingSwaps && !tabData;
 
-  const loadRole = useCallback(async () => {
-    const teamId = selectedTeam?.id;
-    const userId = user?.id;
-    if (!teamId || !userId) return;
-    const generation = requestGenerationRef.current;
-    try {
-      const members = await teamService.listAllMembers(teamId);
-      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
-      const myMember = members.find((m) => m.userId === userId);
-      setRole(myMember?.role || null);
-    } catch {
-      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
-        setRole(null);
-      }
-    }
-  }, [selectedTeam?.id, user?.id]);
+  const error =
+    localError ||
+    (swapsQueryError
+      ? swapsQueryError instanceof ApiError
+        ? swapsQueryError.message
+        : 'Unable to load shift swaps.'
+      : null);
 
-  // Load exact tab badge counts from backend
-  const loadCounts = useCallback(async () => {
-    const teamId = selectedTeam?.id;
-    const userId = user?.id;
-    if (!teamId || !userId) return;
-    const generation = requestGenerationRef.current;
-
-    try {
-      const [peerRes, mgrRes] = await Promise.all([
-        shiftSwapService.list(teamId, { status: 'PENDING_PEER', limit: 100 }),
-        shiftSwapService.list(teamId, { status: 'PENDING_MANAGER', limit: 100 }),
-      ]);
-      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
-        return;
-      }
-
-      const incoming = peerRes.shiftSwaps.filter((s) => s.receivingUserId === userId).length;
-      const myPeer = peerRes.shiftSwaps.filter((s) => s.requestingUserId === userId).length;
-      const myMgr = mgrRes.shiftSwaps.filter((s) => s.requestingUserId === userId).length;
-      const myRequests = myPeer + myMgr;
-      const managerReview = mgrRes.pagination.total;
-
-      setTabCounts({ incoming, myRequests, managerReview });
-    } catch {
-      // Non-blocking
-    }
-  }, [selectedTeam?.id, user?.id]);
-
-  // Load swaps with server-side status filtering based on active tab
-  const loadSwaps = useCallback(
-    async (reset = true) => {
-      const teamId = selectedTeam?.id;
-      const userId = user?.id;
-      if (!teamId) return;
-      const generation = requestGenerationRef.current;
-
-      if (reset) {
-        setLoading(true);
-        pageRef.current = 1;
-      } else {
-        setLoadingMore(true);
-      }
-      setError(null);
-
-      try {
-        const page = reset ? 1 : pageRef.current + 1;
-
-        if (activeTab === 'MANAGER_REVIEW') {
-          const response = await shiftSwapService.list(teamId, {
-            page,
-            limit: 20,
-            status: 'PENDING_MANAGER',
-          });
-          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
-
-          setSwaps((current) => (reset ? response.shiftSwaps : [...current, ...response.shiftSwaps]));
-          pageRef.current = response.pagination.page;
-          setPagination({
-            page: response.pagination.page,
-            totalPages: response.pagination.totalPages,
-          });
-        } else if (activeTab === 'INCOMING') {
-          const response = await shiftSwapService.list(teamId, {
-            page,
-            limit: 30,
-            status: 'PENDING_PEER',
-          });
-          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
-
-          const incomingOnly = response.shiftSwaps.filter((s) => s.receivingUserId === userId);
-          setSwaps((current) => (reset ? incomingOnly : [...current, ...incomingOnly]));
-          pageRef.current = response.pagination.page;
-          setPagination({
-            page: response.pagination.page,
-            totalPages: response.pagination.totalPages,
-          });
-        } else if (activeTab === 'MY_REQUESTS') {
-          const [peerRes, mgrRes] = await Promise.all([
-            shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_PEER' }),
-            shiftSwapService.list(teamId, { page, limit: 30, status: 'PENDING_MANAGER' }),
-          ]);
-          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
-
-          const myActive = [...peerRes.shiftSwaps, ...mgrRes.shiftSwaps].filter(
-            (s) => s.requestingUserId === userId
-          );
-          setSwaps((current) => (reset ? myActive : [...current, ...myActive]));
-          const maxTotalPages = Math.max(peerRes.pagination.totalPages, mgrRes.pagination.totalPages);
-          pageRef.current = page;
-          setPagination({
-            page,
-            totalPages: maxTotalPages,
-          });
-        } else {
-          // HISTORY tab
-          const statusParam = historyFilter === 'ALL' ? undefined : historyFilter;
-          const response = await shiftSwapService.list(teamId, {
-            page,
-            limit: 30,
-            status: statusParam,
-          });
-          if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) return;
-
-          const historyOnly =
-            historyFilter === 'ALL'
-              ? response.shiftSwaps.filter(
-                  (s) => !['PENDING_PEER', 'PENDING_MANAGER'].includes(s.status)
-                )
-              : response.shiftSwaps;
-
-          setSwaps((current) => (reset ? historyOnly : [...current, ...historyOnly]));
-          pageRef.current = response.pagination.page;
-          setPagination({
-            page: response.pagination.page,
-            totalPages: response.pagination.totalPages,
-          });
-        }
-      } catch (err) {
-        if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
-          setError(err instanceof ApiError ? err.message : 'Unable to load shift swaps.');
-        }
-      } finally {
-        if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
-          setLoading(false);
-          setRefreshing(false);
-          setLoadingMore(false);
-        }
-      }
-    },
-    [activeTab, historyFilter, selectedTeam?.id, user?.id]
-  );
-
-  // Reload swaps when activeTab or historyFilter changes
-  useEffect(() => {
-    loadSwaps(true);
-  }, [loadSwaps]);
-
-  // Focus refresh: reload role, counts, and active tab swaps on screen focus
+  // Navigation focus refresh: revalidate cached data
   useFocusEffect(
     useCallback(() => {
-      const teamId = selectedTeam?.id;
-      if (!teamId) return;
-
-      loadRole();
-      loadCounts();
-      loadSwaps(true);
-    }, [loadRole, loadCounts, loadSwaps, selectedTeam?.id])
+      if (!selectedTeam?.id) return;
+      refetchSwaps();
+      refetchCounts();
+      refetchRole();
+    }, [selectedTeam?.id, refetchSwaps, refetchCounts, refetchRole])
   );
 
-  const displayedSwaps = swaps;
+  // Pull to refresh handler
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    setLocalError(null);
+    try {
+      await Promise.all([refetchSwaps(), refetchCounts(), refetchRole()]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
-  // Peer Response handler (Accept / Decline)
+  // Peer Response handler (Accept / Decline) with immediate optimistic cache update & rollback
   const handlePeerResponse = (swap: ShiftSwap, action: 'accept' | 'decline') => {
     if (!selectedTeam) return;
 
@@ -326,10 +194,9 @@ export default function ShiftSwapsScreen() {
         style: action === 'decline' ? 'destructive' : 'default',
         onPress: async () => {
           setActionLoadingId(swap.id);
-          setError(null);
+          setLocalError(null);
           try {
             await respondMutation.mutateAsync({ swapId: swap.id, input: { action } });
-            await Promise.all([loadSwaps(true), loadCounts()]);
           } catch (err) {
             const msg =
               err instanceof ApiError && err.statusCode === 409
@@ -337,8 +204,7 @@ export default function ShiftSwapsScreen() {
                 : err instanceof ApiError
                 ? err.message
                 : 'Failed to respond to swap proposal.';
-            setError(msg);
-            await Promise.all([loadSwaps(true), loadCounts()]);
+            setLocalError(msg);
           } finally {
             setActionLoadingId(null);
           }
@@ -360,7 +226,7 @@ export default function ShiftSwapsScreen() {
           text: 'Approve & Exchange',
           onPress: async () => {
             setActionLoadingId(swap.id);
-            setError(null);
+            setLocalError(null);
             try {
               await reviewMutation.mutateAsync({
                 swapId: swap.id,
@@ -370,7 +236,6 @@ export default function ShiftSwapsScreen() {
                 'Swap Approved',
                 'The shift assignments have been updated in the schedule.'
               );
-              await Promise.all([loadSwaps(true), loadCounts()]);
             } catch (err) {
               const msg =
                 err instanceof ApiError && err.statusCode === 409
@@ -378,8 +243,7 @@ export default function ShiftSwapsScreen() {
                   : err instanceof ApiError
                   ? err.message
                   : 'Failed to approve swap.';
-              setError(msg);
-              await Promise.all([loadSwaps(true), loadCounts()]);
+              setLocalError(msg);
             } finally {
               setActionLoadingId(null);
             }
@@ -413,7 +277,6 @@ export default function ShiftSwapsScreen() {
         },
       });
       setRejectModalVisible(false);
-      await Promise.all([loadSwaps(true), loadCounts()]);
     } catch (err) {
       setRejectError(
         err instanceof ApiError ? err.message : 'Failed to reject swap.'
@@ -423,7 +286,7 @@ export default function ShiftSwapsScreen() {
     }
   };
 
-  // Requester Cancel handler
+  // Requester Cancel handler with immediate optimistic removal & rollback
   const handleCancel = (swap: ShiftSwap) => {
     if (!selectedTeam) return;
 
@@ -437,10 +300,9 @@ export default function ShiftSwapsScreen() {
           style: 'destructive',
           onPress: async () => {
             setActionLoadingId(swap.id);
-            setError(null);
+            setLocalError(null);
             try {
               await cancelMutation.mutateAsync(swap.id);
-              await Promise.all([loadSwaps(true), loadCounts()]);
             } catch (err) {
               const msg =
                 err instanceof ApiError && err.statusCode === 409
@@ -448,8 +310,7 @@ export default function ShiftSwapsScreen() {
                   : err instanceof ApiError
                   ? err.message
                   : 'Failed to cancel swap request.';
-              setError(msg);
-              await Promise.all([loadSwaps(true), loadCounts()]);
+              setLocalError(msg);
             } finally {
               setActionLoadingId(null);
             }
@@ -468,10 +329,7 @@ export default function ShiftSwapsScreen() {
       refreshControl={
         <RefreshControl
           refreshing={refreshing}
-          onRefresh={async () => {
-            setRefreshing(true);
-            await Promise.all([loadSwaps(true), loadCounts(), loadRole()]);
-          }}
+          onRefresh={handleRefresh}
           tintColor={colors.primary}
         />
       }
@@ -772,10 +630,10 @@ export default function ShiftSwapsScreen() {
 
           {hasMore ? (
             <ActionButton
-              label={loadingMore ? 'Loading more...' : 'Load more'}
-              onPress={() => loadSwaps(false)}
+              label={loading ? 'Loading...' : 'Load more'}
+              onPress={() => setPage((p) => p + 1)}
               variant="secondary"
-              loading={loadingMore}
+              loading={loading}
             />
           ) : null}
         </View>
