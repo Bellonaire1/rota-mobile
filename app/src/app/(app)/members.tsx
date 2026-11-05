@@ -1,15 +1,32 @@
 import * as Clipboard from 'expo-clipboard';
 import { Redirect, useRouter } from 'expo-router';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
+import React, { useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import { ActionButton } from '@/components/common/ActionButton';
 import { BrandHeader } from '@/components/common/BrandHeader';
 import { FormField } from '@/components/common/FormField';
 import { colors, spacing, typography } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
-import { teamService } from '@/services/api/teamService';
-import { teamInvitationService } from '@/services/api/teamInvitationService';
+import {
+  useAddMember,
+  useCreateInvitation,
+  useRemoveMember,
+  useRevokeInvitation,
+  useTeamAllMembers,
+  useTeamInvitations,
+  useTeamMembers,
+  useUpdateMemberRole,
+} from '@/services/query';
 import { TeamInvitation, TeamMember, TeamRole } from '@/types/api';
 
 type ManagedRole = Exclude<TeamRole, 'OWNER'>;
@@ -19,81 +36,103 @@ const memberName = (member: TeamMember) => member.user.name || 'Unnamed member';
 export default function MembersScreen() {
   const router = useRouter();
   const { user, selectedTeam, signOut } = useAuth();
-  const [members, setMembers] = useState<TeamMember[]>([]);
-  const [role, setRole] = useState<TeamRole | null>(null);
-  const [pagination, setPagination] = useState({ page: 1, totalPages: 1 });
-  const pageRef = useRef(1);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+
+  const [page, setPage] = useState(1);
+  const [accumulatedMembers, setAccumulatedMembers] = useState<TeamMember[]>([]);
+  const [localError, setLocalError] = useState<string | null>(null);
   const [userIdInput, setUserIdInput] = useState('');
   const [newRole, setNewRole] = useState<ManagedRole>('STAFF');
-  const [adding, setAdding] = useState(false);
   const [busyMemberId, setBusyMemberId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  const [invitations, setInvitations] = useState<TeamInvitation[]>([]);
-  const [loadingInvitations, setLoadingInvitations] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<ManagedRole>('STAFF');
-  const [sendingInvite, setSendingInvite] = useState(false);
   const [inviteError, setInviteError] = useState<string | null>(null);
   const [inviteSuccess, setInviteSuccess] = useState<string | null>(null);
   const [revokingId, setRevokingId] = useState<string | null>(null);
 
-  const isOwner = role === 'OWNER';
-  const hasMore = pagination.page < pagination.totalPages;
-
-  const loadInvitations = useCallback(async () => {
-    if (!selectedTeam) return;
-    setLoadingInvitations(true);
-    try {
-      const list = await teamInvitationService.list(selectedTeam.id);
-      setInvitations(list);
-    } catch {
-      // Ignored if non-owner or network error
-    } finally {
-      setLoadingInvitations(false);
-    }
-  }, [selectedTeam]);
-
-  const loadMembers = useCallback(async (reset = true) => {
-    if (!selectedTeam || !user) return;
-    if (reset) setLoading(true);
-    else setLoadingMore(true);
-    setError(null);
-    try {
-      const page = reset ? 1 : pageRef.current + 1;
-      const response = await teamService.listMembers(selectedTeam.id, page, 20);
-      setMembers((current) => reset ? response.members : [...current, ...response.members]);
-      pageRef.current = response.pagination.page;
-      setPagination({ page: response.pagination.page, totalPages: response.pagination.totalPages });
-
-      if (reset) {
-        let currentMember = response.members.find((member) => member.userId === user.id);
-        if (!currentMember && response.pagination.totalPages > 1) {
-          const allMembers = await teamService.listAllMembers(selectedTeam.id);
-          currentMember = allMembers.find((member) => member.userId === user.id);
-        }
-        setRole(currentMember?.role ?? null);
-      }
-    } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Unable to load team members.');
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-      setLoadingMore(false);
-    }
-  }, [selectedTeam, user]);
-
-  useEffect(() => { loadMembers(true); }, [loadMembers]);
-
+  // Reset page and accumulated list when selectedTeam changes
   useEffect(() => {
-    if (isOwner) {
-      loadInvitations();
+    setPage(1);
+    setAccumulatedMembers([]);
+    setLocalError(null);
+  }, [selectedTeam?.id]);
+
+  // Paginated members query for current page
+  const {
+    data: membersPageData,
+    isLoading: loadingMembers,
+    isRefetching: refreshingMembers,
+    error: membersQueryError,
+    refetch: refetchMembers,
+  } = useTeamMembers(selectedTeam?.id, user?.id, page, 20);
+
+  // All members query used for role discovery if member isn't in page 1
+  const { data: allMembersData } = useTeamAllMembers(selectedTeam?.id, user?.id);
+
+  // Determine user's role in the team
+  const userRole: TeamRole | null =
+    membersPageData?.members.find((m) => m.userId === user?.id)?.role ??
+    allMembersData?.find((m) => m.userId === user?.id)?.role ??
+    null;
+
+  const isOwner = userRole === 'OWNER';
+
+  // Invitations query (enabled only for owner)
+  const {
+    data: invitationsData,
+    isLoading: loadingInvitations,
+    refetch: refetchInvitations,
+  } = useTeamInvitations(selectedTeam?.id, user?.id, isOwner);
+
+  const invitations = invitationsData ?? [];
+
+  // Mutations
+  const addMemberMutation = useAddMember(selectedTeam?.id, user?.id);
+  const updateMemberRoleMutation = useUpdateMemberRole(selectedTeam?.id, user?.id);
+  const removeMemberMutation = useRemoveMember(selectedTeam?.id, user?.id);
+  const createInvitationMutation = useCreateInvitation(selectedTeam?.id, user?.id);
+  const revokeInvitationMutation = useRevokeInvitation(selectedTeam?.id, user?.id);
+
+  // Synchronize members page data into accumulated list
+  useEffect(() => {
+    if (!membersPageData) return;
+    if (page === 1) {
+      setAccumulatedMembers(membersPageData.members);
+    } else {
+      setAccumulatedMembers((current) => {
+        const existingIds = new Set(current.map((m) => m.userId));
+        const newMembers = membersPageData.members.filter((m) => !existingIds.has(m.userId));
+        return [...current, ...newMembers];
+      });
     }
-  }, [isOwner, loadInvitations]);
+  }, [membersPageData, page]);
+
+  const totalPages = membersPageData?.pagination.totalPages ?? 1;
+  const hasMore = page < totalPages;
+
+  const error =
+    localError ||
+    (membersQueryError
+      ? membersQueryError instanceof ApiError
+        ? membersQueryError.message
+        : 'Unable to load team members.'
+      : null);
+
+  const handleRefresh = async () => {
+    setLocalError(null);
+    setPage(1);
+    await refetchMembers();
+    if (isOwner) {
+      await refetchInvitations();
+    }
+  };
+
+  const loadMore = () => {
+    if (hasMore && !loadingMembers) {
+      setPage((p) => p + 1);
+    }
+  };
 
   const sendInvitation = async () => {
     const email = inviteEmail.trim().toLowerCase();
@@ -102,25 +141,21 @@ export default function MembersScreen() {
       setInviteError('Enter a valid email address.');
       return;
     }
-    setSendingInvite(true);
     setInviteError(null);
     setInviteSuccess(null);
     try {
-      await teamInvitationService.create(selectedTeam.id, {
+      await createInvitationMutation.mutateAsync({
         email,
         role: inviteRole,
       });
       setInviteEmail('');
       setInviteSuccess(`Invitation sent to ${email}`);
-      await loadInvitations();
     } catch (requestError) {
       setInviteError(
         requestError instanceof ApiError
           ? requestError.message
           : 'Unable to send invitation.'
       );
-    } finally {
-      setSendingInvite(false);
     }
   };
 
@@ -137,10 +172,9 @@ export default function MembersScreen() {
           onPress: async () => {
             setRevokingId(invitation.id);
             try {
-              await teamInvitationService.revoke(selectedTeam.id, invitation.id);
-              await loadInvitations();
+              await revokeInvitationMutation.mutateAsync(invitation.id);
             } catch (requestError) {
-              setError(
+              setLocalError(
                 requestError instanceof ApiError
                   ? requestError.message
                   : 'Unable to revoke invitation.'
@@ -158,19 +192,16 @@ export default function MembersScreen() {
     const userId = userIdInput.trim();
     if (!selectedTeam) return;
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userId)) {
-      setError('Enter the registered user’s full UUID.');
+      setLocalError('Enter the registered user’s full UUID.');
       return;
     }
-    setAdding(true);
-    setError(null);
+    setLocalError(null);
     try {
-      await teamService.addMember(selectedTeam.id, userId, newRole);
+      await addMemberMutation.mutateAsync({ newUserId: userId, role: newRole });
       setUserIdInput('');
-      await loadMembers(true);
+      setPage(1);
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Unable to add this registered user.');
-    } finally {
-      setAdding(false);
+      setLocalError(requestError instanceof ApiError ? requestError.message : 'Unable to add this registered user.');
     }
   };
 
@@ -178,12 +209,12 @@ export default function MembersScreen() {
     if (!selectedTeam || member.role === 'OWNER') return;
     const nextRole: ManagedRole = member.role === 'STAFF' ? 'MANAGER' : 'STAFF';
     setBusyMemberId(member.userId);
-    setError(null);
+    setLocalError(null);
     try {
-      await teamService.updateMemberRole(selectedTeam.id, member.userId, nextRole);
-      await loadMembers(true);
+      await updateMemberRoleMutation.mutateAsync({ memberUserId: member.userId, role: nextRole });
+      setPage(1);
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Unable to change this member’s role.');
+      setLocalError(requestError instanceof ApiError ? requestError.message : 'Unable to change this member’s role.');
     } finally {
       setBusyMemberId(null);
     }
@@ -198,12 +229,12 @@ export default function MembersScreen() {
         style: 'destructive',
         onPress: async () => {
           setBusyMemberId(member.userId);
-          setError(null);
+          setLocalError(null);
           try {
-            await teamService.removeMember(selectedTeam.id, member.userId);
-            await loadMembers(true);
+            await removeMemberMutation.mutateAsync(member.userId);
+            setPage(1);
           } catch (requestError) {
-            setError(requestError instanceof ApiError ? requestError.message : 'Unable to remove this member.');
+            setLocalError(requestError instanceof ApiError ? requestError.message : 'Unable to remove this member.');
           } finally {
             setBusyMemberId(null);
           }
@@ -218,22 +249,32 @@ export default function MembersScreen() {
       await Clipboard.setStringAsync(user.id);
       setCopied(true);
     } catch {
-      setError('Unable to copy your user ID. You can select it manually.');
+      setLocalError('Unable to copy your user ID. You can select it manually.');
     }
   };
 
   if (!selectedTeam) return <Redirect href="/(app)/select-team" />;
   if (!user) return <Redirect href="/(auth)/login" />;
 
+  const displayMembers = page === 1 && membersPageData ? membersPageData.members : accumulatedMembers;
+
   return (
     <ScrollView
       style={styles.screen}
       contentContainerStyle={styles.content}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadMembers(true); if (isOwner) loadInvitations(); }} tintColor={colors.primary} />}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshingMembers}
+          onRefresh={handleRefresh}
+          tintColor={colors.primary}
+        />
+      }
     >
       <BrandHeader badge="MEMBERS" title={selectedTeam.name} subtitle="Team members" />
       <View style={styles.navigationRow}>
-        <Pressable accessibilityRole="button" onPress={() => router.replace('/(app)')}><Text style={styles.navLink}>Schedule</Text></Pressable>
+        <Pressable accessibilityRole="button" onPress={() => router.replace('/(app)')}>
+          <Text style={styles.navLink}>Schedule</Text>
+        </Pressable>
         <Text style={styles.navDivider}>{'\u00B7'}</Text>
         <Text style={styles.navCurrent}>Members</Text>
       </View>
@@ -241,7 +282,9 @@ export default function MembersScreen() {
       <View style={styles.identityCard}>
         <Text style={styles.eyebrow}>YOUR REGISTERED USER ID</Text>
         <Text selectable style={styles.userId}>{user.id}</Text>
-        <Text style={styles.muted}>Share this ID with a team owner so they can add your existing account. This does not send an invitation.</Text>
+        <Text style={styles.muted}>
+          Share this ID with a team owner so they can add your existing account. This does not send an invitation.
+        </Text>
         <ActionButton label={copied ? 'Copied' : 'Copy user ID'} onPress={copyUserId} variant="secondary" />
       </View>
 
@@ -286,7 +329,7 @@ export default function MembersScreen() {
             <ActionButton
               label="Send invitation"
               onPress={sendInvitation}
-              loading={sendingInvite}
+              loading={createInvitationMutation.isPending}
             />
           </View>
 
@@ -321,17 +364,38 @@ export default function MembersScreen() {
 
           <View style={styles.manageCard}>
             <Text style={styles.sectionTitle}>Add an existing user</Text>
-            <Text style={styles.muted}>Enter the full UUID of a registered Rota user. New owners cannot be assigned here.</Text>
-            <FormField label="Registered user ID" value={userIdInput} onChangeText={setUserIdInput} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autoCapitalize="none" autoCorrect={false} />
+            <Text style={styles.muted}>
+              Enter the full UUID of a registered Rota user. New owners cannot be assigned here.
+            </Text>
+            <FormField
+              label="Registered user ID"
+              value={userIdInput}
+              onChangeText={setUserIdInput}
+              placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
             <Text style={styles.formLabel}>Role</Text>
             <View style={styles.roleRow}>
               {(['STAFF', 'MANAGER'] as ManagedRole[]).map((candidate) => (
-                <Pressable key={candidate} accessibilityRole="radio" accessibilityState={{ checked: newRole === candidate }} onPress={() => setNewRole(candidate)} style={[styles.roleOption, newRole === candidate && styles.roleSelected]}>
-                  <Text style={[styles.roleOptionText, newRole === candidate && styles.roleSelectedText]}>{candidate}</Text>
+                <Pressable
+                  key={candidate}
+                  accessibilityRole="radio"
+                  accessibilityState={{ checked: newRole === candidate }}
+                  onPress={() => setNewRole(candidate)}
+                  style={[styles.roleOption, newRole === candidate && styles.roleSelected]}
+                >
+                  <Text style={[styles.roleOptionText, newRole === candidate && styles.roleSelectedText]}>
+                    {candidate}
+                  </Text>
                 </Pressable>
               ))}
             </View>
-            <ActionButton label="Add registered user" onPress={addMember} loading={adding} />
+            <ActionButton
+              label="Add registered user"
+              onPress={addMember}
+              loading={addMemberMutation.isPending}
+            />
           </View>
         </>
       ) : null}
@@ -339,32 +403,65 @@ export default function MembersScreen() {
       <View style={styles.listHeader}>
         <View>
           <Text style={styles.sectionTitle}>People on this team</Text>
-          <Text style={styles.muted}>{role ? `You are a ${role.toLowerCase()}.` : 'Your membership role is unavailable.'}</Text>
+          <Text style={styles.muted}>
+            {userRole ? `You are a ${userRole.toLowerCase()}.` : 'Your membership role is unavailable.'}
+          </Text>
         </View>
-        <Text style={styles.count}>{pagination.page === 1 ? members.length : '...'}</Text>
+        <Text style={styles.count}>{page === 1 ? displayMembers.length : '...'}</Text>
       </View>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {loading ? <ActivityIndicator color={colors.primary} style={styles.loader} /> : members.length === 0 ? (
-        <View style={styles.emptyCard}><Text style={styles.emptyTitle}>No members found</Text><Text style={styles.muted}>Refresh and try again.</Text></View>
-      ) : members.map((member) => (
-        <View key={member.userId} style={styles.memberCard}>
-          <View style={styles.memberHeader}>
-            <View style={styles.memberIdentity}>
-              <Text style={styles.memberName}>{memberName(member)}</Text>
-              <Text style={styles.memberEmail}>{member.user.email}</Text>
-            </View>
-            <Text style={[styles.roleBadge, member.role === 'OWNER' && styles.ownerBadge]}>{member.role}</Text>
-          </View>
-          {isOwner && member.role !== 'OWNER' ? (
-            <View style={styles.memberActions}>
-              <ActionButton size="small" label={busyMemberId === member.userId ? 'Saving...' : member.role === 'STAFF' ? 'Make manager' : 'Make staff'} onPress={() => changeRole(member)} loading={busyMemberId === member.userId} variant="secondary" />
-              <ActionButton size="small" label="Remove" onPress={() => removeMember(member)} disabled={busyMemberId !== null} variant="quiet" />
-            </View>
-          ) : member.role === 'OWNER' ? <Text style={styles.ownerNote}>Owners cannot be changed or removed.</Text> : null}
+      {loadingMembers && page === 1 ? (
+        <ActivityIndicator color={colors.primary} style={styles.loader} />
+      ) : displayMembers.length === 0 ? (
+        <View style={styles.emptyCard}>
+          <Text style={styles.emptyTitle}>No members found</Text>
+          <Text style={styles.muted}>Refresh and try again.</Text>
         </View>
-      ))}
-      {hasMore ? <ActionButton label={loadingMore ? 'Loading...' : 'Load more members'} onPress={() => loadMembers(false)} loading={loadingMore} variant="secondary" /> : null}
+      ) : (
+        displayMembers.map((member) => (
+          <View key={member.userId} style={styles.memberCard}>
+            <View style={styles.memberHeader}>
+              <View style={styles.memberIdentity}>
+                <Text style={styles.memberName}>{memberName(member)}</Text>
+                <Text style={styles.memberEmail}>{member.user.email}</Text>
+              </View>
+              <Text style={[styles.roleBadge, member.role === 'OWNER' && styles.ownerBadge]}>
+                {member.role}
+              </Text>
+            </View>
+            {isOwner && member.role !== 'OWNER' ? (
+              <View style={styles.memberActions}>
+                <ActionButton
+                  size="small"
+                  label={busyMemberId === member.userId ? 'Saving...' : member.role === 'STAFF' ? 'Make manager' : 'Make staff'}
+                  onPress={() => changeRole(member)}
+                  loading={busyMemberId === member.userId}
+                  variant="secondary"
+                />
+                <ActionButton
+                  size="small"
+                  label="Remove"
+                  onPress={() => removeMember(member)}
+                  disabled={busyMemberId !== null}
+                  variant="quiet"
+                />
+              </View>
+            ) : member.role === 'OWNER' ? (
+              <Text style={styles.ownerNote}>Owners cannot be changed or removed.</Text>
+            ) : null}
+          </View>
+        ))
+      )}
+
+      {hasMore ? (
+        <ActionButton
+          label={loadingMembers ? 'Loading...' : 'Load more members'}
+          onPress={loadMore}
+          loading={loadingMembers}
+          variant="secondary"
+        />
+      ) : null}
 
       <View style={styles.bottomActions}>
         <ActionButton label="Change team" onPress={() => router.push('/(app)/select-team')} variant="secondary" />

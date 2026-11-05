@@ -1,6 +1,7 @@
 import * as SecureStore from 'expo-secure-store';
 import React, { createContext, PropsWithChildren, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Platform } from 'react-native';
+import { clearQueryCache, queryClient } from '@/services/query';
 import { apiClient } from '@/services/api/apiClient';
 import { authService } from '@/services/api/authService';
 import { teamService } from '@/services/api/teamService';
@@ -49,6 +50,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
     userRef.current = null;
     setUser(null);
     setSelectedTeam(null);
+    await clearQueryCache(queryClient);
     if (persistenceAvailableRef.current && userId) {
       await SecureStore.deleteItemAsync(refreshTokenKey(userId));
       await SecureStore.deleteItemAsync(selectedTeamKey(userId));
@@ -153,6 +155,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
   }, [refreshSession]);
 
   const signIn = useCallback(async (email: string, password: string) => {
+    await clearQueryCache(queryClient);
     const result = await authService.login({ email, password });
     await applyAuthResult(result);
     if (persistenceAvailableRef.current) await SecureStore.setItemAsync('rota.last-user-id', result.user.id);
@@ -160,6 +163,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
   }, [applyAuthResult]);
 
   const signInWithMagicLink = useCallback(async (token: string) => {
+    await clearQueryCache(queryClient);
     const result = await authService.confirmMagicLink({ token });
     await applyAuthResult(result);
     if (persistenceAvailableRef.current) await SecureStore.setItemAsync('rota.last-user-id', result.user.id);
@@ -167,6 +171,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
   }, [applyAuthResult]);
 
   const register = useCallback(async (email: string, name: string, password: string) => {
+    await clearQueryCache(queryClient);
     const result = await authService.register({ email, name, password });
     await applyAuthResult(result);
     if (persistenceAvailableRef.current) await SecureStore.setItemAsync('rota.last-user-id', result.user.id);

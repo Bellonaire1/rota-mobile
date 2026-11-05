@@ -5,9 +5,9 @@
 > **Repository:** `C:\Users\USER\rota-mobile`<br>
 > **Last Updated:** November 2026<br>
 > **Audit Status:** Rigorous Independent Verification & Baseline Commit (Task R01.5)<br>
-> **Compulsory Acceptance Requirements (99 total):** 25 DONE | 5 UNVERIFIED | 38 PARTIAL | 31 PENDING<br>
+> **Compulsory Acceptance Requirements (99 total):** 25 DONE | 5 UNVERIFIED | 40 PARTIAL | 29 PENDING<br>
 > **Optional Post-Graduation Milestones (1 total):** 0 DONE | 0 UNVERIFIED | 0 PARTIAL | 1 PENDING<br>
-> **Grand Total Tracked Items:** 100 Subrequirements (25 DONE, 5 UNVERIFIED, 38 PARTIAL, 32 PENDING)
+> **Grand Total Tracked Items:** 100 Subrequirements (25 DONE, 5 UNVERIFIED, 40 PARTIAL, 30 PENDING)
 
 ---
 
@@ -133,11 +133,11 @@ Before evaluating the individual requirements, the following ten technical discr
 
 | ID | Exact Acceptance Criterion | Impl | Test | Dep | Evid | Status | Evidence Link / File | Gap & Next Action |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
-| **R06.1** | Integration of TanStack Query (`@tanstack/react-query`) for client-side query caching and deduplication. | NO | NO | NO | NO | **PENDING** | [package.json](../app/package.json) | Gap: App uses manual `useState`/`useEffect` hooks. `@tanstack/react-query` uninstalled. |
-| **R06.2** | Strict separation of client, server, and persistent state across memory, context, and storage. | PARTIAL | NO | YES | PARTIAL | **PARTIAL** | [AuthContext.tsx](../app/src/context/AuthContext.tsx) | Auth and teams separated, but persistent query cache layer is unbuilt. |
+| **R06.1** | Integration of TanStack Query (`@tanstack/react-query`) for client-side query caching and deduplication. | YES | YES | NO | YES | **PARTIAL** | [package.json](../app/package.json), [queryClient.ts](../app/src/services/query/queryClient.ts), [tanstack-query-foundation-evidence.md](./evidence/tanstack-query-foundation-evidence.md) | `@tanstack/react-query@5.106.1` installed and configured at root with QueryClientProvider, staleTime (2m), gcTime (10m), AppState focus refetch, query deduplication, and screens migrated (`select-team.tsx`, `index.tsx`, `members.tsx`). Verified via 15/15 unit tests in `tanstack-query-foundation.test.ts`. Gap: Standalone APK compilation and live production deployment remaining. |
+| **R06.2** | Strict separation of client, server, and persistent state across memory, context, and storage. | YES | YES | NO | YES | **PARTIAL** | [AuthContext.tsx](../app/src/context/AuthContext.tsx), [queryClient.ts](../app/src/services/query/queryClient.ts), [tanstack-query-foundation-evidence.md](./evidence/tanstack-query-foundation-evidence.md) | Server state handled by TanStack Query; Auth state in AuthContext; Persistent state in SecureStore; UI state in component useState. Sign-out wipes query cache via `clearQueryCache(queryClient)` to prevent cross-account leakage. Zero tokens stored in query cache. Verified in Tests C, H, I, and N. Gap: Offline persistent cache storage (R06B) and live deployment remaining. |
 | **R06.3** | Offline shift viewing with client-side synchronization timestamp and offline status indicator. | PARTIAL | NO | YES | PARTIAL | **PARTIAL** | [app index.tsx](../app/src/app/(app)/index.tsx) | Shifts remain in memory during session, but offline persistent cache and offline banner are unbuilt. |
 | **R06.4** | Optimistic UI updates with automatic rollback on network mutation errors (swaps and settings). | NO | NO | NO | NO | **PENDING** | [shiftService.ts](../app/src/services/api/shiftService.ts) | Gap: Mutations await server response; optimistic rollback unbuilt. |
-| **R06.5** | Explicit TanStack Query cache policies: Configured `staleTime`, `gcTime`, retry backoff, window focus refetch rules, and structured query key factories across shifts, team members, and settings. | NO | NO | NO | NO | **PENDING** | [app/src/](../app/src/) | Gap: Cache policy configuration and query key factories unbuilt. |
+| **R06.5** | Explicit TanStack Query cache policies: Configured `staleTime`, `gcTime`, retry backoff, window focus refetch rules, and structured query key factories across shifts, team members, and settings. | YES | YES | NO | YES | **PARTIAL** | [queryClient.ts](../app/src/services/query/queryClient.ts), [queryKeys.ts](../app/src/services/query/queryKeys.ts), [tanstack-query-foundation-evidence.md](./evidence/tanstack-query-foundation-evidence.md) | Configured staleTime (2m), gcTime (10m), exponential retry backoff (1s-30s cap), fail-fast client error policy (401/403/404 no-retry), AppState foreground refetch listener, and hierarchical typed query key factories (`queryKeys`) across teams, members, shifts, swaps, and activity. Verified via 15 unit tests in `tanstack-query-foundation.test.ts`. Gap: Standalone APK compilation and live production deployment remaining. |
 
 ---
 

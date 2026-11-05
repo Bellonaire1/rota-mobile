@@ -1,5 +1,5 @@
 import { Redirect, useFocusEffect, useRouter } from 'expo-router';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -19,10 +19,16 @@ import { FormField } from '@/components/common/FormField';
 import { colors, spacing, typography } from '@/constants/theme';
 import { useAuth } from '@/context/AuthContext';
 import { ApiError } from '@/services/api/apiClient';
-import { shiftService } from '@/services/api/shiftService';
-import { shiftSwapService } from '@/services/api/shiftSwapService';
-import { teamService } from '@/services/api/teamService';
-import { Shift, ShiftStatus, ShiftSwap, TeamMember, TeamRole } from '@/types/api';
+import { ShiftListParams } from '@/services/api/shiftService';
+import {
+  useCancelShift,
+  useCreateShift,
+  usePendingSwapsSummary,
+  useShifts,
+  useTeamAllMembers,
+  useUpdateShift,
+} from '@/services/query';
+import { Shift, ShiftStatus, TeamMember, TeamRole } from '@/types/api';
 
 type StatusFilter = 'ALL' | ShiftStatus;
 
@@ -102,166 +108,116 @@ const emptyForm = (assigneeId = ''): ShiftFormState => {
 export default function DashboardScreen() {
   const router = useRouter();
   const { user, selectedTeam, signOut, isPersistenceAvailable } = useAuth();
-  const [shifts, setShifts] = useState<Shift[]>([]);
-  const [members, setMembers] = useState<TeamMember[]>([]);
-  const [role, setRole] = useState<TeamRole | null>(null);
-  const [pagination, setPagination] = useState({ page: 1, totalPages: 1 });
+
+  const [page, setPage] = useState(1);
+  const [accumulatedShifts, setAccumulatedShifts] = useState<Shift[]>([]);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
   const [dateDraft, setDateDraft] = useState('');
   const [filterDate, setFilterDate] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const pageRef = useRef(1);
-  const [error, setError] = useState<string | null>(null);
-  const [memberError, setMemberError] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+
   const [modalVisible, setModalVisible] = useState(false);
   const [editingShift, setEditingShift] = useState<Shift | null>(null);
   const [form, setForm] = useState<ShiftFormState>(emptyForm());
   const [formError, setFormError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
   const [cancellingId, setCancellingId] = useState<string | null>(null);
-  const [pendingSwapCount, setPendingSwapCount] = useState(0);
-  const [activeSwapShiftIds, setActiveSwapShiftIds] = useState<Set<string>>(new Set());
 
-  const currentTeamIdRef = useRef<string | null>(selectedTeam?.id ?? null);
-  const requestGenerationRef = useRef(0);
+  // Clear accumulated shifts and reset page when team or filter changes
+  useEffect(() => {
+    setPage(1);
+    setAccumulatedShifts([]);
+    setLocalError(null);
+  }, [selectedTeam?.id, statusFilter, filterDate]);
 
+  // Build shift query parameters
+  const shiftParams: ShiftListParams = useMemo(() => {
+    const fromDate = filterDate ? dateFromInput(filterDate) : null;
+    const toDate = fromDate
+      ? new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate() + 1)
+      : null;
+
+    return {
+      page,
+      limit: 20,
+      status: statusFilter === 'ALL' ? undefined : statusFilter,
+      from: fromDate ? localOffsetIso(fromDate) : undefined,
+      to: toDate ? localOffsetIso(toDate) : undefined,
+    };
+  }, [page, statusFilter, filterDate]);
+
+  // TanStack Query hooks
+  const {
+    data: shiftsPageData,
+    isLoading: loadingShifts,
+    isRefetching: refreshingShifts,
+    error: shiftsQueryError,
+    refetch: refetchShifts,
+  } = useShifts(selectedTeam?.id, user?.id, shiftParams);
+
+  const {
+    data: membersData,
+    isLoading: loadingMembers,
+    error: membersQueryError,
+    refetch: refetchMembers,
+  } = useTeamAllMembers(selectedTeam?.id, user?.id);
+
+  const {
+    data: swapsData,
+    refetch: refetchSwaps,
+  } = usePendingSwapsSummary(selectedTeam?.id, user?.id);
+
+  const members = membersData ?? [];
+  const role: TeamRole | null =
+    members.find((member) => member.userId === user?.id)?.role ?? null;
   const canManage = role === 'OWNER' || role === 'MANAGER';
-  const hasMore = pagination.page < pagination.totalPages;
+
+  const pendingSwapCount = swapsData?.pendingSwapCount ?? 0;
+  const activeSwapShiftIds = swapsData?.activeSwapShiftIds ?? new Set<string>();
+
+  // Mutations
+  const createShiftMutation = useCreateShift(selectedTeam?.id, user?.id);
+  const updateShiftMutation = useUpdateShift(selectedTeam?.id, user?.id);
+  const cancelShiftMutation = useCancelShift(selectedTeam?.id, user?.id);
+
+  // Sync paginated query data into accumulated array
+  useEffect(() => {
+    if (!shiftsPageData) return;
+    if (page === 1) {
+      setAccumulatedShifts(shiftsPageData.shifts);
+    } else {
+      setAccumulatedShifts((current) => {
+        const existingIds = new Set(current.map((s) => s.id));
+        const newShifts = shiftsPageData.shifts.filter((s) => !existingIds.has(s.id));
+        return [...current, ...newShifts];
+      });
+    }
+  }, [shiftsPageData, page]);
+
+  const totalPages = shiftsPageData?.pagination.totalPages ?? 1;
+  const hasMore = page < totalPages;
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time';
 
-  // Team-switching safety: clear stale team data immediately when selectedTeam changes
-  useEffect(() => {
-    currentTeamIdRef.current = selectedTeam?.id ?? null;
-    requestGenerationRef.current += 1;
-    setShifts([]);
-    setPendingSwapCount(0);
-    setActiveSwapShiftIds(new Set());
-    setMembers([]);
-    setRole(null);
-    setPagination({ page: 1, totalPages: 1 });
-    pageRef.current = 1;
-    setError(null);
-    setMemberError(null);
-  }, [selectedTeam?.id]);
-
-  const loadPendingSwaps = useCallback(async () => {
-    const teamId = selectedTeam?.id;
-    if (!teamId) return;
-    const generation = requestGenerationRef.current;
-
-    try {
-      // Query backend status-filtered endpoints to get exact totals and active swap IDs
-      const [peerRes, mgrRes] = await Promise.all([
-        shiftSwapService.list(teamId, { status: 'PENDING_PEER', limit: 100 }),
-        shiftSwapService.list(teamId, { status: 'PENDING_MANAGER', limit: 100 }),
-      ]);
-
-      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
-        return;
-      }
-
-      setPendingSwapCount(peerRes.pagination.total + mgrRes.pagination.total);
-
-      const ids = new Set<string>();
-      peerRes.shiftSwaps.forEach((s) => {
-        ids.add(s.sourceShiftId);
-        ids.add(s.targetShiftId);
-      });
-      mgrRes.shiftSwaps.forEach((s) => {
-        ids.add(s.sourceShiftId);
-        ids.add(s.targetShiftId);
-      });
-      setActiveSwapShiftIds(ids);
-    } catch {
-      // Non-blocking for shift schedule
-    }
-  }, [selectedTeam?.id]);
-
-  const loadShifts = useCallback(async (reset = true) => {
-    const teamId = selectedTeam?.id;
-    if (!teamId) return;
-    const generation = requestGenerationRef.current;
-
-    if (filterDate && !dateFromInput(filterDate)) {
-      setError('Use a valid filter date in YYYY-MM-DD format.');
-      return;
-    }
-    if (reset) setLoading(true);
-    else setLoadingMore(true);
-    setError(null);
-
-    try {
-      const page = reset ? 1 : pageRef.current + 1;
-      const fromDate = filterDate ? dateFromInput(filterDate) : null;
-      const toDate = fromDate ? new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate() + 1) : null;
-      const response = await shiftService.list(teamId, {
-        page,
-        limit: 20,
-        status: statusFilter === 'ALL' ? undefined : statusFilter,
-        from: fromDate ? localOffsetIso(fromDate) : undefined,
-        to: toDate ? localOffsetIso(toDate) : undefined,
-      });
-
-      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
-        return;
-      }
-
-      setShifts((current) => reset ? response.shifts : [...current, ...response.shifts]);
-      pageRef.current = response.pagination.page;
-      setPagination({ page: response.pagination.page, totalPages: response.pagination.totalPages });
-    } catch (requestError) {
-      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
-        setError(requestError instanceof ApiError ? requestError.message : 'Unable to load the schedule.');
-      }
-    } finally {
-      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
-        setLoading(false);
-        setRefreshing(false);
-        setLoadingMore(false);
-      }
-    }
-  }, [filterDate, selectedTeam?.id, statusFilter]);
-
-  const loadMembers = useCallback(async () => {
-    const teamId = selectedTeam?.id;
-    const userId = user?.id;
-    if (!teamId || !userId) return;
-    const generation = requestGenerationRef.current;
-    setMemberError(null);
-
-    try {
-      const currentMembers = await teamService.listAllMembers(teamId);
-      if (currentTeamIdRef.current !== teamId || requestGenerationRef.current !== generation) {
-        return;
-      }
-      setMembers(currentMembers);
-      setRole(currentMembers.find((member) => member.userId === userId)?.role ?? null);
-    } catch (requestError) {
-      if (currentTeamIdRef.current === teamId && requestGenerationRef.current === generation) {
-        setMemberError(requestError instanceof ApiError ? requestError.message : 'Unable to load team members.');
-        setRole(null);
-      }
-    }
-  }, [selectedTeam?.id, user?.id]);
-
-  // Focus refresh: reload schedule, swaps, and member role whenever screen regains focus
+  // Navigation focus refresh
   useFocusEffect(
     useCallback(() => {
-      let isMounted = true;
-      const teamId = selectedTeam?.id;
-      if (!teamId) return;
-
-      loadShifts(true);
-      loadPendingSwaps();
-      loadMembers();
-
-      return () => {
-        isMounted = false;
-      };
-    }, [loadShifts, loadPendingSwaps, loadMembers, selectedTeam?.id])
+      if (!selectedTeam?.id) return;
+      refetchShifts();
+      refetchMembers();
+      refetchSwaps();
+    }, [selectedTeam?.id, refetchShifts, refetchMembers, refetchSwaps])
   );
+
+  const handleRefresh = async () => {
+    setLocalError(null);
+    setPage(1);
+    await Promise.all([refetchShifts(), refetchMembers(), refetchSwaps()]);
+  };
+
+  const loadMore = () => {
+    if (hasMore && !loadingShifts) {
+      setPage((p) => p + 1);
+    }
+  };
 
   const openCreate = () => {
     setEditingShift(null);
@@ -277,7 +233,8 @@ export default function DashboardScreen() {
     setModalVisible(true);
   };
 
-  const updateForm = (field: keyof ShiftFormState, value: string) => setForm((current) => ({ ...current, [field]: value }));
+  const updateForm = (field: keyof ShiftFormState, value: string) =>
+    setForm((current) => ({ ...current, [field]: value }));
 
   const saveShift = async () => {
     const title = form.title.trim();
@@ -290,7 +247,6 @@ export default function DashboardScreen() {
     if (end.getTime() - start.getTime() > 24 * 60 * 60 * 1000) return setFormError('A shift cannot exceed 24 hours.');
     if (!selectedTeam) return;
 
-    setSaving(true);
     setFormError(null);
     const input = {
       title,
@@ -298,62 +254,98 @@ export default function DashboardScreen() {
       startsAt: localOffsetIso(start),
       endsAt: localOffsetIso(end),
     };
+
     try {
       if (editingShift) {
-        await shiftService.update(selectedTeam.id, editingShift.id, { ...input, updatedAt: editingShift.updatedAt });
+        await updateShiftMutation.mutateAsync({
+          shiftId: editingShift.id,
+          input: { ...input, updatedAt: editingShift.updatedAt },
+        });
       } else {
-        await shiftService.create(selectedTeam.id, input);
+        await createShiftMutation.mutateAsync(input);
       }
       setModalVisible(false);
-      await loadShifts(true);
+      setPage(1);
     } catch (requestError) {
       if (requestError instanceof ApiError && requestError.statusCode === 409) {
         setFormError(`${requestError.message} Refresh the schedule and try again.`);
-        await loadShifts(true);
+        refetchShifts();
       } else {
-        setFormError(requestError instanceof ApiError ? requestError.message : 'Unable to save this shift.');
+        setFormError(
+          requestError instanceof ApiError ? requestError.message : 'Unable to save this shift.'
+        );
       }
-    } finally {
-      setSaving(false);
     }
   };
 
   const cancelShift = (shift: Shift) => {
-    Alert.alert('Cancel shift?', `Cancel "${shift.title}" for ${shift.assignedTo.name || shift.assignedTo.email}?`, [
-      { text: 'Keep shift', style: 'cancel' },
-      {
-        text: 'Cancel shift',
-        style: 'destructive',
-        onPress: async () => {
-          if (!selectedTeam) return;
-          setCancellingId(shift.id);
-          setError(null);
-          try {
-            await shiftService.cancel(selectedTeam.id, shift.id, shift.updatedAt);
-            await loadShifts(true);
-          } catch (requestError) {
-            setError(requestError instanceof ApiError && requestError.statusCode === 409
-              ? `${requestError.message} The schedule was refreshed.`
-              : requestError instanceof ApiError ? requestError.message : 'Unable to cancel this shift.');
-            if (requestError instanceof ApiError && requestError.statusCode === 409) await loadShifts(true);
-          } finally {
-            setCancellingId(null);
-          }
+    Alert.alert(
+      'Cancel shift?',
+      `Cancel "${shift.title}" for ${shift.assignedTo.name || shift.assignedTo.email}?`,
+      [
+        { text: 'Keep shift', style: 'cancel' },
+        {
+          text: 'Cancel shift',
+          style: 'destructive',
+          onPress: async () => {
+            if (!selectedTeam) return;
+            setCancellingId(shift.id);
+            setLocalError(null);
+            try {
+              await cancelShiftMutation.mutateAsync({
+                shiftId: shift.id,
+                updatedAt: shift.updatedAt,
+              });
+              setPage(1);
+            } catch (requestError) {
+              setLocalError(
+                requestError instanceof ApiError && requestError.statusCode === 409
+                  ? `${requestError.message} The schedule was refreshed.`
+                  : requestError instanceof ApiError
+                  ? requestError.message
+                  : 'Unable to cancel this shift.'
+              );
+              if (requestError instanceof ApiError && requestError.statusCode === 409) {
+                refetchShifts();
+              }
+            } finally {
+              setCancellingId(null);
+            }
+          },
         },
-      },
-    ]);
+      ]
+    );
   };
 
   const applyDateFilter = () => {
     if (dateDraft && !dateFromInput(dateDraft)) {
-      setError('Use a valid filter date in YYYY-MM-DD format.');
+      setLocalError('Use a valid filter date in YYYY-MM-DD format.');
       return;
     }
-    setError(null);
+    setLocalError(null);
     setFilterDate(dateDraft);
   };
 
-  const sortedShifts = useMemo(() => [...shifts].sort((a, b) => a.startsAt.localeCompare(b.startsAt)), [shifts]);
+  const displayShifts =
+    page === 1 && shiftsPageData ? shiftsPageData.shifts : accumulatedShifts;
+  const sortedShifts = useMemo(
+    () => [...displayShifts].sort((a, b) => a.startsAt.localeCompare(b.startsAt)),
+    [displayShifts]
+  );
+
+  const error =
+    localError ||
+    (shiftsQueryError
+      ? shiftsQueryError instanceof ApiError
+        ? shiftsQueryError.message
+        : 'Unable to load the schedule.'
+      : null);
+
+  const memberError = membersQueryError
+    ? membersQueryError instanceof ApiError
+      ? membersQueryError.message
+      : 'Unable to load team members.'
+    : null;
 
   if (!selectedTeam) {
     return <Redirect href="/(app)/select-team" />;
@@ -365,16 +357,17 @@ export default function DashboardScreen() {
       contentContainerStyle={styles.content}
       refreshControl={
         <RefreshControl
-          refreshing={refreshing}
-          onRefresh={async () => {
-            setRefreshing(true);
-            await Promise.all([loadShifts(true), loadPendingSwaps(), loadMembers()]);
-          }}
+          refreshing={refreshingShifts}
+          onRefresh={handleRefresh}
           tintColor={colors.primary}
         />
       }
     >
-      <BrandHeader badge="WORKSPACE" title={selectedTeam.name} subtitle={`Schedule · ${role ? role.toLowerCase() : 'team member'}`} />
+      <BrandHeader
+        badge="WORKSPACE"
+        title={selectedTeam.name}
+        subtitle={`Schedule · ${role ? role.toLowerCase() : 'team member'}`}
+      />
       <View style={styles.headerRow}>
         <View>
           <Text style={styles.eyebrow}>TEAM SCHEDULE</Text>
@@ -396,41 +389,92 @@ export default function DashboardScreen() {
 
       <View style={styles.filterCard}>
         <Text style={styles.filterTitle}>Find shifts</Text>
-        <FormField label="Date (optional)" value={dateDraft} onChangeText={setDateDraft} placeholder="YYYY-MM-DD" autoCapitalize="none" accessibilityHint="Filter shifts to one local calendar day" />
+        <FormField
+          label="Date (optional)"
+          value={dateDraft}
+          onChangeText={setDateDraft}
+          placeholder="YYYY-MM-DD"
+          autoCapitalize="none"
+          accessibilityHint="Filter shifts to one local calendar day"
+        />
         <View style={styles.filterActions}>
           <ActionButton label="Apply date" onPress={applyDateFilter} variant="secondary" />
-          {filterDate ? <ActionButton label="Clear" onPress={() => { setDateDraft(''); setFilterDate(''); }} variant="quiet" /> : null}
+          {filterDate ? (
+            <ActionButton
+              label="Clear"
+              onPress={() => {
+                setDateDraft('');
+                setFilterDate('');
+              }}
+              variant="quiet"
+            />
+          ) : null}
         </View>
         <Text style={styles.timezone}>Times shown in {timezone}.</Text>
         <View style={styles.segmentRow}>
           {(['ALL', 'SCHEDULED', 'CANCELLED'] as StatusFilter[]).map((status) => (
-            <Pressable key={status} accessibilityRole="button" accessibilityState={{ selected: statusFilter === status }} onPress={() => setStatusFilter(status)} style={[styles.segment, statusFilter === status && styles.segmentSelected]}>
-              <Text style={[styles.segmentLabel, statusFilter === status && styles.segmentLabelSelected]}>{status === 'ALL' ? 'All' : status === 'SCHEDULED' ? 'Scheduled' : 'Cancelled'}</Text>
+            <Pressable
+              key={status}
+              accessibilityRole="button"
+              accessibilityState={{ selected: statusFilter === status }}
+              onPress={() => setStatusFilter(status)}
+              style={[styles.segment, statusFilter === status && styles.segmentSelected]}
+            >
+              <Text
+                style={[
+                  styles.segmentLabel,
+                  statusFilter === status && styles.segmentLabelSelected,
+                ]}
+              >
+                {status === 'ALL' ? 'All' : status === 'SCHEDULED' ? 'Scheduled' : 'Cancelled'}
+              </Text>
             </Pressable>
           ))}
         </View>
       </View>
 
-      {memberError ? <Text style={styles.warning}>{memberError} Management controls are unavailable.</Text> : null}
+      {memberError ? (
+        <Text style={styles.warning}>{memberError} Management controls are unavailable.</Text>
+      ) : null}
       {error ? <Text style={styles.error}>{error}</Text> : null}
-      {loading ? <ActivityIndicator color={colors.primary} style={styles.loader} /> : sortedShifts.length === 0 ? (
+      {loadingShifts && page === 1 ? (
+        <ActivityIndicator color={colors.primary} style={styles.loader} />
+      ) : sortedShifts.length === 0 ? (
         <View style={styles.emptyCard}>
-          <Text style={styles.emptyTitle}>{statusFilter === 'CANCELLED' ? 'No cancelled shifts' : 'No shifts found'}</Text>
-          <Text style={styles.muted}>{canManage ? 'Create the first shift or adjust the filters.' : 'Your team has no shifts matching these filters.'}</Text>
+          <Text style={styles.emptyTitle}>
+            {statusFilter === 'CANCELLED' ? 'No cancelled shifts' : 'No shifts found'}
+          </Text>
+          <Text style={styles.muted}>
+            {canManage
+              ? 'Create the first shift or adjust the filters.'
+              : 'Your team has no shifts matching these filters.'}
+          </Text>
           {canManage ? <ActionButton label="Create a shift" onPress={openCreate} /> : null}
         </View>
       ) : (
         <View>
           {sortedShifts.map((shift) => (
-            <View key={shift.id} style={[styles.shiftCard, shift.status === 'CANCELLED' && styles.cancelledCard]}>
+            <View
+              key={shift.id}
+              style={[styles.shiftCard, shift.status === 'CANCELLED' && styles.cancelledCard]}
+            >
               <View style={styles.shiftTopRow}>
                 <View style={styles.shiftTitleWrap}>
                   <Text style={styles.shiftTitle}>{shift.title}</Text>
                   <Text style={styles.shiftDate}>{shiftDisplay(shift)}</Text>
                 </View>
-                <Text style={[styles.status, shift.status === 'CANCELLED' && styles.cancelledStatus]}>{shift.status === 'SCHEDULED' ? 'Scheduled' : 'Cancelled'}</Text>
+                <Text
+                  style={[
+                    styles.status,
+                    shift.status === 'CANCELLED' && styles.cancelledStatus,
+                  ]}
+                >
+                  {shift.status === 'SCHEDULED' ? 'Scheduled' : 'Cancelled'}
+                </Text>
               </View>
-              <Text style={styles.assignee}>Assigned to {shift.assignedTo.name || shift.assignedTo.email}</Text>
+              <Text style={styles.assignee}>
+                Assigned to {shift.assignedTo.name || shift.assignedTo.email}
+              </Text>
               {activeSwapShiftIds.has(shift.id) ? (
                 <View style={styles.swapPendingBadge}>
                   <Text style={styles.swapPendingBadgeText}>SWAP PENDING</Text>
@@ -440,8 +484,19 @@ export default function DashboardScreen() {
                 <View style={styles.shiftActions}>
                   {canManage ? (
                     <>
-                      <ActionButton size="small" label="Edit" onPress={() => openEdit(shift)} variant="secondary" />
-                      <ActionButton size="small" label={cancellingId === shift.id ? 'Cancelling...' : 'Cancel'} onPress={() => cancelShift(shift)} variant="quiet" loading={cancellingId === shift.id} />
+                      <ActionButton
+                        size="small"
+                        label="Edit"
+                        onPress={() => openEdit(shift)}
+                        variant="secondary"
+                      />
+                      <ActionButton
+                        size="small"
+                        label={cancellingId === shift.id ? 'Cancelling...' : 'Cancel'}
+                        onPress={() => cancelShift(shift)}
+                        variant="quiet"
+                        loading={cancellingId === shift.id}
+                      />
                     </>
                   ) : null}
                   {shift.assignedToUserId === user?.id ? (
@@ -461,18 +516,37 @@ export default function DashboardScreen() {
               ) : null}
             </View>
           ))}
-          {hasMore ? <ActionButton label={loadingMore ? 'Loading...' : 'Load more'} onPress={() => loadShifts(false)} loading={loadingMore} variant="secondary" /> : null}
+          {hasMore ? (
+            <ActionButton
+              label={loadingShifts ? 'Loading...' : 'Load more'}
+              onPress={loadMore}
+              loading={loadingShifts}
+              variant="secondary"
+            />
+          ) : null}
         </View>
       )}
 
-      {!isPersistenceAvailable ? <Text style={styles.notice}>Secure session persistence is unavailable on this platform. You will need to sign in again after closing the app.</Text> : null}
+      {!isPersistenceAvailable ? (
+        <Text style={styles.notice}>
+          Secure session persistence is unavailable on this platform. You will need to sign in again after closing the app.
+        </Text>
+      ) : null}
       <View style={styles.bottomActions}>
         <ActionButton label="Change team" onPress={() => router.push('/(app)/select-team')} variant="secondary" />
         <ActionButton label="Sign out" onPress={signOut} variant="quiet" />
       </View>
 
-      <Modal visible={modalVisible} animationType="slide" transparent onRequestClose={() => setModalVisible(false)}>
-        <KeyboardAvoidingView style={styles.modalBackdrop} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <Modal
+        visible={modalVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setModalVisible(false)}
+      >
+        <KeyboardAvoidingView
+          style={styles.modalBackdrop}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
           <ScrollView contentContainerStyle={styles.modalScroll} keyboardShouldPersistTaps="handled">
             <View style={styles.modalCard}>
               <View style={styles.modalHeader}>
@@ -480,29 +554,91 @@ export default function DashboardScreen() {
                   <Text style={styles.eyebrow}>{editingShift ? 'UPDATE SHIFT' : 'NEW SHIFT'}</Text>
                   <Text style={styles.modalTitle}>{editingShift ? 'Edit shift' : 'Create a shift'}</Text>
                 </View>
-                <Pressable accessibilityRole="button" accessibilityLabel="Close shift form" onPress={() => setModalVisible(false)}><Text style={styles.close}>Close</Text></Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Close shift form"
+                  onPress={() => setModalVisible(false)}
+                >
+                  <Text style={styles.close}>Close</Text>
+                </Pressable>
               </View>
-              <FormField label="Title" value={form.title} onChangeText={(value) => updateForm('title', value)} placeholder="Front desk cover" maxLength={200} />
+              <FormField
+                label="Title"
+                value={form.title}
+                onChangeText={(value) => updateForm('title', value)}
+                placeholder="Front desk cover"
+                maxLength={200}
+              />
               <Text style={styles.formLabel}>Assignee</Text>
               <View style={styles.assigneeContainer}>
-                {members.length === 0 ? <Text style={styles.muted}>No team members are available to assign.</Text> : members.map((member) => (
-                  <Pressable key={member.userId} accessibilityRole="radio" accessibilityState={{ checked: form.assignedToUserId === member.userId }} onPress={() => updateForm('assignedToUserId', member.userId)} style={[styles.assigneeOption, form.assignedToUserId === member.userId && styles.assigneeSelected]}>
-                    <Text style={styles.assigneeOptionName}>{displayName(member)}</Text>
-                    <Text style={styles.assigneeOptionRole}>{member.role}</Text>
-                  </Pressable>
-                ))}
+                {members.length === 0 ? (
+                  <Text style={styles.muted}>No team members are available to assign.</Text>
+                ) : (
+                  members.map((member) => (
+                    <Pressable
+                      key={member.userId}
+                      accessibilityRole="radio"
+                      accessibilityState={{ checked: form.assignedToUserId === member.userId }}
+                      onPress={() => updateForm('assignedToUserId', member.userId)}
+                      style={[
+                        styles.assigneeOption,
+                        form.assignedToUserId === member.userId && styles.assigneeSelected,
+                      ]}
+                    >
+                      <Text style={styles.assigneeOptionName}>{displayName(member)}</Text>
+                      <Text style={styles.assigneeOptionRole}>{member.role}</Text>
+                    </Pressable>
+                  ))
+                )}
               </View>
               <View style={styles.twoColumns}>
-                <View style={styles.column}><FormField label="Start date" value={form.startDate} onChangeText={(value) => updateForm('startDate', value)} placeholder="YYYY-MM-DD" autoCapitalize="none" /></View>
-                <View style={styles.column}><FormField label="Start time" value={form.startTime} onChangeText={(value) => updateForm('startTime', value)} placeholder="09:00" keyboardType="numbers-and-punctuation" /></View>
+                <View style={styles.column}>
+                  <FormField
+                    label="Start date"
+                    value={form.startDate}
+                    onChangeText={(value) => updateForm('startDate', value)}
+                    placeholder="YYYY-MM-DD"
+                    autoCapitalize="none"
+                  />
+                </View>
+                <View style={styles.column}>
+                  <FormField
+                    label="Start time"
+                    value={form.startTime}
+                    onChangeText={(value) => updateForm('startTime', value)}
+                    placeholder="09:00"
+                    keyboardType="numbers-and-punctuation"
+                  />
+                </View>
               </View>
               <View style={styles.twoColumns}>
-                <View style={styles.column}><FormField label="End date" value={form.endDate} onChangeText={(value) => updateForm('endDate', value)} placeholder="YYYY-MM-DD" autoCapitalize="none" /></View>
-                <View style={styles.column}><FormField label="End time" value={form.endTime} onChangeText={(value) => updateForm('endTime', value)} placeholder="17:00" keyboardType="numbers-and-punctuation" /></View>
+                <View style={styles.column}>
+                  <FormField
+                    label="End date"
+                    value={form.endDate}
+                    onChangeText={(value) => updateForm('endDate', value)}
+                    placeholder="YYYY-MM-DD"
+                    autoCapitalize="none"
+                  />
+                </View>
+                <View style={styles.column}>
+                  <FormField
+                    label="End time"
+                    value={form.endTime}
+                    onChangeText={(value) => updateForm('endTime', value)}
+                    placeholder="17:00"
+                    keyboardType="numbers-and-punctuation"
+                  />
+                </View>
               </View>
               <Text style={styles.timezone}>Local times are sent with the device UTC offset.</Text>
               {formError ? <Text style={styles.error}>{formError}</Text> : null}
-              <ActionButton label={editingShift ? 'Save changes' : 'Create shift'} onPress={saveShift} loading={saving} disabled={!canManage} />
+              <ActionButton
+                label={editingShift ? 'Save changes' : 'Create shift'}
+                onPress={saveShift}
+                loading={createShiftMutation.isPending || updateShiftMutation.isPending}
+                disabled={!canManage}
+              />
             </View>
           </ScrollView>
         </KeyboardAvoidingView>
